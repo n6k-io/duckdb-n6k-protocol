@@ -1,0 +1,60 @@
+# name: test/sql/n6k_open_pending.test
+# description: WsClient::Connect waits through FT_HELLO_PENDING / FT_OPEN_PENDING with no overall deadline; pins each open_pending_selftest scenario
+# group: [sql]
+
+require n6k_client
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('ack');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('err');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('stall');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('drop');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('no_reply');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('late_pending');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('abort');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('hello_ack');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('hello_stall');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('reconnect_dead_abort');
+----
+true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('reconnect_abort');
+----
+true

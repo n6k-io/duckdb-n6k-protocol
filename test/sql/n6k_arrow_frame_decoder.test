@@ -1,0 +1,25 @@
+# name: test/sql/n6k_arrow_frame_decoder.test
+# description: N6kArrowFrameDecoder decodes the real pyarrow framing (empty schema frame + schema-prepended chunk, multi-batch)
+# group: [sql]
+
+require n6k_testing
+
+# The selftest pushes the exact pyarrow framing through the push-based decoder: frame 0 is an empty
+# RESP_SCHEMA, frame 1 carries schema+batch0 as two IPC messages, frame 2 carries batch1, frame 3 is
+# EOS. All three rows across the two batches must round-trip.
+query IT
+SELECT id, name FROM n6k_testing_arrow_ipc_decode() ORDER BY id;
+----
+1	Alice
+2	Bob
+3	Charlie
+
+query I
+SELECT count(*) FROM n6k_testing_arrow_ipc_decode();
+----
+3
+
+query T
+SELECT name FROM n6k_testing_arrow_ipc_decode() WHERE id = 3;
+----
+Charlie

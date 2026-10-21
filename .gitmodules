@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "third_party/crossing"]
+	path = third_party/crossing
+	url = https://github.com/n6k-io/duckdb-crossing

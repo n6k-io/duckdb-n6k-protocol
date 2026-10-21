@@ -1,0 +1,220 @@
+# name: test/sql/n6k_server.test
+# description: binder contract for n6k_serve_socket / n6k_serve_http / n6k_serve_fd
+# group: [sql]
+
+require n6k_server
+
+# n6k_testing_served_catalogs() lives in the unpublished test extension; the
+# catalog-list rule it asserts is ResolveServedCatalogs.
+require n6k_testing
+
+# Only binder-error cases belong here: they fail during bind, before the scan
+# runs. Once n6k_serve_socket serves, its scan BLOCKS until interrupted, so the
+# positive/serving path and the no-listen-path error (which needs a valid catalog
+# with N6K_LISTEN unset, i.e. it reaches the scan when it is set) are covered by
+# the integration tests, not here.
+#
+# For the same reason there is no `CALL n6k_serve_socket()` or
+# `CALL n6k_serve_socket('*')` case: both clear every bind check, so if the
+# developer's shell happens to export N6K_LISTEN they reach the scan and hang
+# the suite. The catalog-list rule therefore has no end-to-end coverage for
+# `'*'`.
+
+statement error
+CALL n6k_serve_socket(NULL);
+----
+requires a catalog argument
+
+# The served catalog must already be attached (checked before the env is read, so
+# this is independent of N6K_LISTEN).
+statement error
+CALL n6k_serve_socket('nope');
+----
+is not attached
+
+# Every argument is validated, not just the first.
+statement error
+CALL n6k_serve_socket('memory', 'nope');
+----
+is not attached
+
+# A NULL anywhere in the list is rejected the same way.
+statement error
+CALL n6k_serve_socket('memory', NULL);
+----
+requires a catalog argument
+
+# Two sessions must not resolve to the same catalog by accident.
+statement error
+CALL n6k_serve_socket('memory', 'memory');
+----
+listed more than once
+
+# Catalog names are case-insensitive, so the duplicate check is too.
+statement error
+CALL n6k_serve_socket('memory', 'MEMORY');
+----
+listed more than once
+
+statement error
+CALL n6k_serve_socket('memory', listen => '');
+----
+listen must name a Unix domain socket path
+
+statement error
+CALL n6k_serve_socket('memory', listen => '/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.sock');
+----
+listen path too long
+
+statement error
+CALL n6k_serve_socket('nope', listen => '/tmp/n6k.sock');
+----
+is not attached
+
+# n6k_serve_http — bind-time errors only, for the same reason: a successful bind
+# would reach the scan, start listening and block the suite forever. The serving
+# path is covered by integration tests.
+
+# Host and port are validated before the catalog list.
+statement error
+CALL n6k_serve_http(NULL, 7823);
+----
+requires a host and a port
+
+statement error
+CALL n6k_serve_http('', 7823);
+----
+host must not be empty
+
+statement error
+CALL n6k_serve_http('127.0.0.1', 0);
+----
+out of range
+
+statement error
+CALL n6k_serve_http('127.0.0.1', 70000);
+----
+out of range
+
+# Catalog validation is the shared helper, so it rejects exactly what the socket
+# form rejects.
+statement error
+CALL n6k_serve_http('127.0.0.1', 7823, 'nope');
+----
+is not attached
+
+statement error
+CALL n6k_serve_http('127.0.0.1', 7823, NULL);
+----
+requires a catalog argument
+
+statement error
+CALL n6k_serve_http('127.0.0.1', 7823, 'memory', 'memory');
+----
+listed more than once
+
+# n6k_serve_fd — bind-time errors only. Note there is deliberately no valid-fd +
+# valid-catalog case: that clears every bind check and would block the suite on a
+# peer that never arrives. The serving path is covered by the integration tests,
+# which own the socketpair.
+
+# The fd is validated before the catalog list, so these need no attached catalog.
+statement error
+CALL n6k_serve_fd(NULL);
+----
+requires a file descriptor
+
+statement error
+CALL n6k_serve_fd(-1);
+----
+is not a valid file descriptor
+
+# Catalog validation is the shared helper, so it rejects exactly what the other
+# two forms reject.
+statement error
+CALL n6k_serve_fd(7, 'nope');
+----
+is not attached
+
+statement error
+CALL n6k_serve_fd(7, NULL);
+----
+requires a catalog argument
+
+statement error
+CALL n6k_serve_fd(7, 'memory', 'memory');
+----
+listed more than once
+
+statement error
+CALL n6k_serve_fd(7, 'memory', ping_interval_ms => -1);
+----
+ping_interval_ms must be 0 (disabled) or positive
+
+# Catalog selection. The serve functions block once bound, so the rule is
+# asserted through n6k_testing_served_catalogs(), which resolves the same list and
+# returns it instead of serving it.
+
+query I
+SELECT count(*) FROM n6k_testing_served_catalogs();
+----
+0
+
+query I
+SELECT catalog FROM n6k_testing_served_catalogs('*') ORDER BY catalog;
+----
+memory
+
+statement ok
+ATTACH ':memory:' AS db;
+
+# One catalog attached: the startup in-memory database drops out. Serving it too
+# would make the session multiplexed and change the wire for a host that attached
+# exactly one catalog.
+query I
+SELECT catalog FROM n6k_testing_served_catalogs('*') ORDER BY catalog;
+----
+db
+
+statement ok
+ATTACH ':memory:' AS other;
+
+# Everything deliberately attached is served, however many there are.
+query I
+SELECT catalog FROM n6k_testing_served_catalogs('*') ORDER BY catalog;
+----
+db
+other
+
+statement ok
+DETACH other;
+
+statement ok
+DETACH db;
+
+query I
+SELECT catalog FROM n6k_testing_served_catalogs('*') ORDER BY catalog;
+----
+memory
+
+statement error
+SELECT catalog FROM n6k_testing_served_catalogs('*', 'memory');
+----
+cannot be combined with names
+
+statement error
+SELECT catalog FROM n6k_testing_served_catalogs('memory', '*');
+----
+cannot be combined with names
+
+statement ok
+ATTACH ':memory:' AS db;
+
+query I
+SELECT catalog FROM n6k_testing_served_catalogs('memory', 'db') ORDER BY catalog;
+----
+db
+memory
+
+statement ok
+DETACH db;

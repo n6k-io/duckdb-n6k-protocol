@@ -1,6 +1,6 @@
 {
         "dependencies": [
-                "openssl"
+                { "name": "openssl", "platform": "linux | windows | osx" }
         ],
         "vcpkg-configuration": {
                 "overlay-ports": [

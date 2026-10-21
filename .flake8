@@ -1,0 +1,16 @@
+[flake8]
+max-line-length = 120
+extend-ignore = E203, W503
+exclude =
+    duckdb,
+    extension-ci-tools,
+    third_party,
+    packages/python,
+    packages/npm/node_modules,
+    test-app/node_modules,
+    scratch,
+    .venv,
+    __pycache__,
+    build,
+    dist,
+    *.egg-info

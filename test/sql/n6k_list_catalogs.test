@@ -1,0 +1,15 @@
+# name: test/sql/n6k_list_catalogs.test
+# description: binder contract for n6k_list_catalogs
+# group: [sql]
+
+require n6k_client
+
+statement error
+SELECT * FROM n6k_list_catalogs();
+----
+requires wsFd
+
+statement error
+SELECT * FROM n6k_list_catalogs(wsFd => -1);
+----
+is not a valid file descriptor

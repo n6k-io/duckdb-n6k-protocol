@@ -4,6 +4,8 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -12,19 +14,166 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fails the PR before the long builds start if a package changed but kept a released version.
+  version-check:
+    name: Package version check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
+        id: changes
+        with:
+          filters: |
+            npm:
+              - "packages/npm/**"
+              - "src/n6k_client/**"
+              - "src/common/**"
+              - "third_party/**"
+              - "duckdb"
+              - "CMakeLists.txt"
+              - "extension_config.cmake"
+              - "vcpkg.json"
+            python:
+              - "packages/python/**"
+
+      - name: npm version
+        if: steps.changes.outputs.npm == 'true'
+        run: |
+          version="$(node -p "require('./packages/npm/package.json').version")"
+          .github/scripts/tag-unused.sh "npm/v$version"
+          .github/scripts/npm-unreleased.sh @n6k.io/db "$version"
+
+      - name: python version
+        if: steps.changes.outputs.python == 'true'
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("packages/python/pyproject.toml","rb"))["project"]["version"])')"
+          .github/scripts/tag-unused.sh "python/v$version"
+          .github/scripts/pypi-unreleased.sh n6k-duckdb "$version"
+
+  # Windows (windows_amd64 and windows_amd64_mingw) is not built or shipped.
+  # One build per arch compiles EVERY extension declared in
+  # extension_config.cmake (n6k_client and — on non-Windows — n6k_server;
+  # plus n6k_testing on native, which the deploy step below skips) — the
+  # build command is a blanket `make`, the extension set is driven entirely by
+  # that config, not by extension_name. upload_all_extensions:true packages every
+  # built *.duckdb_extension from build/<type>/repository/** into a single
+  # artifact (named n6k-<ver>-extension-<arch>), so the deploy step ships all of
+  # them from one compile instead of rebuilding the whole tree once per extension.
   duckdb-stable-build:
-    name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
+    name: Build n6k extension binaries
+    needs: version-check
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
     with:
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4.4
-      extension_name: quack
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
+      extension_name: n6k_client
+      # coi-only: build wasm_threads, never eh/mvp (they can't load a shared-memory
+      # extension). On PRs also drop the non-amd64 native arches for speed.
+      exclude_archs: ${{ github.ref != 'refs/heads/main' && 'linux_arm64;osx_amd64;osx_arm64;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh' || 'windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh' }}
+      opt_in_archs: 'linux_amd64_musl'
+      upload_all_extensions: true
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.4.4
+    needs: version-check
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.4
     with:
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4.4
-      extension_name: quack
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
+      extension_name: n6k_client
       format_checks: 'format;tidy'
+
+  duckdb-stable-deploy:
+    name: Deploy n6k extensions (${{ matrix.duckdb_arch }})
+    needs: duckdb-stable-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        duckdb_arch:
+          - linux_amd64
+          - linux_arm64
+          - linux_amd64_musl
+          - osx_amd64
+          - osx_arm64
+          # coi-only: only the shared-memory (wasm_threads) extension is built/shipped.
+          - wasm_threads
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Checkout DuckDB to version
+        run: |
+          if [ ! -d duckdb ]; then
+            git clone https://github.com/duckdb/duckdb.git
+          fi
+          cd duckdb
+          git checkout v1.5.4
+
+      # One artifact per arch holds every extension built for it (n6k_client,
+      # and n6k_server on non-Windows), nested under the repository/
+      # tree — staged here, then flattened + uploaded one extension at a time.
+      - uses: actions/download-artifact@v4
+        with:
+          name: n6k_client-v1.5.4-extension-${{ matrix.duckdb_arch }}
+          path: /tmp/artifact
+
+      - uses: ./.github/actions/setup-gcloud
+
+      - name: Deploy
+        shell: bash
+        env:
+          BUCKET_NAME: n6k-duckdb-release
+          DUCKDB_EXTENSION_SIGNING_PK: ${{ secrets.S3_DUCKDB_ORG_EXTENSION_SIGNING_PK }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          DUCKDB_VERSION=$(git -C duckdb tag --points-at HEAD)
+          DUCKDB_VERSION=${DUCKDB_VERSION:=$(git -C duckdb log -1 --format=%h)}
+          EXT_VERSION=$(git tag --points-at HEAD)
+          EXT_VERSION=${EXT_VERSION:=$(git log -1 --format=%h)}
+
+          if [[ "$DUCKDB_ARCH" == wasm* ]]; then
+            suffix=".duckdb_extension.wasm"
+          else
+            suffix=".duckdb_extension"
+          fi
+
+          # extension-upload.sh reads /tmp/extension/<name><suffix>, so flatten
+          # each built extension to that path and upload it. The artifact contains
+          # whatever was built for this arch, so this ships what was compiled
+          # rather than a hardcoded list — with one deliberate exclusion below.
+          mkdir -p /tmp/extension
+          found=0
+          while IFS= read -r f; do
+            name="$(basename "$f" "$suffix")"
+            # n6k_testing registers the SQL functions that exist only for tests. CI
+            # builds it so the sqllogic suite can `require` it; it must never reach
+            # the public bucket, or hosts would install a test surface alongside n6k.
+            if [[ "$name" == "n6k_testing" ]]; then
+              echo "Skipping $name ($DUCKDB_ARCH) — test-only, not published"
+              continue
+            fi
+            cp "$f" "/tmp/extension/$name$suffix"
+            echo "Uploading $name ($DUCKDB_ARCH)"
+            ./scripts/extension-upload.sh "$name" "$EXT_VERSION" "$DUCKDB_VERSION" "$DUCKDB_ARCH" "$BUCKET_NAME" true true
+            found=$((found+1))
+          done < <(find /tmp/artifact -name "*$suffix")
+
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no *$suffix files found in artifact for $DUCKDB_ARCH"
+            exit 1
+          fi
+          echo "Deployed $found extension(s) for $DUCKDB_ARCH"

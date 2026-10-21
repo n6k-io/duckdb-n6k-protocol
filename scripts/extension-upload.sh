@@ -23,24 +23,13 @@ echo $ext
 
 script_dir="$(dirname "$(readlink -f "$0")")"
 
-# calculate SHA256 hash of extension binary
 cat $ext > $ext.append
 
-if [[ $4 == wasm* ]]; then
-  # 0 for custom section
-  # 113 in hex = 275 in decimal, total lenght of what follows (1 + 16 + 2 + 256)
-  # [1(continuation) + 0010011(payload) = \x93, 0(continuation) + 10(payload) = \x02]
-  echo -n -e '\x00' >> $ext.append
-  echo -n -e '\x93\x02' >> $ext.append
-  # 10 in hex = 16 in decimal, lenght of name, 1 byte
-  echo -n -e '\x10' >> $ext.append
-  echo -n -e 'duckdb_signature' >> $ext.append
-  # the name of the WebAssembly custom section, 16 bytes
-  # 100 in hex, 256 in decimal
-  # [1(continuation) + 0000000(payload) = ff, 0(continuation) + 10(payload)],
-  # for a grand total of 2 bytes
-  echo -n -e '\x80\x02' >> $ext.append
-fi
+# The build appends a 256-byte zero placeholder for the signature as the last
+# bytes of the file (see duckdb/scripts/append_metadata.cmake). Strip it before
+# computing the hash and appending the real signature so the total footer
+# length stays the same and the metadata block remains in DuckDB's read window.
+( command -v truncate && truncate -s -256 $ext.append ) || ( command -v gtruncate && gtruncate -s -256 $ext.append ) || exit 1
 
 # (Optionally) Sign binary
 if [ "$DUCKDB_EXTENSION_SIGNING_PK" != "" ]; then
@@ -48,13 +37,13 @@ if [ "$DUCKDB_EXTENSION_SIGNING_PK" != "" ]; then
   $script_dir/../duckdb/scripts/compute-extension-hash.sh $ext.append > $ext.hash
   openssl pkeyutl -sign -in $ext.hash -inkey private.pem -pkeyopt digest:sha256 -out $ext.sign
   rm -f private.pem
+else
+  # No signing key: write a 256-byte zero signature.
+  dd if=/dev/zero of=$ext.sign bs=256 count=1
 fi
 
-# Signature is always there, potentially defaulting to 256 zeros
-truncate -s 256 $ext.sign
-
-# append signature to extension binary
 cat $ext.sign >> $ext.append
+rm $ext.sign
 
 # compress extension binary
 if [[ $4 == wasm_* ]]; then
@@ -65,26 +54,20 @@ fi
 
 set -e
 
-# Abort if AWS key is not set
-if [ -z "$AWS_ACCESS_KEY_ID" ]; then
-    echo "No AWS key found, skipping.."
-    exit 0
-fi
-
 # upload versioned version
 if [[ $7 = 'true' ]]; then
   if [[ $4 == wasm* ]]; then
-    aws s3 cp $ext.compressed s3://$5/$1/$2/$3/$4/$1.duckdb_extension.wasm --acl public-read --content-encoding br --content-type="application/wasm"
+    gcloud storage cp $ext.compressed "gs://$5/$1/$2/$3/$4/$1.duckdb_extension.wasm" --content-encoding=br --content-type=application/wasm
   else
-    aws s3 cp $ext.compressed s3://$5/$1/$2/$3/$4/$1.duckdb_extension.gz --acl public-read
+    gcloud storage cp $ext.compressed "gs://$5/$1/$2/$3/$4/$1.duckdb_extension.gz"
   fi
 fi
 
 # upload to latest version
 if [[ $6 = 'true' ]]; then
   if [[ $4 == wasm* ]]; then
-    aws s3 cp $ext.compressed s3://$5/$3/$4/$1.duckdb_extension.wasm --acl public-read --content-encoding br --content-type="application/wasm"
+    gcloud storage cp $ext.compressed "gs://$5/$3/$4/$1.duckdb_extension.wasm" --content-encoding=br --content-type=application/wasm
   else
-    aws s3 cp $ext.compressed s3://$5/$3/$4/$1.duckdb_extension.gz --acl public-read
+    gcloud storage cp $ext.compressed "gs://$5/$3/$4/$1.duckdb_extension.gz"
   fi
 fi

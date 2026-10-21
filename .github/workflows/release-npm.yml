@@ -1,0 +1,115 @@
+name: Publish npm package
+
+# Triggered by pushing a tag like `npm/v0.4.2`. Create it with:
+#   cd packages/npm && npm version patch && git push --follow-tags
+# (`npm version` bumps + commits package.json and tags it; .npmrc sets the
+# `npm/v` prefix.) The WASM bundle is NOT rebuilt here — it is downloaded from
+# the Main Extension Distribution Pipeline run for this exact commit, and the
+# job fails fast if no such run/artifact exists.
+
+on:
+  push:
+    tags:
+      - "npm/v*"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun run ci
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # read artifacts from the distribution pipeline run
+      id-token: write # npm OIDC trusted publishing
+    defaults:
+      run:
+        working-directory: packages/npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches package.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#npm/v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG_VERSION package.json=$PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      - name: Find distribution pipeline run for this commit
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID="$(gh run list \
+            --workflow MainDistributionPipeline.yml \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')"
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No successful Main Extension Distribution Pipeline run found for commit $GITHUB_SHA. Push the commit to main, let it build, then tag it."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using distribution pipeline run $RUN_ID"
+
+      # Reuse the wasm already built by the distribution pipeline for this commit
+      # — no rebuild. (parquet/core_functions are statically linked into
+      # @duckdb/duckdb-wasm, so they are not bundled.) The pipeline now publishes
+      # ONE artifact per variant (n6k_client-v1.5.4-extension-<variant>) holding every
+      # built extension nested under the repository/ tree, so stage it and copy
+      # only the extension the package ships (n6k_client) flat into
+      # wasm/v1.5.4/<variant>/ where the package serves it. n6k_server is
+      # POSIX-only (UDS) and intentionally not bundled for the browser.
+      - name: Download n6k_client wasm from that run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ steps.find.outputs.run_id }}
+        run: |
+          for variant in wasm_threads; do
+            dest="wasm/v1.5.4/$variant"
+            mkdir -p "$dest"
+            tmp="$(mktemp -d)"
+            gh run download "$RUN_ID" -n "n6k_client-v1.5.4-extension-$variant" -D "$tmp"
+            for ext in n6k_client; do
+              find "$tmp" -name "$ext.duckdb_extension.wasm" -exec cp {} "$dest/" \;
+            done
+          done
+
+      - name: Verify wasm bundle is complete
+        run: |
+          missing=0
+          for variant in wasm_threads; do
+            for ext in n6k_client; do
+              f="wasm/v1.5.4/$variant/$ext.duckdb_extension.wasm"
+              if [ ! -f "$f" ]; then
+                echo "::error::missing $f in downloaded bundle"
+                missing=1
+              fi
+            done
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "wasm bundle complete"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "23"
+
+      - run: npm install -g npm@latest
+
+      - run: npm publish --access public

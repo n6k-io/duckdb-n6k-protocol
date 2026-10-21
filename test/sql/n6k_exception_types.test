@@ -1,0 +1,69 @@
+# name: test/sql/n6k_exception_types.test
+# description: n6k_exception_types() -- DuckDB ExceptionType <-> protocol wire value
+# group: [sql]
+
+require n6k_client
+
+# The wire value is the DuckDB CLASS NAME, not the display string
+# Exception::ExceptionTypeToString returns. Sending the display string is not a loud
+# failure -- the client does not recognize it and silently downgrades to IOException
+# per the protocol -- so every typed error would quietly become untyped. These are the
+# regression fence for that.
+
+# The three where the display string is nothing like the wire value.
+query TT
+SELECT exception_type, duckdb_name
+FROM n6k_exception_types()
+WHERE exception_type IN ('TransactionException', 'NotImplementedException', 'InternalException')
+ORDER BY exception_type
+----
+InternalException	INTERNAL
+NotImplementedException	Not implemented
+TransactionException	TransactionContext
+
+# The enum and the class name disagree on word order here, which is exactly the kind
+# of correspondence a per-server re-derivation gets wrong.
+query TT
+SELECT exception_type, duckdb_name
+FROM n6k_exception_types()
+WHERE exception_type = 'TypeMismatchException'
+----
+TypeMismatchException	Mismatch Type
+
+query TT
+SELECT exception_type, duckdb_name
+FROM n6k_exception_types()
+WHERE exception_type = 'CatalogException'
+----
+CatalogException	Catalog
+
+# Only transaction conflicts are retriable: a write-write conflict under optimistic
+# concurrency means nothing is wrong and the client may simply re-issue.
+query TT
+SELECT exception_type, retriable
+FROM n6k_exception_types()
+WHERE retriable
+----
+TransactionException	true
+
+query I
+SELECT count(*) FROM n6k_exception_types() WHERE NOT exception_type LIKE '%Exception'
+----
+0
+
+# No duplicates on either side of the correspondence. Count is pinned against
+# EXCEPTION_TYPES in packages/python/src/n6k_protocol/protocol.py; adding one there
+# without adding it here (or vice versa) fails.
+query III
+SELECT count(*), count(DISTINCT exception_type), count(DISTINCT duckdb_name)
+FROM n6k_exception_types()
+----
+23	23	23
+
+# The message prefix is what a host that only sees formatted error text matches on to
+# recover the type, so it must be exactly "<duckdb_name> Error: ".
+query I
+SELECT count(*) FROM n6k_exception_types()
+WHERE message_prefix != duckdb_name || ' Error: '
+----
+0

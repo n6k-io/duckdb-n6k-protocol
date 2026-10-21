@@ -1,0 +1,28 @@
+# name: test/sql/n6k_ws_send_after_start.test
+# description: A frame enqueued immediately after Reactor::Start must reach the wire (the HELLO position in WsClient::StartReactorAndHandshake)
+# group: [sql]
+
+require n6k_client
+
+# WsClient::StartReactorAndHandshake calls reactor->Start(...) and then sends HELLO. Start() dials
+# asynchronously, and ixwebsocket's WebSocket::sendBinary discards silently while the socket is not
+# yet ReadyState::Open — so a writer thread that fires before the 101 lands drops HELLO, the server
+# sees zero data frames, and Connect can only time out. This stands up an in-process
+# ix::WebSocketServer on loopback and asserts the post-Start frame actually arrives.
+query I
+SELECT probe_received FROM n6k_selftest_send_after_start();
+----
+true
+
+# ok folds in that the loopback server bound at all, so a bind failure reads as a failure rather than
+# a silently-vacuous pass.
+query I
+SELECT ok FROM n6k_selftest_send_after_start();
+----
+true
+
+# Exactly one diagnostic row.
+query I
+SELECT count(*) FROM n6k_selftest_send_after_start();
+----
+1

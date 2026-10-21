@@ -1,0 +1,63 @@
+# name: test/sql/n6k.test
+# description: test n6k extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT * FROM n6k_catalog_query('nope', 'SELECT 1');
+----
+Catalog Error
+
+# Require statement will ensure this test is run with this extension loaded
+require n6k_client
+
+# Confirm the table function exists and reports the missing catalog rather than a binder error
+statement error
+SELECT * FROM n6k_catalog_query('nope', 'SELECT 1');
+----
+nope
+
+# --- TYPE n6k secret -------------------------------------------------------
+# Credentials may be supplied via CREATE SECRET instead of an inline ATTACH
+# token. The token is redacted in duckdb_secrets() and the SCOPE is stored
+# scheme-stripped so a bare hostname matches the (also scheme-stripped) base URL.
+
+statement ok
+CREATE SECRET n6k_test (TYPE n6k, TOKEN 'supersecret', SCOPE 'n6k://localhost:8099');
+
+# token value never appears; it shows as redacted
+query II
+SELECT secret_string LIKE '%supersecret%', secret_string LIKE '%token=redacted%'
+FROM duckdb_secrets() WHERE name = 'n6k_test';
+----
+false	true
+
+# SCOPE had its 'n6k://' scheme stripped before storage
+query I
+SELECT scope = ['localhost:8099'] FROM duckdb_secrets() WHERE name = 'n6k_test';
+----
+true
+
+# CREATE OR REPLACE rotates the secret in place
+statement ok
+CREATE OR REPLACE SECRET n6k_test (TYPE n6k, TOKEN 'rotated', SCOPE 'localhost');
+
+query I
+SELECT scope = ['localhost'] FROM duckdb_secrets() WHERE name = 'n6k_test';
+----
+true
+
+# An omitted SCOPE is a catch-all (empty prefix)
+statement ok
+CREATE SECRET n6k_test_any (TYPE n6k, TOKEN 'tok');
+
+query I
+SELECT scope = [''] FROM duckdb_secrets() WHERE name = 'n6k_test_any';
+----
+true
+
+statement ok
+DROP SECRET n6k_test;
+
+statement ok
+DROP SECRET n6k_test_any;

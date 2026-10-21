@@ -1,0 +1,35 @@
+# name: test/sql/n6k_connect.test
+# description: binder contract for n6k_connect
+# group: [sql]
+
+require n6k_client
+
+statement error
+SELECT * FROM n6k_connect(token => 'x');
+----
+requires wsFd
+
+statement error
+SELECT * FROM n6k_connect(wsFd => -1);
+----
+is not a valid file descriptor
+
+statement error
+SELECT * FROM n6k_connect(wsFd => 7, token => NULL);
+----
+token must not be NULL
+
+statement error
+SELECT * FROM n6k_connect(wsFd => 7);
+----
+requires token or scope
+
+statement error
+SELECT * FROM n6k_connect(wsFd => 7, scope => '');
+----
+requires token or scope
+
+statement error
+SELECT * FROM n6k_connect(wsFd => 7, scope => NULL);
+----
+scope must not be NULL

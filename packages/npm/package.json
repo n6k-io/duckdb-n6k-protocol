@@ -1,0 +1,85 @@
+{
+  "name": "@n6k.io/db",
+  "version": "0.11.3",
+  "description": "DuckDB-wasm driver for the n6k extension",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./wasm-dir": "./src/wasm-dir.ts",
+    "./node": "./src/node.ts",
+    "./native/*": "./src/native/*.ts",
+    "./native-wasm-adapter/*": "./src/native-wasm-adapter/*.ts",
+    "./react": "./src/react/index.ts",
+    "./react/core": "./src/react/core.ts",
+    "./react/iframe": "./src/react/iframe/index.ts",
+    "./workers": "./src/workers/manifest.ts",
+    "./workers/duckdb-worker": "./src/workers/duckdb-worker.ts",
+    "./copy-wasm-extensions": "./src/copy-wasm-extensions.ts"
+  },
+  "bin": {
+    "copy-wasm-extensions": "./src/copy-wasm-extensions.ts"
+  },
+  "files": [
+    "src/",
+    "wasm/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/n6k-io/duckdb-driver",
+    "directory": "packages/npm"
+  },
+  "keywords": [
+    "duckdb",
+    "wasm",
+    "worker",
+    "sharedarraybuffer",
+    "sql"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "lint": "eslint src/",
+    "test": "N6K_REAL_HOME=\"$HOME\" HOME=\"$(mktemp -d)\" N6K_ISO_HOME=1 bun test",
+    "integration-tests": "bash scripts/integration-tests.sh",
+    "typecheck": "tsc",
+    "fmt": "prettier --write src/",
+    "fmt:check": "prettier --check src/",
+    "profile": "bun scripts/profile.ts",
+    "check": "bun fmt --log-level warn && bun lint --fix && bun typecheck",
+    "ci": "bun run fmt:check && bun run lint && bun run typecheck && BACKEND=skip TEST_SERVER=skip bun run test"
+  },
+  "peerDependencies": {
+    "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
+    "@duckdb/node-api": "1.5.4-r.1",
+    "@tanstack/react-query": "^5",
+    "@types/react": "^19.0.0",
+    "react": "^19.2.4",
+    "apache-arrow": "*"
+  },
+  "peerDependenciesMeta": {
+    "@duckdb/node-api": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@duckdb/node-api": "1.5.4-r.1",
+    "@eslint/js": "^10.0.1",
+    "@types/react-dom": "19.2.3",
+    "eslint": "^10.0.3",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-unicorn": "^63.0.0",
+    "globals": "^17.4.0",
+    "playwright-core": "1.60.0",
+    "prettier": "^3.8.1",
+    "react-dom": "19.2.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.57.0"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.2",
+    "nanoid": "^6.0.2"
+  }
+}

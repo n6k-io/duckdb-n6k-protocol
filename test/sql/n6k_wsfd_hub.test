@@ -1,0 +1,25 @@
+# name: test/sql/n6k_wsfd_hub.test
+# description: one socket shared by two catalog sessions demuxes by ns
+# group: [sql]
+
+require n6k_client
+
+# Two ATTACHes may ride one wsFd. Exactly one reader owns the fd, and each frame
+# reaches the session named by its ns; two readers on one socket would race read()
+# and split frames between them.
+#
+# sqllogictest only ever runs in the native build, where FdTransport exists, so the
+# per-session counts below are asserted directly rather than gated on mode.
+query IIIIIIIIII
+SELECT mode, got_ns1, got_ns2, ns1_only_own, ns2_only_own,
+       untagged_broadcast, unknown_ns_dropped, single_hub,
+       request_routed, pong_not_stolen
+FROM n6k_selftest_fd_hub_routing();
+----
+native	3	3	true	true	true	true	true	true	true
+
+# ok folds in every condition above, so a harness failure can't read as a pass.
+query I
+SELECT ok FROM n6k_selftest_fd_hub_routing();
+----
+true

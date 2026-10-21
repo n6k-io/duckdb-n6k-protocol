@@ -1,0 +1,61 @@
+# name: test/sql/n6k_handshake.test
+# description: bind errors and frame shape for n6k_handshake / n6k_reject / n6k_hello_pending / n6k_hello_ack; binding n6k_serve_fd has no side effect
+# group: [sql]
+
+require n6k_server
+
+statement error
+SELECT * FROM n6k_handshake(NULL);
+----
+requires a file descriptor
+
+statement error
+SELECT * FROM n6k_handshake(-1);
+----
+is not a valid file descriptor
+
+statement error
+SELECT * FROM n6k_reject(NULL);
+----
+requires a reason
+
+query I
+SELECT octet_length(frame) > 0 FROM n6k_reject('unauthorized');
+----
+true
+
+query I
+SELECT octet_length(frame) > 0 FROM n6k_hello_pending(NULL);
+----
+true
+
+statement error
+SELECT * FROM n6k_hello_ack(app_capabilities => ['nope']);
+----
+unknown capability 'nope'
+
+query I
+SELECT (SELECT frame FROM n6k_hello_ack(capabilities => ['jsonrpc', 'foo'])) = (SELECT frame FROM n6k_hello_ack());
+----
+true
+
+query I
+SELECT (SELECT frame FROM n6k_hello_ack(capabilities => ['jsonrpc'], app_capabilities => ['jsonrpc'])) = (SELECT frame FROM n6k_hello_ack());
+----
+false
+
+statement error
+CALL n6k_serve_fd(7, auth_function => 'x');
+----
+auth_function
+
+statement ok
+EXPLAIN SELECT * FROM n6k_serve_fd(7, 'memory');
+
+statement ok
+EXPLAIN SELECT * FROM n6k_serve_fd(7, 'memory');
+
+statement error
+SELECT * FROM n6k_handshake(-1);
+----
+is not a valid file descriptor

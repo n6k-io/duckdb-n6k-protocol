@@ -1,0 +1,56 @@
+[project]
+name = "n6k-duckdb-driver-dev"
+version = "0"
+description = "Dev harness for the n6k DuckDB driver (workspace root). Not published."
+requires-python = ">=3.11"
+dependencies = [
+    "n6k-duckdb[test-server,mcp]",
+    # Must match the built C++ extension's DuckDB version.
+    "duckdb==1.5.4",
+]
+
+[tool.uv.sources]
+n6k-duckdb = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/python"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "websockets>=12",
+    "black>=24",
+    "clang-format==11.0.1",
+    "cmake-format>=0.6",
+    "clang-tidy>=18",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["integration_tests", "packages/python/tests"]
+
+[tool.black]
+line-length = 120
+# Don't descend into submodules, vendored code, or the workspace member
+# (packages/python has its own config that should stay authoritative for itself).
+extend-exclude = '''
+/(
+    duckdb
+  | extension-ci-tools
+  | third_party
+  | packages/python
+  | packages/npm/node_modules
+  | test-app/node_modules
+  | scratch
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+# mypy config lives in packages/python/pyproject.toml. Always run mypy
+# from inside packages/python/ (see CLAUDE.md) — mypy's config discovery
+# follows the CWD, and a root-level [tool.mypy] block wouldn't help
+# because `mypy packages/python/...` from here doesn't pick up the same
+# package/module resolution as `cd packages/python && mypy .`.

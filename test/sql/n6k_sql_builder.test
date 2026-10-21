@@ -1,0 +1,60 @@
+# name: test/sql/n6k_sql_builder.test
+# description: n6k_testing_build_*_sql scalars — structure in, SQL out
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT n6k_testing_build_table_schema_sql('db', 'main', 't');
+----
+Catalog Error
+
+require n6k_testing
+
+# ------------------------------------------------------ create / alter
+
+# Column types are type EXPRESSIONS, interpolated verbatim; only names are quoted.
+query T
+SELECT n6k_testing_build_create_table_sql('db', 'main', 't', '[{"name":"a","type":"INTEGER"},{"name":"b\"c","type":"VARCHAR"}]');
+----
+CREATE TABLE "db"."main"."t" ("a" INTEGER, "b""c" VARCHAR)
+
+query T
+SELECT n6k_testing_build_alter_sql('db', 'main', 't', 'add_column', '{"name":"a","type":"INTEGER"}');
+----
+ALTER TABLE "db"."main"."t" ADD COLUMN "a" INTEGER
+
+query T
+SELECT n6k_testing_build_alter_sql('db', 'main', 't', 'drop_column', '{"name":"a"}');
+----
+ALTER TABLE "db"."main"."t" DROP COLUMN "a"
+
+query T
+SELECT n6k_testing_build_alter_sql('db', 'main', 't', 'rename_column', '{"old_name":"a\"b","new_name":"c"}');
+----
+ALTER TABLE "db"."main"."t" RENAME COLUMN "a""b" TO "c"
+
+statement error
+SELECT n6k_testing_build_alter_sql('db', 'main', 't', 'drop_table', '{}');
+----
+unsupported alter kind
+
+# ------------------------------------------------ table_schema / target
+
+query T
+SELECT n6k_testing_build_table_schema_sql('db', 'main', 't');
+----
+SELECT * FROM "db"."main"."t" LIMIT 0
+
+# Every part of the qualified name is quoted, embedded quotes doubled.
+query T
+SELECT n6k_testing_qualified_table('ca"t', 'we"ird', 'ta"ble');
+----
+"ca""t"."we""ird"."ta""ble"
+
+# The scalars are row-wise, not one-shot: a multi-row input builds one statement
+# per row.
+query T
+SELECT n6k_testing_build_table_schema_sql('db', 'main', name) FROM (VALUES ('a'), ('b')) v(name) ORDER BY 1;
+----
+SELECT * FROM "db"."main"."a" LIMIT 0
+SELECT * FROM "db"."main"."b" LIMIT 0

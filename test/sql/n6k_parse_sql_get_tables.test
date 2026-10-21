@@ -1,0 +1,222 @@
+# name: test/sql/n6k_parse_sql_get_tables.test
+# description: test n6k_parse_sql_get_tables function
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT * FROM n6k_parse_sql_get_tables('SELECT 1');
+----
+Catalog Error
+
+require n6k_client
+
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM foo');
+----
+NULL	NULL	foo	base_table	select
+
+# 2-part name where the prefix is a known schema in default catalog (`main`):
+# resolved as (default_catalog, main, bar).
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM main.bar');
+----
+memory	main	bar	base_table	select
+
+# 2-part name where the prefix is neither an attached catalog nor a known
+# schema: emitted as (NULL, prefix, table) — ambiguous, consumer wildcards.
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM page_db.foo');
+----
+NULL	page_db	foo	base_table	select
+
+# 2-part name where the prefix IS an attached catalog: emitted with the
+# prefix promoted to the catalog column, schema NULL.
+statement ok
+ATTACH ':memory:' AS extra_db;
+
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM extra_db.foo');
+----
+extra_db	NULL	foo	base_table	select
+
+statement ok
+DETACH extra_db;
+
+# Fully qualified 3-part
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM mydb.myschema.bar');
+----
+mydb	myschema	bar	base_table	select
+
+# JOIN: both sides collected
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM todos JOIN users ON todos.uid = users.id') ORDER BY table_name;
+----
+NULL	NULL	todos	base_table	select
+NULL	NULL	users	base_table	select
+
+# INSERT target only: target is privilege_type 'insert'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('INSERT INTO foo VALUES (1, 2, 3)');
+----
+NULL	NULL	foo	base_table	insert
+
+# INSERT ... SELECT: target 'insert', source 'select'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('INSERT INTO foo SELECT * FROM bar') ORDER BY table_name;
+----
+NULL	NULL	bar	base_table	select
+NULL	NULL	foo	base_table	insert
+
+# UPDATE target: privilege_type 'update'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('UPDATE foo SET x = 1 WHERE id = 5');
+----
+NULL	NULL	foo	base_table	update
+
+# DELETE target: privilege_type 'delete'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('DELETE FROM foo WHERE id = 5');
+----
+NULL	NULL	foo	base_table	delete
+
+# UNION
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM a UNION ALL SELECT * FROM b') ORDER BY table_name;
+----
+NULL	NULL	a	base_table	select
+NULL	NULL	b	base_table	select
+
+# Subquery
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM (SELECT * FROM inner_tbl) sub') ORDER BY table_name;
+----
+NULL	NULL	inner_tbl	base_table	select
+
+# No tables (literal select)
+query I
+SELECT count(*) FROM n6k_parse_sql_get_tables('SELECT 1');
+----
+0
+
+# Deduplication: same table referenced twice with the same access collapses.
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM foo f1 JOIN foo f2 ON f1.id = f2.id');
+----
+NULL	NULL	foo	base_table	select
+
+# Same table both read and written yields two distinct rows.
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('INSERT INTO t SELECT * FROM t') ORDER BY privilege_type;
+----
+NULL	NULL	t	base_table	insert
+NULL	NULL	t	base_table	select
+
+# UPDATE with FROM: target 'update', FROM source 'select'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('UPDATE foo SET x = bar.x FROM bar WHERE foo.id = bar.id') ORDER BY table_name;
+----
+NULL	NULL	bar	base_table	select
+NULL	NULL	foo	base_table	update
+
+# CTE: alias filtered out, body's underlying table returned
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables(
+  'WITH cte AS (SELECT * FROM page_db.bar) SELECT * FROM cte'
+) ORDER BY table_name;
+----
+NULL	page_db	bar	base_table	select
+
+# Table function: emitted with ref_type='table_function'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM duckdb_tables()');
+----
+NULL	NULL	duckdb_tables	table_function	select
+
+statement ok
+ATTACH ':memory:' AS extra_db;
+
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM extra_db.some_fn(1)');
+----
+extra_db	NULL	some_fn	table_function	select
+
+statement ok
+DETACH extra_db;
+
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM page_db.some_fn(1)');
+----
+NULL	page_db	some_fn	table_function	select
+
+# Quoted identifier containing a dot stays a single table name
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SELECT * FROM "weird.name"');
+----
+NULL	NULL	weird.name	base_table	select
+
+# --- DDL targets ---
+
+# CREATE TABLE: target captured with privilege_type 'create'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('CREATE TABLE reports (id INT)');
+----
+NULL	NULL	reports	base_table	create
+
+# CREATE TABLE AS SELECT: target 'create', source 'select'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('CREATE TABLE r AS SELECT * FROM s') ORDER BY table_name;
+----
+NULL	NULL	r	base_table	create
+NULL	NULL	s	base_table	select
+
+# CREATE VIEW: view target 'create', body source 'select'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('CREATE VIEW v AS SELECT * FROM t') ORDER BY table_name;
+----
+NULL	NULL	t	base_table	select
+NULL	NULL	v	base_table	create
+
+# DROP TABLE: target captured with privilege_type 'drop'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('DROP TABLE old_data');
+----
+NULL	NULL	old_data	base_table	drop
+
+# ALTER TABLE: target captured with privilege_type 'alter'
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('ALTER TABLE users ADD COLUMN email VARCHAR');
+----
+NULL	NULL	users	base_table	alter
+
+# --- DESCRIBE / SUMMARIZE / SHOW ---
+
+# DESCRIBE a table reports it as a read, just like SELECT * FROM it.
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('DESCRIBE foo');
+----
+NULL	NULL	foo	base_table	select
+
+# DESCRIBE qualified table
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('DESCRIBE mydb.myschema.bar');
+----
+mydb	myschema	bar	base_table	select
+
+# DESCRIBE of a sub-select recurses into the inner query.
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('DESCRIBE (SELECT * FROM inner_tbl)');
+----
+NULL	NULL	inner_tbl	base_table	select
+
+# SUMMARIZE a table behaves like DESCRIBE
+query IIIII
+SELECT catalog, schema, table_name, ref_type, privilege_type FROM n6k_parse_sql_get_tables('SUMMARIZE foo');
+----
+NULL	NULL	foo	base_table	select
+
+# SHOW TABLES is a catalog listing — no specific table, emits nothing.
+query I
+SELECT count(*) FROM n6k_parse_sql_get_tables('SHOW TABLES');
+----
+0

@@ -1,0 +1,98 @@
+[project]
+name = "n6k-duckdb"
+version = "0.11.3"
+description = "In-process bridge between DuckDB connections with policy-based access control"
+readme = "README.md"
+authors = [
+    { email = "srossross@gmail.com" }
+]
+requires-python = ">=3.9"
+# Core deps are the pure protocol library `n6k_protocol` (wire format + engine +
+# handler contract): pyarrow + numpy for Arrow bodies, msgpack for the frame
+# header codec, and jsonschema to validate decoded headers against the generated
+# schema.json. The FastAPI adapter and duckdb-backed handler (both in
+# `n6k_server`) are optional extras below.
+dependencies = ["pyarrow", "numpy", "msgpack", "jsonschema", "typing_extensions"]
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=1.0.0"]
+fastapi = ["fastapi>=0.100", "starlette"]
+# watchfiles is not optional for the reload path: without it uvicorn falls back to
+# StatReload, which hardcodes rglob("*.py") and ignores reload_includes entirely —
+# so a rebuilt .duckdb_extension would never trigger a restart.
+mcp = ["mcp>=2.3,<3; python_version >= '3.10'"]
+test-server = ["fastapi>=0.100", "uvicorn>=0.27", "watchfiles>=0.21", "python-dotenv>=1"]
+
+[project.scripts]
+n6k-docs = "n6k_protocol.scripts.docgen:main"
+test-server = "n6k_server.test_server.__main__:main"
+
+# Ship two top-level import packages from this single distribution:
+#   n6k_protocol — pure protocol library (pyarrow+numpy): wire + engine + handler
+#   n6k_server   — FastAPI adapter + duckdb-backed handler (depends on n6k_protocol)
+[tool.uv.build-backend]
+module-name = ["n6k_protocol", "n6k_server"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "websockets>=12",
+    "httpx>=0.27",  # for fastapi.TestClient in framework unit tests
+    "fastapi>=0.100",  # framework/adapter unit tests
+    "duckdb>=1.0.0",  # duckdb-backed tests (duckdb is no longer a core dep)
+    "pandas>=2",  # Categorical round-trip tests
+    "black>=24",
+    "flake8>=7",
+    "mypy>=1",
+    "types-jsonschema",  # typeshed stubs for the header validator
+    "msgpack-types",  # stubs for the frame-header msgpack codec (msgpack ships no py.typed)
+    "pyjwt[crypto]>=2.13.0",
+    "python-dotenv>=1",
+]
+
+[tool.pytest.ini_options]
+# Tests are colocated with the code they cover under `src/<pkg>/**/__tests__/`.
+# `conftest.py` at this directory registers CLI options (--from-bucket, --external).
+testpaths = ["src"]
+
+[tool.black]
+line-length = 120
+
+[tool.mypy]
+strict = true
+exclude = ["\\.venv/", "build/", "dist/"]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+# Relax strict type-checking inside colocated `__tests__/` packages.
+#
+# Rationale: tests are executable fixtures, not API surface. Strict mode on
+# pytest-style tests forces `-> None` on every test function, variance fixes
+# on every `duckdb.connect(config=...)` call, None-checks on every
+# `fetchone()`, and similar noise that doesn't catch bugs. Library code
+# under `src/` stays fully strict.
+#
+# Matching: tests live at `src/<pkg>/**/__tests__/*.py`, so their module names
+# are `<pkg>.__tests__.*` and `<pkg>.<subpkg>.__tests__.*`. Mypy `module` globs
+# don't support `**`, so we enumerate the two depths that exist today. Add a new
+# line if tests get added under a deeper package.
+[[tool.mypy.overrides]]
+module = [
+    "n6k_server.__tests__.*",
+    "n6k_server.*.__tests__.*",
+    "n6k_protocol.__tests__.*",
+    "n6k_protocol.*.__tests__.*",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+disallow_untyped_decorators = false
+disallow_untyped_calls = false
+warn_return_any = false
+
+[build-system]
+requires = ["uv_build>=0.9.27,<0.10.0"]
+build-backend = "uv_build"

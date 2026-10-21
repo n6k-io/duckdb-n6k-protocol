@@ -1,0 +1,64 @@
+# name: test/sql/n6k_split_statements.test
+# description: test n6k_split_statements function
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT * FROM n6k_split_statements('SELECT 1');
+----
+Catalog Error
+
+require n6k_client
+
+# Basic split: one row per statement, 1-based ordinality
+query ITT
+SELECT ordinality, statement, statement_type FROM n6k_split_statements('SELECT 1; SELECT 2; SELECT 3');
+----
+1	SELECT 1	SELECT
+2	SELECT 2	SELECT
+3	SELECT 3	SELECT
+
+# Trailing semicolon produces no empty trailing row
+query I
+SELECT count(*) FROM n6k_split_statements('SELECT 1; SELECT 2; SELECT 3;');
+----
+3
+
+# Single statement, no trailing semicolon
+query ITT
+SELECT ordinality, statement, statement_type FROM n6k_split_statements('SELECT 42');
+----
+1	SELECT 42	SELECT
+
+# Semicolon inside a string literal does NOT split the statement
+query ITT
+SELECT ordinality, statement, statement_type FROM n6k_split_statements('SELECT ''a;b;c''');
+----
+1	SELECT 'a;b;c'	SELECT
+
+# Mixed statement types are reported correctly, text sliced verbatim
+query ITT
+SELECT ordinality, statement, statement_type FROM n6k_split_statements('SELECT 1; INSERT INTO t VALUES (1); DELETE FROM t');
+----
+1	SELECT 1	SELECT
+2	INSERT INTO t VALUES (1)	INSERT
+3	DELETE FROM t	DELETE
+
+# Leading/trailing whitespace around each statement is trimmed
+query T
+SELECT statement FROM n6k_split_statements('   SELECT 1   ;   SELECT 2   ') ORDER BY ordinality;
+----
+SELECT 1
+SELECT 2
+
+# Empty input yields no rows
+query I
+SELECT count(*) FROM n6k_split_statements('');
+----
+0
+
+# Whitespace-only input yields no rows
+query I
+SELECT count(*) FROM n6k_split_statements('   ');
+----
+0

@@ -1,0 +1,44 @@
+# name: test/sql/n6k_table_describe.test
+# description: n6k_table_describe single-table descriptor
+# group: [sql]
+
+require n6k_client
+
+statement ok
+CREATE TABLE memory.main.dt(id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, n INTEGER DEFAULT 5);
+
+query ITT
+SELECT len(columns), verbs, primary_key
+FROM n6k_table_describe('memory', schema := 'main', "table" := 'dt');
+----
+3	[select, insert, update, delete, alter, drop]	[id]
+
+# Per-column detail via the struct list (explicit NOT NULL and DEFAULT).
+query TTT
+SELECT c.name, c.nullable, c."default"
+FROM n6k_table_describe('memory', schema := 'main', "table" := 'dt') t, UNNEST(t.columns) AS u(c)
+WHERE c.name IN ('name', 'n')
+ORDER BY c.name;
+----
+n	true	5
+name	false	NULL
+
+statement ok
+CREATE VIEW memory.main.dv AS SELECT id FROM memory.main.dt;
+
+query T
+SELECT verbs FROM n6k_table_describe('memory', schema := 'main', "table" := 'dv');
+----
+[select, drop]
+
+query TTT
+SELECT name, kind, verbs FROM n6k_table_permissions('memory', schema := 'main') ORDER BY name;
+----
+dt	native_table	[select, insert, update, delete, alter, drop]
+dv	native_view	[select, drop]
+
+# Missing table errors.
+statement error
+SELECT * FROM n6k_table_describe('memory', schema := 'main', "table" := 'nope');
+----
+not found

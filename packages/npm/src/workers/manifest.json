@@ -1,0 +1,15 @@
+{
+  "urlPrefix": "/_n6k/workers",
+  "workers": [
+    {
+      "exportName": "duckdbWorkerUrl",
+      "file": "n6k-duckdb-worker.js",
+      "src": "src/workers/duckdb-worker.ts"
+    },
+    {
+      "exportName": "wsWorkerUrl",
+      "file": "ws-worker.js",
+      "src": "src/workers/ws-worker.ts"
+    }
+  ]
+}
