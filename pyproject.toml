@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "n6k-duckdb[test-server,mcp]",
     # Must match the built C++ extension's DuckDB version.
-    "duckdb==1.5.4",
+    "duckdb==1.5.6",
 ]
 
 [tool.uv.sources]
@@ -24,6 +24,7 @@ dev = [
     "clang-format==11.0.1",
     "cmake-format>=0.6",
     "clang-tidy>=18",
+    "httpx>=0.28.1",
 ]
 
 [tool.pytest.ini_options]

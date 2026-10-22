@@ -69,10 +69,10 @@ jobs:
       # Reuse the wasm already built by the distribution pipeline for this commit
       # — no rebuild. (parquet/core_functions are statically linked into
       # @duckdb/duckdb-wasm, so they are not bundled.) The pipeline now publishes
-      # ONE artifact per variant (n6k_client-v1.5.4-extension-<variant>) holding every
+      # ONE artifact per variant (n6k_client-v1.5.6-extension-<variant>) holding every
       # built extension nested under the repository/ tree, so stage it and copy
       # only the extension the package ships (n6k_client) flat into
-      # wasm/v1.5.4/<variant>/ where the package serves it. n6k_server is
+      # wasm/v1.5.6/<variant>/ where the package serves it. n6k_server is
       # POSIX-only (UDS) and intentionally not bundled for the browser.
       - name: Download n6k_client wasm from that run
         env:
@@ -80,10 +80,10 @@ jobs:
           RUN_ID: ${{ steps.find.outputs.run_id }}
         run: |
           for variant in wasm_threads; do
-            dest="wasm/v1.5.4/$variant"
+            dest="wasm/v1.5.6/$variant"
             mkdir -p "$dest"
             tmp="$(mktemp -d)"
-            gh run download "$RUN_ID" -n "n6k_client-v1.5.4-extension-$variant" -D "$tmp"
+            gh run download "$RUN_ID" -n "n6k_client-v1.5.6-extension-$variant" -D "$tmp"
             for ext in n6k_client; do
               find "$tmp" -name "$ext.duckdb_extension.wasm" -exec cp {} "$dest/" \;
             done
@@ -94,7 +94,7 @@ jobs:
           missing=0
           for variant in wasm_threads; do
             for ext in n6k_client; do
-              f="wasm/v1.5.4/$variant/$ext.duckdb_extension.wasm"
+              f="wasm/v1.5.6/$variant/$ext.duckdb_extension.wasm"
               if [ ! -f "$f" ]; then
                 echo "::error::missing $f in downloaded bundle"
                 missing=1

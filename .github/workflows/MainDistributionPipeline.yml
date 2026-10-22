@@ -70,10 +70,10 @@ jobs:
   duckdb-stable-build:
     name: Build n6k extension binaries
     needs: version-check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.6
     with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5.4
+      duckdb_version: v1.5.6
+      ci_tools_version: v1.5.6
       extension_name: n6k_client
       # coi-only: build wasm_threads, never eh/mvp (they can't load a shared-memory
       # extension). On PRs also drop the non-amd64 native arches for speed.
@@ -84,10 +84,10 @@ jobs:
   code-quality-check:
     name: Code Quality Check
     needs: version-check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.4
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.6
     with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5.4
+      duckdb_version: v1.5.6
+      ci_tools_version: v1.5.6
       extension_name: n6k_client
       format_checks: 'format;tidy'
 
@@ -121,14 +121,14 @@ jobs:
             git clone https://github.com/duckdb/duckdb.git
           fi
           cd duckdb
-          git checkout v1.5.4
+          git checkout v1.5.6
 
       # One artifact per arch holds every extension built for it (n6k_client,
       # and n6k_server on non-Windows), nested under the repository/
       # tree — staged here, then flattened + uploaded one extension at a time.
       - uses: actions/download-artifact@v4
         with:
-          name: n6k_client-v1.5.4-extension-${{ matrix.duckdb_arch }}
+          name: n6k_client-v1.5.6-extension-${{ matrix.duckdb_arch }}
           path: /tmp/artifact
 
       - uses: ./.github/actions/setup-gcloud

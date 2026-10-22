@@ -53,7 +53,7 @@ The directory structure is:
 
 ```
 wasm/
-  v1.5.4/
+  v1.5.6/
     wasm_threads/
       n6k_client.duckdb_extension.wasm
       ...

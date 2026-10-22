@@ -84,6 +84,10 @@ rejected token (`HELLO_ERR`) or an unserved catalog (`OPEN_ERR`) fails the
 Prerequisites: CMake, C++17 compiler, Python with `uv`.
 
 ```sh
+git clone --recurse-submodules https://github.com/n6k-io/duckdb-n6k-protocol.git
+# or, in an existing clone:
+git submodule update --init --recursive
+
 make release
 ```
 

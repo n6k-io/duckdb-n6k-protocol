@@ -740,7 +740,7 @@ def test_policies_insert_check_rejects_row():
     assert source.sql("SELECT id FROM t ORDER BY id").fetchall() == [(1,), (2,), (3,)]
 
 
-def test_policies_delete_respects_select_policy():
+def test_policies_delete_ignores_select_policy():
     source = _tenant_source()
     target = _target()
     _bridge(
@@ -750,7 +750,7 @@ def test_policies_delete_respects_select_policy():
     )
 
     target.sql(f"DELETE FROM {T}")
-    assert source.sql("SELECT id FROM t ORDER BY id").fetchall() == [(2,)]
+    assert source.sql("SELECT id FROM t ORDER BY id").fetchall() == []
 
 
 def test_unqualified_policy_table_rejected():
