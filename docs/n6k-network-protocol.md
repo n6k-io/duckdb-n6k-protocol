@@ -219,7 +219,18 @@ flags transient faults the client may safely retry (e.g. a
 
 `exception_type` is the name of the DuckDB `Exception` subclass the
 client should throw; the allowed values are `EXCEPTION_TYPES` in
-`packages/python/src/n6k_protocol/protocol.py`. Unknown values MUST be treated
+`packages/python/src/n6k_protocol/protocol.py`:
+
+`BinderException`, `ConstraintException`, `ConversionException`,
+`DependencyException`, `InvalidInputException`, `InvalidTypeException`,
+`OutOfRangeException`, `ParserException`, `SyntaxException`,
+`TypeMismatchException`, `CatalogException`, `NotImplementedException`,
+`ConnectionException`, `FatalException`, `HTTPException`, `InternalException`,
+`InterruptException`, `IOException`, `OutOfMemoryException`,
+`PermissionException`, `SequenceException`, `SerializationException`,
+`TransactionException`.
+
+Unknown values MUST be treated
 as `IOException` by the client.
 
 The client prefixes the reconstructed message with the catalog and op
