@@ -42,7 +42,7 @@ list. Tables and verbs without a policy are inaccessible.
 
 ## How it works
 
-`bridge()` loads the `vcatbridge` DuckDB extension — from `$VIRTUAL_CATALOG_EXT_DIR` when set, otherwise installed from the n6k extension repository. The extension creates an in-process bridge between two DuckDB database instances using a token-based handshake; one `bridge()` call is one attached catalog, and `unbridge()` detaches it.
+`bridge()` loads the `vcatbridge` DuckDB extension — from `$VIRTUAL_CATALOG_EXT_DIR` when it holds a build, otherwise installed from the n6k extension repository. The extension creates an in-process bridge between two DuckDB database instances using a token-based handshake; one `bridge()` call is one attached catalog, and `unbridge()` detaches it.
 
 No network server is required — data flows directly between connections in the same process.
 

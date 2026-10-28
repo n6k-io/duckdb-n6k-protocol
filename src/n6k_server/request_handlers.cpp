@@ -592,8 +592,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 //   next(handle)                                      -> BLOB   one IPC record batch, NULL at end
 //   close(handle)                                     -> BLOB   trailing end-of-stream bytes
 //
-// vcatprovider creates the catalog entry and lists it via vcatprovider_stream_functions();
-// that listing is the only contract between the two extensions.
+// vcatprovider creates the catalog entry and lists it via vcatprovider_stream_functions().
 struct StreamFunctionInfo {
 	std::string open_udf;
 	std::string next_udf;

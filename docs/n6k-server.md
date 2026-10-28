@@ -341,9 +341,9 @@ SELECT vcatprovider_create_stream_function(catalog, schema, name, open_udf, next
 SELECT vcatprovider_drop_stream_function(catalog, schema, name);
 ```
 
-Both come from **`vcatprovider`** (sibling `duckdb-virtual-catalog`
-repo), not `n6k_server`; the server only recognises such an entry — by finding it
-in `vcatprovider_stream_functions()` — to forward the generator's Arrow bytes untouched.
+`vcatprovider` is in the sibling `duckdb-virtual-catalog` repo. The server only
+recognises such an entry — by finding it in `vcatprovider_stream_functions()` — to
+forward the generator's Arrow bytes untouched.
 `register_rpc_streams()` loads `vcatprovider` for you.
 
 That entry is an ordinary table function, so it needs nothing passed to the

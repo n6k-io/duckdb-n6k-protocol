@@ -7,9 +7,8 @@ scalar-only.
 
 So this module registers three scalar UDFs (open/next/close, speaking Arrow IPC)
 and asks the extension to build a table function over them, via
-`vcatprovider_create_stream_function`, which `vcatprovider` provides. The
-result is an ordinary catalog entry: the
-reactor resolves it like any other table function and drives the generator one
+`vcatprovider_create_stream_function`. The result is an ordinary catalog entry:
+the reactor resolves it like any other table function and drives the generator one
 Arrow batch per `RESP_CHUNK`, paced by the client's credit and closed on cancel,
 and `SELECT * FROM <catalog>.main.<name>(...)` works locally with no server.
 
