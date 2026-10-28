@@ -188,15 +188,15 @@ static PermissionCollectorFn LookupPermissionCollector(ClientContext &context, c
 	return it == registry->collectors.end() ? nullptr : it->second;
 }
 
-// The virtual_catalog extensions are separate binaries; their `<prefix>_table_permissions` table
+// The vcat extensions are separate binaries; their `<prefix>_table_permissions` table
 // function is the contract. Its `verbs` list passes through (minus `alter` on bridged kinds), and its open `kind` set
 // folds into the kinds n6k clients already know.
 static const char *VirtualCatalogPermissionsFunction(const string &catalog_type) {
-	if (catalog_type == "virtual_catalog_bridge") {
-		return "bridge_table_permissions";
+	if (catalog_type == "vcatbridge") {
+		return "vcatbridge_table_permissions";
 	}
-	if (catalog_type == "virtual_catalog_provider") {
-		return "provider_table_permissions";
+	if (catalog_type == "vcatprovider") {
+		return "vcatprovider_table_permissions";
 	}
 	return nullptr;
 }

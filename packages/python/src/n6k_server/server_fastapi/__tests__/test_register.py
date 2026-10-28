@@ -42,7 +42,7 @@ from n6k_protocol.protocol import (
 )
 from n6k_server import pump
 from n6k_protocol.filters import Filters
-from n6k_server.extension import load_n6k_server, load_virtual_catalog_provider
+from n6k_server.extension import load_n6k_server, load_vcatprovider
 from n6k_server.provider import Provider, _catalogs, register_provider
 from n6k_server import context
 from n6k_server.jsonrpc import JsonRpc, JsonRpcApp
@@ -403,8 +403,8 @@ class _EmptyProvider(Provider):
 
 
 def _attach_provider(con: duckdb.DuckDBPyConnection, providers: list[Provider]) -> list[str]:
-    load_virtual_catalog_provider(con)
-    con.execute("ATTACH ':memory:' AS db (TYPE virtual_catalog_provider)")
+    load_vcatprovider(con)
+    con.execute("ATTACH ':memory:' AS db (TYPE vcatprovider)")
     provider = _EmptyProvider()
     register_provider(con, catalog="db", schema_name="main", provider=provider)
     providers.append(provider)
@@ -467,8 +467,8 @@ def test_closing_a_socket_while_a_provider_query_waits_on_the_loop_does_not_dead
     provider = _SlowListProvider()
 
     def with_provider(con: duckdb.DuckDBPyConnection, token: str) -> list[str]:
-        load_virtual_catalog_provider(con)
-        con.execute("ATTACH ':memory:' AS db (TYPE virtual_catalog_provider)")
+        load_vcatprovider(con)
+        con.execute("ATTACH ':memory:' AS db (TYPE vcatprovider)")
         register_provider(con, catalog="db", schema_name="main", provider=provider)
         return ["db"]
 

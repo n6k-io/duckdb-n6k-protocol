@@ -7,9 +7,8 @@ scalar-only.
 
 So this module registers three scalar UDFs (open/next/close, speaking Arrow IPC)
 and asks the extension to build a table function over them, via
-`provider_create_stream_function`, which `virtual_catalog_provider` provides. The
-result is an ordinary catalog entry: the
-reactor resolves it like any other table function and drives the generator one
+`vcatprovider_create_stream_function`. The result is an ordinary catalog entry:
+the reactor resolves it like any other table function and drives the generator one
 Arrow batch per `RESP_CHUNK`, paced by the client's credit and closed on cancel,
 and `SELECT * FROM <catalog>.main.<name>(...)` works locally with no server.
 
@@ -32,7 +31,7 @@ async def random_walk(scalars, table):
 
 def connect(ws):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-    load_virtual_catalog_provider(con)
+    load_vcatprovider(con)
     con.execute("ATTACH ':memory:' AS db")
     register_rpc_streams(con, catalog="db", registry={"random_walk": (StreamingRpc(random_walk), TICK)})
     return con
@@ -77,7 +76,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 from duckdb.func import FunctionNullHandling
 
-from n6k_server.extension import load_virtual_catalog_provider
+from n6k_server.extension import load_vcatprovider
 
 log = logging.getLogger(__name__)
 
@@ -355,7 +354,7 @@ class HostStreamUdfs:
             self.con.begin()
             try:
                 for catalog, name in self.created:
-                    self.con.execute("SELECT provider_drop_stream_function(?, ?, ?)", [catalog, RPC_SCHEMA, name])
+                    self.con.execute("SELECT vcatprovider_drop_stream_function(?, ?, ?)", [catalog, RPC_SCHEMA, name])
             except Exception:
                 self.con.rollback()
                 raise
@@ -399,7 +398,7 @@ def register_rpc_streams(
     if main_loop is None:
         main_loop = asyncio.get_running_loop()
 
-    load_virtual_catalog_provider(con)
+    load_vcatprovider(con)
     handle = HostStreamUdfs(con, uuid.uuid4().hex, main_loop)
     handle.create_functions()
 
@@ -415,7 +414,7 @@ def register_rpc_streams(
                 raise TypeError(f"RPC {name!r} needs a pa.Schema, got {type(schema).__name__}")
             handle.registry[name] = (fn, schema)
             con.execute(
-                "SELECT provider_create_stream_function(?, ?, ?, ?, ?, ?)",
+                "SELECT vcatprovider_create_stream_function(?, ?, ?, ?, ?, ?)",
                 [catalog, RPC_SCHEMA, name, open_udf, next_udf, close_udf],
             )
             handle.created.append((catalog, name))

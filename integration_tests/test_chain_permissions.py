@@ -1,7 +1,7 @@
 """n6k_table_permissions over a network→bridge→table chain.
 
 A network (TYPE n6k) client attaches to the test server, whose `bridge_db`
-catalog is itself a bridge (TYPE virtual_catalog_bridge) over a source connection. This
+catalog is itself a bridge (TYPE vcatbridge) over a source connection. This
 verifies that a bridge's verbs and primary keys survive the network hop: the server
 reports them via n6k_table_permissions, ships them in the tables_list response, and
 the client surfaces them as n6k_remote rows.

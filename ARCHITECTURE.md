@@ -8,13 +8,11 @@ The repo builds three DuckDB extensions:
 - **n6k_server** — serves attached catalogs over the n6k protocol.
 - **n6k_testing** — test-only functions; never published.
 
-The in-process bridge and provider catalogs (`virtual_catalog_bridge`,
-`virtual_catalog_provider`) come from the sibling `duckdb-virtual-catalog` repo.
-The only contract between the two repos is SQL: `n6k_table_permissions` /
-`n6k_table_describe` read `bridge_table_permissions` / `provider_table_permissions`
-for those catalog types, `n6k_server` finds host stream functions through
-`provider_stream_functions()`, and providers declare primary keys in Arrow schema
-metadata under `vcat.primary_keys`. The Python package (`bridge.py`, `provider.py`,
+The in-process bridge and provider catalogs (`vcatbridge`,
+`vcatprovider`) come from the sibling `duckdb-virtual-catalog` repo.
+The only contract between the two repos is SQL functions and Arrow schema metadata; see
+`VirtualCatalogPermissionsFunction` in `src/common/n6k_permissions.cpp`, `HostStreamOrNull`
+in `src/n6k_server/request_handlers.cpp`, and `PK_METADATA_KEY` in `provider.py`. The Python package (`bridge.py`, `provider.py`,
 `rpc_stream.py`) drives their SQL API; local builds resolve through
 `VIRTUAL_CATALOG_EXT_DIR`.
 

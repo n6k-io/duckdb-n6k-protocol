@@ -19,8 +19,8 @@ DuckDB extensions for remote and in-process data access.
 - Attach onto a WebSocket the host app already opened (browser): `await registerWebsocket(ws, token)` (sends the socket's one HELLO) then `ATTACH '' AS db (TYPE n6k, wsId '…')` (sends OPEN); see [n6k-network.md](docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser)
 - Attach onto a connected socket fd the host owns (native): `SELECT * FROM n6k_connect(wsFd => <fileno>, token => '…')` then `ATTACH '' AS db (TYPE n6k, wsFd <fileno>)` — the fd-level analogue of `wsId`, see [n6k-network.md](docs/n6k-network.md#attaching-an-existing-socket-fd-native)
 
-The in-process bridge and provider catalogs (`virtual_catalog_bridge`,
-`virtual_catalog_provider`) live in the sibling `duckdb-virtual-catalog` repo. The
+The in-process bridge and provider catalogs (`vcatbridge`,
+`vcatprovider`) live in the sibling `duckdb-virtual-catalog` repo. The
 Python package drives them; point `VIRTUAL_CATALOG_EXT_DIR` at that repo's
 `build/release/extension` to use a local build.
 
