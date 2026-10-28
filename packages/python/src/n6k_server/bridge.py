@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 
 
 class Policy(NamedTuple):
-    """One `vcatbridge_set_policy(bridge_id, table, setting, value)` call."""
+    """One `vcatbridge_set_policy` call."""
 
     table: str
     setting: str

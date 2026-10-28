@@ -1,7 +1,7 @@
 """Install and load the DuckDB extensions this package drives.
 
-``n6k_client`` is the client driver for ``ATTACH 'n6k://…'`` (only the extension is
-renamed; the storage type, secret type and URL scheme are still ``n6k``).
+``n6k_client`` is the client driver for ``ATTACH 'n6k://…'``; its storage type,
+secret type and URL scheme are ``n6k``.
 ``n6k_server`` serves attached catalogs over the n6k protocol. ``n6k_testing``
 is test-only and never published. ``vcatbridge`` and
 ``vcatprovider`` come from the sibling ``duckdb-virtual-catalog`` repo.
