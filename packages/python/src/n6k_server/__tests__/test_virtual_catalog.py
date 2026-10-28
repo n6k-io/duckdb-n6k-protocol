@@ -1,7 +1,7 @@
-"""`ATTACH ':memory:' AS workspace (TYPE virtual_catalog_provider)` must behave
+"""`ATTACH ':memory:' AS workspace (TYPE vcatprovider)` must behave
 identically to plain `:memory:` for native tables.
 
-The virtual_catalog_provider storage extension wraps a native DuckCatalog. A bare
+The vcatprovider storage extension wraps a native DuckCatalog. A bare
 catalog with no provider registered should be transparent:
 CREATE / INSERT / SELECT / ALTER / DROP / BEGIN-ROLLBACK / transactions
 behave the same as unwrapped DuckDB.
@@ -9,14 +9,14 @@ behave the same as unwrapped DuckDB.
 
 import duckdb
 
-from n6k_server.extension import load_virtual_catalog_provider
+from n6k_server.extension import load_vcatprovider
 
 CONN_CONFIG: dict[str, str | bool | int | float | list[str]] = {"allow_unsigned_extensions": "true"}
 
 
 def _attach(conn: duckdb.DuckDBPyConnection, name: str = "workspace") -> None:
-    load_virtual_catalog_provider(conn)
-    conn.execute(f"ATTACH ':memory:' AS {name} (TYPE virtual_catalog_provider)")
+    load_vcatprovider(conn)
+    conn.execute(f"ATTACH ':memory:' AS {name} (TYPE vcatprovider)")
 
 
 def test_create_insert_select() -> None:
@@ -109,4 +109,4 @@ def test_catalog_type_reported() -> None:
     conn = duckdb.connect(config=CONN_CONFIG)
     _attach(conn)
     rows = conn.execute("SELECT type FROM duckdb_databases() WHERE database_name='workspace'").fetchall()
-    assert rows == [("virtual_catalog_provider",)]
+    assert rows == [("vcatprovider",)]

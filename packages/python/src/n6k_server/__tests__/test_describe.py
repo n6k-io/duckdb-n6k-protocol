@@ -9,7 +9,7 @@ from typing import Any
 
 import duckdb
 
-from n6k_server.extension import load_n6k, load_virtual_catalog_bridge
+from n6k_server.extension import load_n6k, load_vcatbridge
 
 CONN_CONFIG: dict[str, str | bool | int | float | list[str]] = {"allow_unsigned_extensions": "true"}
 
@@ -73,7 +73,7 @@ def test_describe_bridge_readwrite_table() -> None:
     source.sql("CREATE TABLE rw(id INTEGER PRIMARY KEY, label VARCHAR)")
 
     target = _conn()
-    load_virtual_catalog_bridge(target)
+    load_vcatbridge(target)
     bridge(
         source,
         target,

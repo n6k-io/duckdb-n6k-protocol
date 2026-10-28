@@ -592,7 +592,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 //   next(handle)                                      -> BLOB   one IPC record batch, NULL at end
 //   close(handle)                                     -> BLOB   trailing end-of-stream bytes
 //
-// virtual_catalog_provider creates the catalog entry and lists it via provider_stream_functions();
+// vcatprovider creates the catalog entry and lists it via vcatprovider_stream_functions();
 // that listing is the only contract between the two extensions.
 struct StreamFunctionInfo {
 	std::string open_udf;
@@ -613,10 +613,10 @@ struct RpcTarget {
 };
 
 // The UDFs behind `entry_name`, or nullptr for an ordinary table function or when
-// virtual_catalog_provider is not loaded (the Prepare fails on the unknown function).
+// vcatprovider is not loaded (the Prepare fails on the unknown function).
 static unique_ptr<StreamFunctionInfo> HostStreamOrNull(Connection &conn, const std::string &catalog,
                                                        const std::string &schema, const std::string &entry_name) {
-	auto stmt = conn.Prepare("SELECT open_udf, next_udf, close_udf FROM provider_stream_functions() "
+	auto stmt = conn.Prepare("SELECT open_udf, next_udf, close_udf FROM vcatprovider_stream_functions() "
 	                         "WHERE catalog = ? AND schema = ? AND entry_name = ?");
 	if (stmt->HasError()) {
 		return nullptr;
@@ -767,7 +767,7 @@ struct RpcStreamCloser {
 //
 // The catalog entry is only used to find the UDF names: binding it as SQL would decode the host's
 // Arrow blobs into vectors and immediately re-encode them, and would buffer where this does not.
-// `SELECT * FROM db.main.<name>(...)` takes the bound path instead, inside virtual_catalog_provider.
+// `SELECT * FROM db.main.<name>(...)` takes the bound path instead, inside vcatprovider.
 static void HandleRpcStream(ServeReactor &reactor, Connection &conn, const StreamFunctionInfo &rpc,
                             const std::string &function, const std::string &args_json, const uint8_t *input,
                             size_t input_len, const FrameTarget &target, RequestSlot &slot) {

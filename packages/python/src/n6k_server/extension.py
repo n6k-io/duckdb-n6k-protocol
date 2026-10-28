@@ -3,8 +3,8 @@
 ``n6k_client`` is the client driver for ``ATTACH 'n6k://…'`` (only the extension is
 renamed; the storage type, secret type and URL scheme are still ``n6k``).
 ``n6k_server`` serves attached catalogs over the n6k protocol. ``n6k_testing``
-is test-only and never published. ``virtual_catalog_bridge`` and
-``virtual_catalog_provider`` come from the sibling ``duckdb-virtual-catalog`` repo.
+is test-only and never published. ``vcatbridge`` and
+``vcatprovider`` come from the sibling ``duckdb-virtual-catalog`` repo.
 
 Local builds resolve by name from ``$N6K_EXTENSION_DIR`` (this repo's
 ``build/release/extension``) and ``$VIRTUAL_CATALOG_EXT_DIR`` (the sibling repo's);
@@ -22,12 +22,12 @@ EXTENSION_REPO = "https://storage.googleapis.com/n6k-duckdb-release"
 EXTENSION_DIR_ENV = "N6K_EXTENSION_DIR"
 VIRTUAL_CATALOG_EXT_DIR_ENV = "VIRTUAL_CATALOG_EXT_DIR"
 
-VIRTUAL_CATALOG_BRIDGE = "virtual_catalog_bridge"
-VIRTUAL_CATALOG_PROVIDER = "virtual_catalog_provider"
+VCATBRIDGE = "vcatbridge"
+VCATPROVIDER = "vcatprovider"
 
 _EXTENSION_DIR_ENVS = {
-    VIRTUAL_CATALOG_BRIDGE: VIRTUAL_CATALOG_EXT_DIR_ENV,
-    VIRTUAL_CATALOG_PROVIDER: VIRTUAL_CATALOG_EXT_DIR_ENV,
+    VCATBRIDGE: VIRTUAL_CATALOG_EXT_DIR_ENV,
+    VCATPROVIDER: VIRTUAL_CATALOG_EXT_DIR_ENV,
 }
 
 
@@ -50,12 +50,12 @@ def _load_local_or_install(conn: duckdb.DuckDBPyConnection, name: str) -> None:
         conn.load_extension(name)
 
 
-def load_virtual_catalog_bridge(conn: duckdb.DuckDBPyConnection) -> None:
-    _load_local_or_install(conn, VIRTUAL_CATALOG_BRIDGE)
+def load_vcatbridge(conn: duckdb.DuckDBPyConnection) -> None:
+    _load_local_or_install(conn, VCATBRIDGE)
 
 
-def load_virtual_catalog_provider(conn: duckdb.DuckDBPyConnection) -> None:
-    _load_local_or_install(conn, VIRTUAL_CATALOG_PROVIDER)
+def load_vcatprovider(conn: duckdb.DuckDBPyConnection) -> None:
+    _load_local_or_install(conn, VCATPROVIDER)
 
 
 def load_n6k(conn: duckdb.DuckDBPyConnection) -> None:

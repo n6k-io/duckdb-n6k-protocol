@@ -1,3 +1,10 @@
+# 0.11.4
+
+Breaking, for downstream:
+
+- Needs the `duckdb-virtual-catalog` build with the `vcat` names: extensions `vcatbridge` / `vcatprovider` (`TYPE` too), SQL functions `vcatbridge_*` / `vcatprovider_*`, `vcatbridge_lockdown`.
+- `load_virtual_catalog_bridge` / `load_virtual_catalog_provider` → `load_vcatbridge` / `load_vcatprovider`; `VIRTUAL_CATALOG_BRIDGE` / `VIRTUAL_CATALOG_PROVIDER` → `VCATBRIDGE` / `VCATPROVIDER`.
+
 # 0.11.3
 
 Summary (install the `[mcp]` extra; needs the extension built from the same commit):

@@ -25,7 +25,7 @@ boundary.
 
 ## Hardening
 
-- Run `virtual_catalog_lockdown` on the served instance: no files, network, extensions or config
+- Run `vcatbridge_lockdown` on the served instance: no files, network, extensions or config
   changes; memory and thread caps.
 
 ## n6k must

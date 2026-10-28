@@ -2,7 +2,7 @@ import duckdb
 import pytest
 
 from n6k_server.bridge import Policy, bridge, unbridge
-from n6k_server.extension import load_n6k, load_virtual_catalog_bridge
+from n6k_server.extension import load_n6k, load_vcatbridge
 
 CONN_CONFIG: dict[str, str | bool | int | float | list[str]] = {"allow_unsigned_extensions": "true"}
 
@@ -11,7 +11,7 @@ T = '"workspace"."main"."t"'
 
 def _target() -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(config=CONN_CONFIG)
-    load_virtual_catalog_bridge(conn)
+    load_vcatbridge(conn)
     return conn
 
 
@@ -812,7 +812,7 @@ def test_context_finalized_after_bridge():
     bridge_id = _bridge(source, target, [Policy("main.t", "select", "tenant_id = $tenant")], context={"tenant": 42})
 
     with pytest.raises(duckdb.Error, match="is finalized"):
-        source.sql("SELECT bridge_set_context($1, 'tenant', 7)", params=[bridge_id]).fetchone()
+        source.sql("SELECT vcatbridge_set_context($1, 'tenant', 7)", params=[bridge_id]).fetchone()
 
 
 def test_context_none_value_rejected():

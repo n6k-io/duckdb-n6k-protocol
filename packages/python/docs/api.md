@@ -144,7 +144,7 @@ class Users(Provider):
 
 async def main():
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-    con.execute("ATTACH ':memory:' AS app (TYPE virtual_catalog_provider)")
+    con.execute("ATTACH ':memory:' AS app (TYPE vcatprovider)")
     register_provider(con, catalog="app", schema_name="public", provider=Users())
 
 asyncio.run(main())
@@ -299,7 +299,7 @@ register_provider(
 
 Bind `provider` to `(con, catalog, schema_name)`.
 
-The target catalog must be `TYPE virtual_catalog_provider`; the schema is
+The target catalog must be `TYPE vcatprovider`; the schema is
 materialised by the extension when the provider lists tables in it.
 
 Provider coroutines run on `main_loop` (default: the loop running at

@@ -337,14 +337,14 @@ scalar-only), so the host registers three scalar UDFs and asks the extension to
 build the catalog entry over them:
 
 ```sql
-SELECT provider_create_stream_function(catalog, schema, name, open_udf, next_udf, close_udf);
-SELECT provider_drop_stream_function(catalog, schema, name);
+SELECT vcatprovider_create_stream_function(catalog, schema, name, open_udf, next_udf, close_udf);
+SELECT vcatprovider_drop_stream_function(catalog, schema, name);
 ```
 
-Both come from **`virtual_catalog_provider`** (sibling `duckdb-virtual-catalog`
+Both come from **`vcatprovider`** (sibling `duckdb-virtual-catalog`
 repo), not `n6k_server`; the server only recognises such an entry — by finding it
-in `provider_stream_functions()` — to forward the generator's Arrow bytes untouched.
-`register_rpc_streams()` loads `virtual_catalog_provider` for you.
+in `vcatprovider_stream_functions()` — to forward the generator's Arrow bytes untouched.
+`register_rpc_streams()` loads `vcatprovider` for you.
 
 That entry is an ordinary table function, so it needs nothing passed to the
 serving call and it is callable as plain SQL on the host's own connection:

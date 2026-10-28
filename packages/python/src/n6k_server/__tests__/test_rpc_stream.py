@@ -3,7 +3,7 @@
 Most of these drive the three UDFs from SQL exactly as the reactor does —
 `open` → `next`* → `close` — because that call sequence *is* the contract
 between the extension and this process, and running it here pins it without a
-socket. The registration half needs the `virtual_catalog_provider` extension and is marked.
+socket. The registration half needs the `vcatprovider` extension and is marked.
 
 Queries run through `asyncio.to_thread`, matching the reactor: the generator is
 driven on the event loop from a DuckDB worker thread, and calling it from the
@@ -193,15 +193,15 @@ async def test_unknown_function_is_an_error():
 async def test_register_rpc_streams_creates_a_callable_table_function():
     """The point of the catalog form: a host RPC is ordinary SQL on the connection
     that registered it, with no server and no reactor in the picture."""
-    from n6k_server.extension import VIRTUAL_CATALOG_PROVIDER, load_virtual_catalog_provider
+    from n6k_server.extension import VCATPROVIDER, load_vcatprovider
 
     def echo(scalars: List[Any], table: Optional[pa.Table]) -> pa.Table:
         return pa.table({"seq": [7, 8]}, schema=TICK)
 
-    if local_extension_path(VIRTUAL_CATALOG_PROVIDER) is None:
-        pytest.skip("virtual_catalog_provider extension not built")
+    if local_extension_path(VCATPROVIDER) is None:
+        pytest.skip("vcatprovider extension not built")
     con = duckdb.connect(config=CONN_CONFIG)
-    load_virtual_catalog_provider(con)
+    load_vcatprovider(con)
     con.execute("ATTACH ':memory:' AS db")
     handle = await asyncio.to_thread(
         register_rpc_streams,
