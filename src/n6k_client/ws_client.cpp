@@ -269,11 +269,11 @@ std::shared_ptr<Reactor> WsClient::CurrentReactor() const {
 }
 
 void WsClient::SendFrame(const std::string &frame_bytes) {
-	if (opts_.logger) {
-		DUCKDB_LOG(opts_.logger, WsLogType, "send", frame_bytes);
-	}
 	if (auto r = CurrentReactor()) {
 		r->Send(frame_bytes);
+		if (opts_.logger) {
+			DUCKDB_LOG(opts_.logger, WsLogType, "send", frame_bytes);
+		}
 	}
 }
 
