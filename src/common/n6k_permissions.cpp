@@ -189,8 +189,7 @@ static PermissionCollectorFn LookupPermissionCollector(ClientContext &context, c
 }
 
 // The vcat extensions are separate binaries; their `<prefix>_table_permissions` table
-// function is the contract. Its `verbs` list passes through (minus `alter` on bridged kinds), and its open `kind` set
-// folds into the kinds n6k clients already know.
+// function is the contract.
 static const char *VirtualCatalogPermissionsFunction(const string &catalog_type) {
 	if (catalog_type == "vcatbridge") {
 		return "vcatbridge_table_permissions";
@@ -252,6 +251,7 @@ static void CollectVirtualCatalogPermissions(ClientContext &context, Catalog &ca
 			if (!bridged) {
 				row.kind = kind;
 			} else {
+				// Fold into the kinds n6k clients know (TablePermissionRow::kind, n6k_permissions.hpp).
 				const bool writes = HasVerb(verbs, "insert") || HasVerb(verbs, "update") || HasVerb(verbs, "delete");
 				row.kind = writes ? "bridge_readwrite" : "bridge_read";
 			}

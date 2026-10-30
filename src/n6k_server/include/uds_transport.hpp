@@ -30,6 +30,8 @@ public:
 	                      std::chrono::steady_clock::time_point deadline) override;
 	void WriteFrame(StreamFrameType type, const std::string &frame) override;
 	void ShutdownWrite() override;
+	// Payload: STREAM_FRAME_CLOSE in n6k_protocol/protocol.py; the host (n6k_server.pump) performs the close.
+	void SendClose(int code, const std::string &reason) override;
 
 	// Safe from another thread while one is blocked reading: it wakes with EOF, as from a peer close.
 	void CloseInbound();

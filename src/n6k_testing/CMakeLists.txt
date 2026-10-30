@@ -29,12 +29,17 @@ n6k_common_includes()
 # code by recompiling the same .cpp into each target, so these must be the same
 # sources the shipped extensions build, not a copy.
 n6k_common_sources(EXTENSION_SOURCES n6k_sql_builder serve_bind_common
-                   n6k_arrow_frame_decoder)
+                   n6k_arrow_frame_decoder arrow_ipc_encode)
 n6k_nanoarrow_sources(EXTENSION_SOURCES)
 
-list(APPEND EXTENSION_SOURCES n6k_testing_extension.cpp
-     sql_builder_functions.cpp fixture_functions.cpp
-     arrow_ipc_decode_selftest.cpp)
+list(
+  APPEND
+  EXTENSION_SOURCES
+  n6k_testing_extension.cpp
+  sql_builder_functions.cpp
+  fixture_functions.cpp
+  arrow_ipc_decode_selftest.cpp
+  wire_codec_bench.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

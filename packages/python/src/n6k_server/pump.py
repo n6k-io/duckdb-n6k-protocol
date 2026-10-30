@@ -1,18 +1,17 @@
 """Serve a WebSocket by handing it to the C++ reactor and shuttling bytes.
 
 This module is the whole of Python's involvement in a served connection. It never decodes an
-n6k frame, never inspects an op, and cannot tell a SCAN from a PING: the protocol lives in
-`src/n6k_server`. It reads only the stream framing envelope, the extension's host events (JSON,
-`_Resolver.receive`), and text frames, which belong to the app.
+n6k frame, never inspects an op, and cannot tell a SCAN from a PING: the protocol, the handshake
+included, lives in `src/n6k_server`. It reads only the stream framing envelope, the extension's
+CLOSE frame, and text frames, which belong to the app.
 
 The mechanism is a `socketpair()`. Python keeps one end and passes the *number*
-of the other to SQL — `CALL n6k_serve_fd(<fd>, 'db')` — which the extension
-`dup()`s and then reads and writes like any socket.
+of the other to `n6k_serve_create_session(<fd>)`, then serves the returned id with
+`CALL n6k_serve_fd(<id>, ...)`, which `dup()`s the fd and then reads and writes it like any socket.
 
-The handshake replies are the exception: once `n6k_handshake` has read the token, the extension
-builds HELLO_PENDING, HELLO_ERR and HELLO_ACK (`n6k_hello_pending` / `n6k_reject` /
-`n6k_hello_ack`) and Python sends them itself, so it knows HELLO_ACK has reached the socket before
-any text it sends. When `n6k_handshake` rejects the HELLO it sends its own HELLO_ERR.
+The host's hooks reach the extension as scalar UDFs it calls back (see `_Callbacks`). Text the app
+sends goes back through the extension (`n6k_serve_send_text`), so it is ordered after HELLO_ACK and
+with the binary frames.
 
 In-process rather than a spawned `duckdb`, because the reactor's workers open
 connections on *this* `DatabaseInstance`. That is what lets a table backed by
@@ -31,6 +30,9 @@ import json
 import logging
 import socket
 import struct
+import threading
+import uuid
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -47,8 +49,10 @@ from typing import (
 )
 
 import duckdb
+import msgpack
+from duckdb.func import FunctionNullHandling
 
-from n6k_protocol.protocol import APP_HELLO_CAPS, OPEN_PENDING_INTERVAL_MS, STREAM_FRAME_HOST, STREAM_FRAME_N6K
+from n6k_protocol.protocol import APP_HELLO_CAPS, STREAM_FRAME_CLOSE, STREAM_FRAME_JSONRPC, STREAM_FRAME_N6K
 from n6k_server.context import _CURRENT, Connection
 from n6k_server.provider import release_providers
 
@@ -65,6 +69,10 @@ PAUSE_CANCEL_TIMEOUT_S = 5.0
 PAUSE_POLL_S = 0.02
 
 _T = TypeVar("_T")
+
+_UUID = duckdb.sqltype("UUID")
+_VARCHAR = duckdb.sqltype("VARCHAR")
+_VARCHAR_LIST = duckdb.sqltype("VARCHAR[]")
 
 
 class WsReject(Exception):
@@ -307,15 +315,20 @@ Authenticate = Callable[
 class LiveServe:
     """The catalogs of one connection while it serves; every change reaches the client as
     CATALOGS_CHANGED. Calls after the connection closed raise `RuntimeError`. `connection` is the
-    connection `current()` returns in its text handlers; HELLO_ACK has been sent, so it may notify.
+    connection `current()` returns in its text handlers. Every call waits for the serve to register
+    (after HELLO_ACK is queued) and raises if it ends first; see `AwaitServe` in serve_reactor.cpp.
     """
 
     def __init__(
-        self, cur: duckdb.DuckDBPyConnection, fd: int, unsettled: "_Unsettled", connection: Connection
+        self,
+        cur: duckdb.DuckDBPyConnection,
+        session_id: uuid.UUID,
+        unsettled: "_Unsettled",
+        connection: Connection,
     ) -> None:
         self.connection = connection
         self._cur = cur
-        self._fd = fd
+        self._session_id = session_id
         self._unsettled = unsettled
         self._lock = asyncio.Lock()
         self._closed = False
@@ -330,7 +343,9 @@ class LiveServe:
             self._check_open()
             if isinstance(catalog, LazyCatalog):
                 rank = catalog.rank
-                await self._call(lambda cur, fd, name: _add_lazy_catalog(cur, fd, name, rank), catalog.name)
+                await self._call(
+                    lambda cur, session_id, name: _add_lazy_catalog(cur, session_id, name, rank), catalog.name
+                )
                 return
             if isinstance(catalog, PendingCatalog):
                 await asyncio.wait_for(catalog.attach(self._cur), catalog.timeout)
@@ -363,7 +378,7 @@ class LiveServe:
         upstream._hello_running = True
         try:
             catalogs, capabilities = await self._call(
-                lambda cur, _fd, _name: _upstream_hello(cur, upstream.fd, token), "", upstream._hello_finished
+                lambda cur, _session_id, _name: _upstream_hello(cur, upstream.fd, token), "", upstream._hello_finished
             )
         except asyncio.CancelledError:
             await upstream.aclose()
@@ -384,7 +399,9 @@ class LiveServe:
         if upstream.closed:
             raise RuntimeError(f"the upstream is closed: {upstream.reason}")
         catalogs = list(upstream.catalogs)
-        skipped = await self._call(lambda cur, fd, _name: _add_upstream(cur, fd, upstream.fd, catalogs, rank), "")
+        skipped = await self._call(
+            lambda cur, session_id, _name: _add_upstream(cur, session_id, upstream.fd, catalogs, rank), ""
+        )
         upstream._added = True
         return skipped
 
@@ -392,16 +409,18 @@ class LiveServe:
         """Change an added upstream's rank and re-decide every name it reports. Returns the names it
         reports but does not win."""
         self._check_open()
-        return await self._call(lambda cur, fd, _name: _set_upstream_rank(cur, fd, upstream.fd, rank), "")
+        return await self._call(
+            lambda cur, session_id, _name: _set_upstream_rank(cur, session_id, upstream.fd, rank), ""
+        )
 
     async def remove_upstream(self, upstream: Upstream) -> None:
         """Stop forwarding to `upstream` and close it; its sessions fail with "removed by host"."""
         self._check_open()
-        await self._call(lambda cur, fd, _name: _remove_upstream(cur, fd, upstream.fd), "")
+        await self._call(lambda cur, session_id, _name: _remove_upstream(cur, session_id, upstream.fd), "")
         await upstream.wait_closed()
 
     async def _upstream_closed_reason(self, up_fd: int) -> Optional[str]:
-        return await self._call(lambda cur, fd, _name: _upstream_status(cur, fd, up_fd), "")
+        return await self._call(lambda cur, session_id, _name: _upstream_status(cur, session_id, up_fd), "")
 
     @contextlib.asynccontextmanager
     async def paused(self, catalog: str, timeout: float = 5.0) -> AsyncIterator[None]:
@@ -451,7 +470,7 @@ class LiveServe:
 
     async def _call(
         self,
-        fn: Callable[[duckdb.DuckDBPyConnection, int, str], _T],
+        fn: Callable[[duckdb.DuckDBPyConnection, uuid.UUID, str], _T],
         name: str,
         on_done: Optional[Callable[[], None]] = None,
     ) -> _T:
@@ -460,7 +479,7 @@ class LiveServe:
 
         def run() -> _T:
             try:
-                return fn(cur, self._fd, name)
+                return fn(cur, self._session_id, name)
             finally:
                 cur.close()
 
@@ -484,7 +503,7 @@ class LiveServe:
 
     async def _join(self, timeout: float) -> "Optional[asyncio.Future[Any]]":
         """None once every call has returned, else a future for when they will. Until then the cursor
-        is in use and the fd may still be looked up, so neither can be closed."""
+        is in use, so it cannot be closed."""
         if not self._calls:
             return None
         calls = asyncio.gather(*self._calls, return_exceptions=True)
@@ -689,42 +708,31 @@ def _quote_literal(value: str) -> str:
 
 
 def build_serve_sql(
-    fd: int,
+    session_id: uuid.UUID,
     catalogs: list[str],
     ping_interval_ms: Optional[int] = None,
-    pending: Optional[Mapping[str, str]] = None,
-    capabilities: Sequence[str] = (),
-    app_capabilities: Sequence[str] = (),
-    hello_acked: bool = False,
-    resolve: bool = False,
-    lazy: Optional[Mapping[str, Optional[int]]] = None,
+    *,
+    authenticate: Optional[str] = None,
+    on_text: Optional[str] = None,
+    resolve: Optional[str] = None,
+    hello_pending_message: Optional[str] = None,
+    workers: Optional[int] = None,
 ) -> str:
-    """`CALL n6k_serve_fd(...)` serving exactly `catalogs`, plus `pending` (name -> status message).
-
-    `capabilities` is the client's FT_HELLO list as `n6k_handshake` returned it; the extension
-    negotiates it. `app_capabilities` are the APP_HELLO_CAPS this socket's app serves.
-    `hello_acked` means the host already sent HELLO_ACK (`n6k_hello_ack`). `resolve` parks an OPEN for
-    an unknown catalog and asks the host to resolve it (STREAM_FRAME_HOST); `lazy` (name -> rank or
-    None) names are listed before that (they need `resolve`)."""
-    args = [str(fd), *(_quote_literal(name) for name in catalogs)]
+    """`CALL n6k_serve_fd(...)` serving `catalogs`, with the names of the UDFs the extension calls back
+    (`authenticate`'s result replaces `catalogs` when it carries a `"catalogs"` key)."""
+    args = [f"'{session_id}'::UUID", *(_quote_literal(name) for name in catalogs)]
     if ping_interval_ms is not None:
         args.append(f"ping_interval_ms => {ping_interval_ms}")
-    if capabilities:
-        args.append(f"capabilities => [{', '.join(_quote_literal(c) for c in capabilities)}]")
-    if app_capabilities:
-        args.append(f"app_capabilities => [{', '.join(_quote_literal(c) for c in app_capabilities)}]")
-    if hello_acked:
-        args.append("hello_acked => true")
-    if resolve:
-        args.append("resolve => true")
-    if lazy:
-        entries = ", ".join(
-            f"{_quote_literal(name)}: {'NULL' if rank is None else int(rank)}" for name, rank in lazy.items()
-        )
-        args.append(f"lazy => MAP {{{entries}}}")
-    if pending:
-        entries = ", ".join(f"{_quote_literal(name)}: {_quote_literal(msg)}" for name, msg in pending.items())
-        args.append(f"pending => MAP {{{entries}}}")
+    if workers is not None:
+        args.append(f"workers => {workers}")
+    for param, value in (
+        ("authenticate", authenticate),
+        ("on_text", on_text),
+        ("resolve", resolve),
+        ("hello_pending_message", hello_pending_message),
+    ):
+        if value is not None:
+            args.append(f"{param} => {_quote_literal(value)}")
     return f"CALL n6k_serve_fd({', '.join(args)})"
 
 
@@ -753,24 +761,35 @@ def _split_served(
     return ready, pending, lazy
 
 
-def _mark_ready(cur: duckdb.DuckDBPyConnection, fd: int, name: str) -> None:
-    cur.execute("SELECT * FROM n6k_serve_open_ready(?, ?)", [fd, name]).fetchall()
+def _create_session(cur: duckdb.DuckDBPyConnection, fd: int) -> uuid.UUID:
+    row = cur.execute("SELECT session_id FROM n6k_serve_create_session(?)", [fd]).fetchone()
+    assert row is not None
+    session_id: uuid.UUID = row[0]
+    return session_id
 
 
-def _mark_failed(cur: duckdb.DuckDBPyConnection, fd: int, name: str, message: str) -> None:
-    cur.execute("SELECT * FROM n6k_serve_open_failed(?, ?, ?)", [fd, name, message]).fetchall()
+def _mark_ready(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_open_ready(?, ?)", [session_id, name]).fetchall()
 
 
-def _add_catalog(cur: duckdb.DuckDBPyConnection, fd: int, name: str) -> None:
-    cur.execute("SELECT * FROM n6k_serve_add_catalog(?, ?)", [fd, name]).fetchall()
+def _mark_failed(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str, message: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_open_failed(?, ?, ?)", [session_id, name, message]).fetchall()
 
 
-def _add_lazy_catalog(cur: duckdb.DuckDBPyConnection, fd: int, name: str, rank: Optional[int]) -> None:
-    cur.execute("SELECT * FROM n6k_serve_add_lazy_catalog(?, ?, rank => ?)", [fd, name, rank]).fetchall()
+def _add_catalog(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_add_catalog(?, ?)", [session_id, name]).fetchall()
 
 
-def _resolved(cur: duckdb.DuckDBPyConnection, fd: int, name: str, error: Optional[str]) -> None:
-    cur.execute("SELECT * FROM n6k_serve_resolved(?, ?, ?)", [fd, name, error]).fetchall()
+def _add_lazy_catalog(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str, rank: Optional[int]) -> None:
+    cur.execute("SELECT * FROM n6k_serve_add_lazy_catalog(?, ?, rank => ?)", [session_id, name, rank]).fetchall()
+
+
+def _send_text(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, text: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_send_text(?, ?)", [session_id, text]).fetchall()
+
+
+def _close(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, code: int, reason: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_close(?, ?, ?)", [session_id, code, reason]).fetchall()
 
 
 def _upstream_hello(cur: duckdb.DuckDBPyConnection, fd: int, token: str) -> tuple[list[str], list[str]]:
@@ -779,50 +798,52 @@ def _upstream_hello(cur: duckdb.DuckDBPyConnection, fd: int, token: str) -> tupl
     return [str(c) for c in row[0]], [str(c) for c in row[1]]
 
 
-def _add_upstream(cur: duckdb.DuckDBPyConnection, fd: int, up_fd: int, catalogs: list[str], rank: int) -> list[str]:
+def _add_upstream(
+    cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up_fd: int, catalogs: list[str], rank: int
+) -> list[str]:
     row = cur.execute(
-        "SELECT skipped FROM n6k_serve_add_upstream(?, ?, ?, rank => ?)", [fd, up_fd, catalogs, rank]
+        "SELECT skipped FROM n6k_serve_add_upstream(?, ?, ?, rank => ?)", [session_id, up_fd, catalogs, rank]
     ).fetchone()
     assert row is not None
     return [str(c) for c in row[0]]
 
 
-def _set_upstream_rank(cur: duckdb.DuckDBPyConnection, fd: int, up_fd: int, rank: int) -> list[str]:
-    row = cur.execute("SELECT skipped FROM n6k_serve_set_upstream_rank(?, ?, ?)", [fd, up_fd, rank]).fetchone()
+def _set_upstream_rank(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up_fd: int, rank: int) -> list[str]:
+    row = cur.execute("SELECT skipped FROM n6k_serve_set_upstream_rank(?, ?, ?)", [session_id, up_fd, rank]).fetchone()
     assert row is not None
     return [str(c) for c in row[0]]
 
 
-def _remove_upstream(cur: duckdb.DuckDBPyConnection, fd: int, up_fd: int) -> None:
-    cur.execute("SELECT * FROM n6k_serve_remove_upstream(?, ?)", [fd, up_fd]).fetchall()
+def _remove_upstream(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up_fd: int) -> None:
+    cur.execute("SELECT * FROM n6k_serve_remove_upstream(?, ?)", [session_id, up_fd]).fetchall()
 
 
-def _upstream_status(cur: duckdb.DuckDBPyConnection, fd: int, up_fd: int) -> Optional[str]:
-    row = cur.execute("SELECT open, reason FROM n6k_serve_upstream_status(?, ?)", [fd, up_fd]).fetchone()
+def _upstream_status(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up_fd: int) -> Optional[str]:
+    row = cur.execute("SELECT open, reason FROM n6k_serve_upstream_status(?, ?)", [session_id, up_fd]).fetchone()
     assert row is not None
     return None if row[0] else str(row[1])
 
 
-def _remove_catalog(cur: duckdb.DuckDBPyConnection, fd: int, name: str) -> None:
-    cur.execute("SELECT * FROM n6k_serve_remove_catalog(?, ?)", [fd, name]).fetchall()
+def _remove_catalog(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_remove_catalog(?, ?)", [session_id, name]).fetchall()
 
 
-def _pause(cur: duckdb.DuckDBPyConnection, fd: int, name: str) -> None:
-    cur.execute("SELECT * FROM n6k_serve_pause(?, ?)", [fd, name]).fetchall()
+def _pause(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_pause(?, ?)", [session_id, name]).fetchall()
 
 
-def _resume(cur: duckdb.DuckDBPyConnection, fd: int, name: str) -> None:
-    cur.execute("SELECT * FROM n6k_serve_resume(?, ?)", [fd, name]).fetchall()
+def _resume(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_resume(?, ?)", [session_id, name]).fetchall()
 
 
-def _drained(cur: duckdb.DuckDBPyConnection, fd: int, name: str) -> bool:
-    row = cur.execute("SELECT holding, running FROM n6k_serve_inflight(?, ?)", [fd, name]).fetchone()
+def _drained(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str) -> bool:
+    row = cur.execute("SELECT holding, running FROM n6k_serve_inflight(?, ?)", [session_id, name]).fetchone()
     assert row is not None
     return bool(row[0]) and int(row[1]) == 0
 
 
-def _cancel_inflight(cur: duckdb.DuckDBPyConnection, fd: int, name: str) -> None:
-    cur.execute("SELECT * FROM n6k_serve_cancel_inflight(?, ?)", [fd, name]).fetchall()
+def _cancel_inflight(cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, name: str) -> None:
+    cur.execute("SELECT * FROM n6k_serve_cancel_inflight(?, ?)", [session_id, name]).fetchall()
 
 
 class _Unsettled:
@@ -835,7 +856,7 @@ class _Unsettled:
 
 
 async def _settle_pending(
-    pending: PendingCatalog, cur: duckdb.DuckDBPyConnection, fd: int, unsettled: _Unsettled
+    pending: PendingCatalog, cur: duckdb.DuckDBPyConnection, session_id: uuid.UUID, unsettled: _Unsettled
 ) -> None:
     failure: Optional[str] = None
     try:
@@ -852,63 +873,13 @@ async def _settle_pending(
             return
         if failure is None:
             try:
-                await asyncio.to_thread(_mark_ready, cur, fd, pending.name)
+                await asyncio.to_thread(_mark_ready, cur, session_id, pending.name)
             except Exception as exc:  # noqa: BLE001 - e.g. `attach` returned without attaching it
                 logger.info("pending catalog %r failed: %s", pending.name, exc)
                 failure = str(exc) or type(exc).__name__
         if failure is not None:
-            await asyncio.to_thread(_mark_failed, cur, fd, pending.name, failure)
+            await asyncio.to_thread(_mark_failed, cur, session_id, pending.name, failure)
         unsettled.names.discard(pending.name)
-
-
-class _Resolver:
-    """Runs `resolve(live, name)` for each catalog the extension asks about, then settles it with
-    `n6k_serve_resolved`: NULL if `resolve` returned (the extension ACKs if the catalog is served by
-    then, or forwards it to the upstream serving it, else OPEN_ERRs "not found"), its message if it
-    raised. The extension asks once per name until it is settled."""
-
-    def __init__(self, resolve: Optional[Resolve]) -> None:
-        self._resolve = resolve
-        self._handle: Optional[LiveServe] = None
-        self._tasks: set[asyncio.Task[None]] = set()
-
-    def bind(self, handle: LiveServe) -> None:
-        self._handle = handle
-
-    def receive(self, payload: bytes) -> None:
-        try:
-            name = json.loads(payload)["resolve"]
-        except (ValueError, KeyError, TypeError):
-            logger.error("dropping a malformed host event from the extension: %r", payload[:200])
-            return
-        if self._resolve is None or self._handle is None:
-            logger.error("dropping a resolve request for %r: no resolve hook is serving", name)
-            return
-        task = asyncio.create_task(self._run(self._resolve, self._handle, str(name)))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    async def _run(self, resolve: Resolve, handle: LiveServe, name: str) -> None:
-        _CURRENT.set(handle.connection)
-        error: Optional[str] = None
-        try:
-            result = resolve(handle, name)
-            if inspect.isawaitable(result):
-                await result
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.info("resolving catalog %r failed: %s", name, exc)
-            error = str(exc) or type(exc).__name__
-        if handle.closed:
-            return
-        try:
-            await handle._call(lambda cur, fd, n: _resolved(cur, fd, n, error), name)
-        except Exception:  # noqa: BLE001
-            logger.exception("settling the resolve of catalog %r failed", name)
-
-    def close(self) -> list["asyncio.Task[None]"]:
-        return list(self._tasks)
 
 
 async def _run_on_serve(on_serve: OnServe, ws: Any, handle: LiveServe, params: dict[str, str]) -> None:
@@ -922,65 +893,6 @@ async def _run_on_serve(on_serve: OnServe, ws: Any, handle: LiveServe, params: d
         logger.exception("on_serve failed")
 
 
-def _handshake(con: duckdb.DuckDBPyConnection, fd: int) -> tuple[str, list[str]]:
-    row = con.execute("SELECT token, capabilities FROM n6k_handshake(?)", [fd]).fetchone()
-    assert row is not None
-    return str(row[0]), [str(c) for c in row[1]]
-
-
-def _frame(cur: duckdb.DuckDBPyConnection, sql: str, params: Sequence[Any] = ()) -> bytes:
-    row = cur.execute(sql, list(params)).fetchone()
-    assert row is not None
-    return bytes(row[0])
-
-
-def _reject(con: duckdb.DuckDBPyConnection, reason: str) -> bytes:
-    return _frame(con, "SELECT frame FROM n6k_reject(?)", [reason])
-
-
-def _hello_pending(cur: duckdb.DuckDBPyConnection, message: str) -> bytes:
-    return _frame(cur, "SELECT frame FROM n6k_hello_pending(?)", [message])
-
-
-def _hello_ack(con: duckdb.DuckDBPyConnection, capabilities: Sequence[str], app_capabilities: Sequence[str]) -> bytes:
-    args = []
-    if capabilities:
-        args.append(f"capabilities => [{', '.join(_quote_literal(c) for c in capabilities)}]")
-    if app_capabilities:
-        args.append(f"app_capabilities => [{', '.join(_quote_literal(c) for c in app_capabilities)}]")
-    return _frame(con, f"SELECT frame FROM n6k_hello_ack({', '.join(args)})")
-
-
-async def _send_frame(ws: WebSocketLike, send_lock: asyncio.Lock, data: bytes) -> bool:
-    try:
-        async with send_lock:
-            await ws.send_bytes(data)
-    except Exception:  # noqa: BLE001 - the client is gone; the directions see it too
-        return False
-    return True
-
-
-# Well inside the client's HANDSHAKE_TIMEOUT_MS wait for a first reply, and long enough that a fast
-# authenticate answers with HELLO_ACK alone.
-HELLO_PENDING_FIRST_S = 1.0
-
-
-async def _beat_hello_pending(
-    cur: duckdb.DuckDBPyConnection, ws: WebSocketLike, send_lock: asyncio.Lock, message: str, stop: asyncio.Event
-) -> None:
-    """Stopped by the event, not by cancellation, so the caller can await the in-flight send before
-    HELLO_ACK or HELLO_ERR."""
-    delay = HELLO_PENDING_FIRST_S
-    while True:
-        try:
-            await asyncio.wait_for(stop.wait(), delay)
-            return
-        except asyncio.TimeoutError:
-            pass
-        await _send_frame(ws, send_lock, await asyncio.to_thread(_hello_pending, cur, message))
-        delay = OPEN_PENDING_INTERVAL_MS / 1000
-
-
 async def _authenticate(
     authenticate: Authenticate, ws: Any, con: duckdb.DuckDBPyConnection, token: str, params: dict[str, str]
 ) -> Authorized:
@@ -992,13 +904,171 @@ async def _authenticate(
     return Authorized(list(result))
 
 
+class _ServedText:
+    """Sends a `_TextChannel`'s text through the extension."""
+
+    def __init__(self, handle: LiveServe) -> None:
+        self._handle = handle
+
+    async def send_text(self, data: str) -> None:
+        await self._handle._call(lambda cur, session_id, _name: _send_text(cur, session_id, data), "")
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        await self._handle._call(lambda cur, session_id, _name: _close(cur, session_id, code, reason[:123]), "")
+
+
+class _Callbacks:
+    """The UDFs `n6k_serve_fd` calls back, each run on this loop. They run on the extension's threads, so
+    each blocks only that thread: `authenticate` on a thread of its own, `on_text` on the reactor's text
+    worker (it only schedules delivery, so never blocks), and `resolve` serially on the reactor's single
+    resolver thread (`ResolverLoop`), so a slow resolve delays the connection's others."""
+
+    def __init__(
+        self,
+        ws: Any,
+        con: duckdb.DuckDBPyConnection,
+        authenticate: Authenticate,
+        params: dict[str, str],
+        handle: LiveServe,
+        text: "_TextChannel",
+        on_serve: Optional[OnServe],
+        resolve: Optional[Resolve],
+    ) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._ws = ws
+        self._con = con
+        self._authenticate = authenticate
+        self._params = params
+        self._handle = handle
+        self._text = text
+        self._on_serve = on_serve
+        self._resolve = resolve
+        self._closing = False
+        self._resolving: set[Future[Optional[str]]] = set()
+        self.settlers: list[asyncio.Task[None]] = []
+        self.cursors: list[duckdb.DuckDBPyConnection] = []
+        # create_function registers into the DATABASE catalog; the suffix keeps connections apart.
+        suffix = uuid.uuid4().hex
+        self.authenticate_udf = f"__n6k_authenticate_{suffix}"
+        self.on_text_udf = f"__n6k_on_text_{suffix}" if text.capabilities else None
+        self.resolve_udf = f"__n6k_resolve_{suffix}" if resolve is not None else None
+
+    def create_functions(self) -> None:
+        special = FunctionNullHandling.SPECIAL
+        self._con.create_function(
+            self.authenticate_udf,
+            self._authenticate_udf,
+            [_UUID, _VARCHAR, _VARCHAR_LIST, _VARCHAR],
+            _VARCHAR,
+            null_handling=special,
+            side_effects=True,
+        )
+        if self.on_text_udf is not None:
+            self._con.create_function(
+                self.on_text_udf,
+                self._on_text_udf,
+                [_UUID, _VARCHAR],
+                _VARCHAR,
+                null_handling=special,
+                side_effects=True,
+            )
+        if self.resolve_udf is not None:
+            self._con.create_function(
+                self.resolve_udf,
+                self._resolve_udf,
+                [_UUID, _VARCHAR],
+                _VARCHAR,
+                null_handling=special,
+                side_effects=True,
+            )
+
+    def close(self) -> list["asyncio.Task[None]"]:
+        self._closing = True
+        for future in list(self._resolving):
+            future.cancel()
+        return self.settlers
+
+    def _authenticate_udf(
+        self, session_id: uuid.UUID, token: str, capabilities: list[str], request: Optional[str]
+    ) -> str:
+        return asyncio.run_coroutine_threadsafe(self._admit(token, list(capabilities or ())), self._loop).result()
+
+    async def _admit(self, token: str, capabilities: list[str]) -> str:
+        """Returns the JSON `ParseAuthResult` (src/n6k_server/host_callbacks.cpp) parses."""
+        try:
+            authorized = await _authenticate(self._authenticate, self._ws, self._con, token, self._params)
+            catalogs, pending, lazy = _split_served(authorized.catalogs, self._resolve is not None)
+        except WsReject as reject:
+            return json.dumps({"reject": reject.reason or "unauthorized", "code": reject.code})
+        except Exception:  # noqa: BLE001 - any failure refuses the client rather than serving it
+            logger.exception("authenticate failed")
+            return json.dumps({"reject": "internal error", "code": 1011})
+        if self._closing:
+            return json.dumps({"reject": "the connection closed", "code": 1000})
+        self._text.authorize(self._params, authorized.identity, capabilities)
+        handle = self._handle
+        handle.connection = self._text.connection
+        handle._unsettled.names.update(p.name for p in pending)
+        for p in pending:
+            cur = handle._cur.cursor()
+            self.cursors.append(cur)
+            self.settlers.append(asyncio.create_task(_settle_pending(p, cur, handle._session_id, handle._unsettled)))
+        if self._on_serve is not None:
+            self.settlers.append(asyncio.create_task(_run_on_serve(self._on_serve, self._ws, handle, self._params)))
+        return json.dumps(
+            {
+                "catalogs": catalogs,
+                "pending": {p.name: p.message for p in pending},
+                "lazy": lazy,
+                "app_capabilities": list(self._text.capabilities),
+            }
+        )
+
+    def _on_text_udf(self, session_id: uuid.UUID, text: str) -> None:
+        self._loop.call_soon_threadsafe(self._deliver, text)
+
+    def _deliver(self, text: str) -> None:
+        if self._closing or self._text.receive(text):
+            return
+        logger.info("closing: more than %d text messages in flight", self._text.max_inflight)
+        self.settlers.append(asyncio.create_task(self._close_busy()))
+
+    async def _close_busy(self) -> None:
+        with contextlib.suppress(Exception):
+            await _ServedText(self._handle).close(1008, "too many text messages in flight")
+
+    def _resolve_udf(self, session_id: uuid.UUID, name: str) -> Optional[str]:
+        if self._closing:
+            return "the connection closed"
+        future = asyncio.run_coroutine_threadsafe(self._run_resolve(name), self._loop)
+        self._resolving.add(future)
+        try:
+            return future.result()
+        except BaseException:  # noqa: BLE001 - cancelled at teardown
+            return "the connection closed"
+        finally:
+            self._resolving.discard(future)
+
+    async def _run_resolve(self, name: str) -> Optional[str]:
+        assert self._resolve is not None
+        _CURRENT.set(self._handle.connection)
+        try:
+            result = self._resolve(self._handle, name)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.info("resolving catalog %r failed: %s", name, exc)
+            return str(exc) or type(exc).__name__
+        return None
+
+
 def _start_directions(
     ws: WebSocketLike,
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-    text: _TextChannel,
     send_lock: asyncio.Lock,
-    resolver: _Resolver,
 ) -> tuple["asyncio.Task[None]", "asyncio.Task[None]"]:
     async def ws_to_sock() -> None:
         while True:
@@ -1011,15 +1081,11 @@ def _start_directions(
             if message.get("type") == "websocket.disconnect":
                 return
             data = message.get("bytes")
+            frame_type = STREAM_FRAME_N6K
             if data is None:
-                if text.receive(message.get("text") or ""):
-                    continue
-                logger.info("closing: more than %d text messages in flight", text.max_inflight)
-                async with send_lock:
-                    with contextlib.suppress(Exception):
-                        await ws.close(code=1008, reason="too many text messages in flight")
-                return
-            writer.write(STREAM_HEADER.pack(len(data), STREAM_FRAME_N6K) + data)
+                data = (message.get("text") or "").encode()
+                frame_type = STREAM_FRAME_JSONRPC
+            writer.write(STREAM_HEADER.pack(len(data), frame_type) + data)
             await writer.drain()
 
     async def sock_to_ws() -> None:
@@ -1029,28 +1095,34 @@ def _start_directions(
             except asyncio.IncompleteReadError:
                 return  # the extension closed
             n, frame_type = STREAM_HEADER.unpack(header)
-            if frame_type not in (STREAM_FRAME_N6K, STREAM_FRAME_HOST):
-                logger.error("closing: stream frame type 0x%02x from the extension, expected n6k", frame_type)
+            if frame_type not in (STREAM_FRAME_N6K, STREAM_FRAME_JSONRPC, STREAM_FRAME_CLOSE):
+                logger.error("closing: stream frame type 0x%02x from the extension", frame_type)
                 return
             if n > MAX_FRAME_BYTES:
                 logger.error("closing: frame of %d bytes from the extension exceeds %d", n, MAX_FRAME_BYTES)
                 return
             data = await reader.readexactly(n)
-            if frame_type == STREAM_FRAME_HOST:
-                resolver.receive(data)
-                continue
+            if frame_type == STREAM_FRAME_CLOSE:
+                close = msgpack.unpackb(data)
+                async with send_lock:
+                    with contextlib.suppress(Exception):
+                        await ws.close(code=int(close["code"]), reason=str(close["reason"]))
+                return
             async with send_lock:
-                await ws.send_bytes(data)
+                if frame_type == STREAM_FRAME_JSONRPC:
+                    await ws.send_text(data.decode())
+                else:
+                    await ws.send_bytes(data)
 
     return asyncio.create_task(ws_to_sock()), asyncio.create_task(sock_to_ws())
 
 
-async def _stage_won(stage: "asyncio.Task[Any]", *directions: "asyncio.Task[None]") -> bool:
+async def _stage_won(stage: "asyncio.Future[Any]", *directions: "asyncio.Task[None]") -> bool:
     done, _ = await asyncio.wait({stage, *directions}, return_when=asyncio.FIRST_COMPLETED)
     return stage in done
 
 
-async def _exited_within(task: "Optional[asyncio.Task[Any]]", timeout: float) -> bool:
+async def _exited_within(task: "Optional[asyncio.Future[Any]]", timeout: float) -> bool:
     if task is None:
         return True
     try:
@@ -1083,7 +1155,38 @@ def _close_all(cursors: Sequence[duckdb.DuckDBPyConnection], con: duckdb.DuckDBP
     _close_con(con)
 
 
-def _log_late_failure(task: "asyncio.Task[Any]") -> None:
+def _on_own_thread(fn: Callable[..., Any], *args: Any) -> "asyncio.Future[Any]":
+    """`fn(*args)` on a thread of its own, as a future on this loop.
+
+    Not the default executor: a serving CALL holds its thread for the connection's life, so a pool
+    sized for short calls would cap the connections at its size and starve every other `to_thread`.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def settle(result: Any, error: Optional[BaseException]) -> None:
+        if future.cancelled():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+
+    def run() -> None:
+        try:
+            result, error = fn(*args), None
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting side as-is
+            result, error = None, exc
+        try:
+            loop.call_soon_threadsafe(settle, result, error)
+        except RuntimeError:
+            pass  # the loop already closed: nobody is left to hear the outcome
+
+    threading.Thread(target=run, name="n6k-serve").start()
+    return future
+
+
+def _log_late_failure(task: "asyncio.Future[Any]") -> None:
     if not task.cancelled() and task.exception() is not None:
         logger.info("stage failed after its socket closed: %s", task.exception())
 
@@ -1101,22 +1204,24 @@ async def serve_and_close_connection(
     text_app: Optional[TextApp] = None,
     resolve: Optional[Resolve] = None,
     max_text_inflight: Optional[int] = None,
+    workers: Optional[int] = None,
 ) -> None:
     """Handshake, authenticate, then serve `ws` from `con` until either side drops; then close `con`.
 
-    `con` arrives empty. `n6k_handshake` reads the client's FT_HELLO token on it, and only then
+    `con` arrives empty. The extension reads the client's FT_HELLO and calls back, and only then
     does `authenticate(ws, con, token, **params)` attach what that identity may see and return the
     catalogs to serve: names already attached, `PendingCatalog`s attached while serving, and, with
-    `resolve`, `LazyCatalog`s. While it runs past `HELLO_PENDING_FIRST_S`, the client gets
+    `resolve`, `LazyCatalog`s. While it runs past the extension's `hello_pending_first_ms`, the client gets
     FT_HELLO_PENDING carrying `hello_pending_message`. A `WsReject` or any other exception sends
-    FT_HELLO_ERR (built by `n6k_reject`) and nothing is served; an empty list logs the client in with
-    no catalogs. Returning `Authorized(catalogs, identity)` hands `identity` to text handlers.
+    FT_HELLO_ERR and nothing is served; an empty list logs the client in with no catalogs. Returning
+    `Authorized(catalogs, identity)` hands `identity` to text handlers.
 
-    Ownership passes here: the serving CALL holds `con` for the connection's life. A caller that
-    needs to reach the data meanwhile must take a `con.cursor()` inside `authenticate`.
+    Ownership passes here: the serving CALL runs on a cursor of `con` for the connection's life.
 
-    Once serving starts, `on_serve(ws, handle, **params)` (sync or async) gets a `LiveServe` for
-    adding and removing catalogs; it is cancelled when the connection ends.
+    Once `authenticate` returns, `on_serve(ws, handle, **params)` (sync or async) gets a `LiveServe` for
+    adding and removing catalogs; it is cancelled when the connection ends. It starts before the
+    extension validates that result and sends HELLO_ACK, so it also runs on a connection the extension
+    then rejects.
 
     With `resolve`, a client's OPEN for a catalog that is not served waits (FT_OPEN_PENDING) while
     `resolve(handle, name)` (sync or async) runs on that same `LiveServe`, once per name however many
@@ -1136,6 +1241,8 @@ async def serve_and_close_connection(
     connection ends. `n6k_server.context.current()` inside a handler is the connection's params and
     identity.
 
+    `workers`: `n6k_serve_fd`'s `workers` option; None keeps its default.
+
     `con` is closed off the event loop and only after every query on it returns; this returns without
     waiting for them, so a query that never returns leaves `con` open.
     """
@@ -1146,97 +1253,35 @@ async def serve_and_close_connection(
     if on_text is not None:
         text_app = _OnTextApp(on_text, ws, params)
     host_sock, ext_sock = socket.socketpair()
-    fd = ext_sock.fileno()
-    stage: Optional[asyncio.Task[Any]] = None
+    stage: Optional[asyncio.Future[Any]] = None
     directions: tuple[asyncio.Task[None], ...] = ()
-    settlers: list[asyncio.Task[None]] = []
-    cursors: list[duckdb.DuckDBPyConnection] = []
-    handle: Optional[LiveServe] = None
     writer: Optional[asyncio.StreamWriter] = None
     transport_owns_host_sock = False
     send_lock = asyncio.Lock()
-    text = _TextChannel(ws, text_app, send_lock, max_text_inflight)
-    resolver = _Resolver(resolve)
-    close_code = 1000
-    close_reason = ""
+    # Taken before the CALL: a cursor of a connection that is executing waits for it. `con` itself stays
+    # free for `authenticate`.
+    serve_cur = con.cursor()
+    session_id = _create_session(serve_cur, ext_sock.fileno())
+    handle = LiveServe(con.cursor(), session_id, _Unsettled(()), Connection())
+    cursors = [serve_cur]
+    text = _TextChannel(_ServedText(handle), text_app, asyncio.Lock(), max_text_inflight)  # type: ignore[arg-type]
+    callbacks = _Callbacks(ws, con, authenticate, params, handle, text, on_serve, resolve)
     try:
         reader, writer = await asyncio.open_connection(sock=host_sock)
         transport_owns_host_sock = True
-        directions = _start_directions(ws, reader, writer, text, send_lock, resolver)
-
-        stage = asyncio.create_task(asyncio.to_thread(_handshake, con, fd))
-        if not await _stage_won(stage, *directions):
-            return
-        try:
-            token, hello_capabilities = stage.result()
-        except Exception as exc:  # noqa: BLE001
-            logger.info("handshake failed: %s", exc)
-            return
-
-        # Its own cursor: `authenticate` may be blocked in a query on `con`.
-        beat_cur = con.cursor()
-        cursors.append(beat_cur)
-        beat_stop = asyncio.Event()
-        beat = asyncio.create_task(_beat_hello_pending(beat_cur, ws, send_lock, hello_pending_message, beat_stop))
-        stage = asyncio.create_task(_authenticate(authenticate, ws, con, token, params))
-        won = await _stage_won(stage, *directions)
-        beat_stop.set()
-        await asyncio.gather(beat, return_exceptions=True)
-        if not won:
-            return
-        reason: Optional[str] = None
-        catalogs: list[str] = []
-        pending: list[PendingCatalog] = []
-        lazy: dict[str, Optional[int]] = {}
-        try:
-            authorized = stage.result()
-            catalogs, pending, lazy = _split_served(authorized.catalogs, resolve is not None)
-        except WsReject as reject:
-            reason = reject.reason or "unauthorized"
-            close_code = reject.code
-        except Exception:  # noqa: BLE001 - any failure refuses the client rather than serving it
-            logger.exception("authenticate failed")
-            reason = "internal error"
-            close_code = 1011
-        if reason is not None:
-            close_reason = reason
-            stage = asyncio.create_task(asyncio.to_thread(_reject, con, reason))
-            if await _stage_won(stage, *directions):
-                await _send_frame(ws, send_lock, stage.result())
-                # Nothing serves the fd, so there is no output to drain.
-                stage = None
-            return
-        stage = asyncio.create_task(asyncio.to_thread(_hello_ack, con, hello_capabilities, text.capabilities))
-        if not await _stage_won(stage, *directions):
-            return
-        acked = await _send_frame(ws, send_lock, stage.result())
-        stage = None
-        if not acked:
-            return
-        text.authorize(params, authorized.identity, hello_capabilities)
-
-        pending_cursors = [(p, con.cursor()) for p in pending]
-        cursors.extend(cur for _, cur in pending_cursors)
+        directions = _start_directions(ws, reader, writer, send_lock)
+        callbacks.create_functions()
         sql = build_serve_sql(
-            fd,
-            catalogs,
+            session_id,
+            [],
             ping_interval_ms,
-            {p.name: p.message for p in pending},
-            hello_capabilities,
-            text.capabilities,
-            hello_acked=True,
-            resolve=resolve is not None,
-            lazy=lazy,
+            authenticate=callbacks.authenticate_udf,
+            on_text=callbacks.on_text_udf,
+            resolve=callbacks.resolve_udf,
+            hello_pending_message=hello_pending_message,
+            workers=workers,
         )
-        # The CALL's thread starts at the next await, so cursors taken before then precede it.
-        stage = asyncio.create_task(asyncio.to_thread(con.execute, sql))
-        unsettled = _Unsettled([p.name for p in pending])
-        settlers = [asyncio.create_task(_settle_pending(p, cur, fd, unsettled)) for p, cur in pending_cursors]
-        if on_serve is not None or resolve is not None:
-            handle = LiveServe(con.cursor(), fd, unsettled, text.connection)
-            resolver.bind(handle)
-        if on_serve is not None and handle is not None:
-            settlers.append(asyncio.create_task(_run_on_serve(on_serve, ws, handle, params)))
+        stage = _on_own_thread(serve_cur.execute, sql)
         await _stage_won(stage, *directions)
         if stage.done():
             stage.result()
@@ -1247,10 +1292,9 @@ async def serve_and_close_connection(
                 host_sock.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
-        if handle is not None:
-            handle._close()
-        settlers.extend(text.close())
-        settlers.extend(resolver.close())
+        handle._close()
+        settlers = [*callbacks.close(), *text.close()]
+        cursors.extend(callbacks.cursors)
         if stage is not None and stage.done() and len(directions) == 2:
             try:
                 await asyncio.wait_for(asyncio.shield(directions[1]), timeout=DRAIN_TIMEOUT_S)
@@ -1274,21 +1318,15 @@ async def serve_and_close_connection(
         if not transport_owns_host_sock:
             host_sock.close()
         exited = await _exited_within(stage, SERVE_JOIN_TIMEOUT_S)
-        if handle is not None:
-            await handle._close_upstreams(SERVE_JOIN_TIMEOUT_S)
-        # A LiveServe call still running looks its reactor up by fd number; closing `ext_sock` would
-        # free that number for another connection's socketpair.
-        calls = await handle._join(SERVE_JOIN_TIMEOUT_S) if handle is not None else None
-        if calls is None:
-            ext_sock.close()
-        else:
-            calls.add_done_callback(lambda _: ext_sock.close())
+        await handle._close_upstreams(SERVE_JOIN_TIMEOUT_S)
+        ext_sock.close()
+        calls = await handle._join(SERVE_JOIN_TIMEOUT_S)
         try:
-            await ws.close(code=close_code, reason=close_reason[:123])
-        except Exception:  # noqa: BLE001 - already closed by the peer, or mid-close
+            await ws.close()
+        except Exception:  # noqa: BLE001 - already closed by the peer, by the extension, or mid-close
             pass
-        late_cursors = [handle._cur] if handle is not None and calls is not None else []
-        if handle is not None and calls is None:
+        late_cursors = [handle._cur] if calls is not None else []
+        if calls is None:
             cursors.append(handle._cur)
         # A thread that outlived the timeout still owns `con`; closing it underneath would race.
         busy: list[asyncio.Future[Any]] = []

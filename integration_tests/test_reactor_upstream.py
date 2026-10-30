@@ -1,15 +1,19 @@
+import itertools
 import json
 import os
+import queue
 import socket
 import struct
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, Optional
 
 import duckdb
 import pytest
+from duckdb.sqltypes import UUID, VARCHAR
 
 from _paths import REPO_ROOT
 
@@ -37,7 +41,6 @@ from n6k_protocol.protocol import (
     OP_CATALOG_LIST,
     OP_CATALOGS_CHANGED,
     OP_QUERY,
-    STREAM_FRAME_HOST,
     STREAM_FRAME_N6K,
 )
 
@@ -45,11 +48,12 @@ SERVER_EXT_PATH = os.path.join(REPO_ROOT, "build", "release", "extension", "n6k_
 
 pytestmark = pytest.mark.skipif(not os.path.exists(SERVER_EXT_PATH), reason=f"Extension not built: {SERVER_EXT_PATH}")
 
+_udf_ids = itertools.count()
+
 
 class _Peer:
     def __init__(self, sock: socket.socket, timeout: float = 10) -> None:
         self.sock = sock
-        self.events: list[dict[str, Any]] = []
         sock.settimeout(timeout)
 
     def send(self, header: dict[str, Any]) -> None:
@@ -57,15 +61,10 @@ class _Peer:
         self.sock.sendall(struct.pack(">IB", len(frame), STREAM_FRAME_N6K) + frame)
 
     def recv(self) -> dict[str, Any]:
-        while True:
-            n, frame_type = struct.unpack(">IB", self._exactly(5))
-            payload = self._exactly(n)
-            if frame_type == STREAM_FRAME_HOST:
-                self.events.append(json.loads(payload))
-                continue
-            assert frame_type == STREAM_FRAME_N6K
-            header, _ = unpack_frame(payload)
-            return dict(header)
+        n, frame_type = struct.unpack(">IB", self._exactly(5))
+        assert frame_type == STREAM_FRAME_N6K
+        header, _ = unpack_frame(self._exactly(n))
+        return dict(header)
 
     def recv_until(self, match: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
         while not match(frame := self.recv()):
@@ -91,15 +90,68 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return c
 
 
+class _Resolver:
+    def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
+        self.name = f"resolve_{next(_udf_ids)}"
+        self._calls: queue.Queue[str] = queue.Queue()
+        self._answers: queue.Queue[Optional[str]] = queue.Queue()
+        self._closed = threading.Event()
+        con.create_function(
+            self.name, self._resolve, [UUID, VARCHAR], VARCHAR, null_handling="special", side_effects=True
+        )
+
+    def _resolve(self, session_id: uuid.UUID, catalog: str) -> Optional[str]:
+        self._calls.put(catalog)
+        while not self._closed.is_set():
+            try:
+                return self._answers.get(timeout=0.05)
+            except queue.Empty:
+                pass
+        return None
+
+    def called(self) -> str:
+        return self._calls.get(timeout=5)
+
+    def calls_so_far(self) -> list[str]:
+        calls = []
+        while not self._calls.empty():
+            calls.append(self._calls.get_nowait())
+        return calls
+
+    def answer(self, error: Optional[str] = None) -> None:
+        self._answers.put(error)
+
+    def close(self) -> None:
+        self._closed.set()
+
+
+def _authenticate(con: duckdb.DuckDBPyConnection, result: dict[str, Any]) -> str:
+    name = f"authenticate_{next(_udf_ids)}"
+    con.create_function(
+        name,
+        lambda session_id, token, caps, request: json.dumps(result),
+        [UUID, VARCHAR, duckdb.list_type(VARCHAR), VARCHAR],
+        VARCHAR,
+        null_handling="special",
+        side_effects=True,
+    )
+    return f", authenticate => '{name}'"
+
+
 @contextmanager
-def _serving(con: duckdb.DuckDBPyConnection, sql_tail: str) -> Iterator[tuple[_Peer, int]]:
+def _serving(
+    con: duckdb.DuckDBPyConnection, sql_tail: str, resolver: Optional[_Resolver] = None
+) -> Iterator[tuple[_Peer, uuid.UUID]]:
     peer_sock, served = socket.socketpair()
-    fd = served.fileno()
+    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchone()[0]
     errors: list[BaseException] = []
+    sql = f"CALL n6k_serve_fd('{session_id}'::UUID{sql_tail}" + (
+        f", resolve => '{resolver.name}')" if resolver else ")"
+    )
 
     def serve() -> None:
         try:
-            con.execute(f"CALL n6k_serve_fd({fd}{sql_tail})").fetchall()
+            con.execute(sql).fetchall()
         except BaseException as e:
             errors.append(e)
 
@@ -107,10 +159,13 @@ def _serving(con: duckdb.DuckDBPyConnection, sql_tail: str) -> Iterator[tuple[_P
     worker.start()
     peer = _Peer(peer_sock)
     try:
+        peer.send({"t": FT_HELLO, "token": "", "protocol_version": N6K_PROTOCOL_VERSION})
         assert peer.recv()["t"] == FT_HELLO_ACK
-        yield peer, fd
+        yield peer, session_id
     finally:
         peer_sock.close()
+        if resolver:
+            resolver.close()
         worker.join(15)
         served.close()
     assert not worker.is_alive(), "serve did not end after the peer closed"
@@ -124,16 +179,15 @@ class _UpstreamServer:
             self.con.execute(f"ATTACH ':memory:' AS {name}")
             self.con.execute(f"CREATE TABLE {name}.main.t AS SELECT range AS i FROM range(100000)")
         self.link, self._served = socket.socketpair()
-        self.fd = self._served.fileno()
+        self.session_id = self.con.execute(
+            "SELECT session_id FROM n6k_serve_create_session(?)", [self._served.fileno()]
+        ).fetchone()[0]
         self.errors: list[BaseException] = []
         names = ", ".join(f"'{n}'" for n in catalogs)
 
         def serve() -> None:
             try:
-                row = self.con.execute("SELECT capabilities FROM n6k_handshake(?)", [self.fd]).fetchone()
-                assert row is not None
-                caps = ", ".join(f"'{c}'" for c in row[0])
-                self.con.execute(f"CALL n6k_serve_fd({self.fd}, {names}, capabilities => [{caps}])").fetchall()
+                self.con.execute(f"CALL n6k_serve_fd('{self.session_id}'::UUID, {names})").fetchall()
             except BaseException as e:
                 self.errors.append(e)
 
@@ -164,6 +218,11 @@ def con() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 @pytest.fixture
+def resolver(con: duckdb.DuckDBPyConnection) -> _Resolver:
+    return _Resolver(con)
+
+
+@pytest.fixture
 def upstream() -> Iterator[_UpstreamServer]:
     up = _UpstreamServer(["a"])
     yield up
@@ -176,14 +235,14 @@ def _hello(side: duckdb.DuckDBPyConnection, up_fd: int, token: str = "") -> tupl
     return list(row[0]), list(row[1])
 
 
-def _add_upstream(side: duckdb.DuckDBPyConnection, fd: int, up_fd: int, catalogs: list[str]) -> list[str]:
-    row = side.execute("SELECT skipped FROM n6k_serve_add_upstream(?, ?, ?)", [fd, up_fd, catalogs]).fetchone()
+def _add_upstream(side: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up_fd: int, catalogs: list[str]) -> list[str]:
+    row = side.execute("SELECT skipped FROM n6k_serve_add_upstream(?, ?, ?)", [session_id, up_fd, catalogs]).fetchone()
     assert row is not None
     return list(row[0])
 
 
-def _status(side: duckdb.DuckDBPyConnection, fd: int, up_fd: int) -> tuple[bool, Optional[str]]:
-    row = side.execute("SELECT open, reason FROM n6k_serve_upstream_status(?, ?)", [fd, up_fd]).fetchone()
+def _status(side: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up_fd: int) -> tuple[bool, Optional[str]]:
+    row = side.execute("SELECT open, reason FROM n6k_serve_upstream_status(?, ?)", [session_id, up_fd]).fetchone()
     assert row is not None
     return bool(row[0]), row[1]
 
@@ -203,17 +262,17 @@ def _query(peer: _Peer, ns: int, req_id: int, sql: str) -> list[dict[str, Any]]:
             return frames
 
 
-def _attach_upstream(side: duckdb.DuckDBPyConnection, peer: _Peer, fd: int, up: _UpstreamServer) -> None:
+def _attach_upstream(side: duckdb.DuckDBPyConnection, peer: _Peer, session_id: uuid.UUID, up: _UpstreamServer) -> None:
     catalogs, _ = _hello(side, up.link.fileno())
     assert catalogs == ["a"]
-    assert _add_upstream(side, fd, up.link.fileno(), catalogs) == []
+    assert _add_upstream(side, session_id, up.link.fileno(), catalogs) == []
     assert peer.recv_push() == ["x", "a"]
 
 
-def _wait_closed(side: duckdb.DuckDBPyConnection, fd: int, up_fd: int, timeout: float = 15) -> str:
+def _wait_closed(side: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up_fd: int, timeout: float = 15) -> str:
     deadline = time.monotonic() + timeout
     while True:
-        is_open, reason = _status(side, fd, up_fd)
+        is_open, reason = _status(side, session_id, up_fd)
         if not is_open:
             assert reason is not None
             return reason
@@ -225,8 +284,8 @@ def test_upstream_catalog_is_listed_opened_and_queried_alongside_a_local_one(
     con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
 ) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
         assert _open(peer, 2, "x")["t"] == FT_OPEN_ACK
         assert _query(peer, 1, 1, "SELECT count(*) AS n FROM a.main.t")[-1]["t"] == FT_RESP_END
@@ -234,15 +293,15 @@ def test_upstream_catalog_is_listed_opened_and_queried_alongside_a_local_one(
         peer.send({"t": FT_REQ, "id": 9, "op": OP_CATALOG_LIST})
         chunk = peer.recv_until(lambda f: f["t"] == FT_RESP_CHUNK and f["id"] == 9)
         assert chunk["catalogs"] == ["x", "a"]
-        assert _status(side, fd, upstream.link.fileno()) == (True, None)
+        assert _status(side, session_id, upstream.link.fileno()) == (True, None)
 
 
 def test_catalog_plans_is_granted_for_a_local_catalog_but_not_a_forwarded_one(
     con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
 ) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         for ns, catalog, granted in ((1, "x", [CAP_CATALOG_PLANS]), (2, "a", [])):
             peer.send({"t": FT_OPEN, "ns": ns, "catalog": catalog, "capabilities": [CAP_CATALOG_PLANS]})
             ack = peer.recv_until(lambda f: f["t"] in (FT_OPEN_ACK, FT_OPEN_ERR) and f["ns"] == ns)
@@ -254,10 +313,10 @@ def test_a_name_already_served_is_skipped(con: duckdb.DuckDBPyConnection) -> Non
     up = _UpstreamServer(["a", "x"])
     side = con.cursor()
     try:
-        with _serving(con, ", 'x'") as (peer, fd):
+        with _serving(con, ", 'x'") as (peer, session_id):
             catalogs, _ = _hello(side, up.link.fileno())
             assert sorted(catalogs) == ["a", "x"]
-            assert _add_upstream(side, fd, up.link.fileno(), catalogs) == ["x"]
+            assert _add_upstream(side, session_id, up.link.fileno(), catalogs) == ["x"]
             assert peer.recv_push() == ["x", "a"]
             assert _open(peer, 1, "x")["t"] == FT_OPEN_ACK
     finally:
@@ -267,13 +326,13 @@ def test_a_name_already_served_is_skipped(con: duckdb.DuckDBPyConnection) -> Non
 def test_the_upstreams_catalog_changes_follow(con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer) -> None:
     side = con.cursor()
     up_side = upstream.con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         up_side.execute("ATTACH ':memory:' AS d")
-        up_side.execute("SELECT * FROM n6k_serve_add_catalog(?, 'd')", [upstream.fd]).fetchall()
+        up_side.execute("SELECT * FROM n6k_serve_add_catalog(?, 'd')", [upstream.session_id]).fetchall()
         assert peer.recv_push() == ["x", "a", "d"]
         assert _open(peer, 1, "d")["t"] == FT_OPEN_ACK
-        up_side.execute("SELECT * FROM n6k_serve_remove_catalog(?, 'a')", [upstream.fd]).fetchall()
+        up_side.execute("SELECT * FROM n6k_serve_remove_catalog(?, 'a')", [upstream.session_id]).fetchall()
         assert peer.recv_push() == ["x", "d"]
 
 
@@ -281,8 +340,8 @@ def test_upstream_eof_fails_its_sessions_with_the_reason(
     con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
 ) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
         assert _open(peer, 2, "x")["t"] == FT_OPEN_ACK
         # Stalls once its batch credits run out, so it is still in flight when the upstream dies.
@@ -292,7 +351,7 @@ def test_upstream_eof_fails_its_sessions_with_the_reason(
         err = peer.recv_until(lambda f: f["t"] == FT_ERR and f.get("ns") == 1 and f["id"] == 1)
         assert 'upstream for catalog "a" closed' in err["exception_message"]
         assert peer.recv_push() == ["x"]
-        assert "closed" in _wait_closed(side, fd, upstream.link.fileno())
+        assert "closed" in _wait_closed(side, session_id, upstream.link.fileno())
         assert _open(peer, 3, "a")["t"] == FT_OPEN_ERR
         assert _query(peer, 2, 1, "SELECT * FROM x.main.t")[-1]["t"] == FT_RESP_END
 
@@ -301,12 +360,12 @@ def test_remove_upstream_fails_its_sessions_as_removed_by_host(
     con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
 ) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
-        side.execute("SELECT * FROM n6k_serve_remove_upstream(?, ?)", [fd, upstream.link.fileno()]).fetchall()
+        side.execute("SELECT * FROM n6k_serve_remove_upstream(?, ?)", [session_id, upstream.link.fileno()]).fetchall()
         assert peer.recv_push() == ["x"]
-        assert _wait_closed(side, fd, upstream.link.fileno()) == "removed by host"
+        assert _wait_closed(side, session_id, upstream.link.fileno()) == "removed by host"
         err = _query(peer, 1, 1, "SELECT 1")[-1]
         assert err["t"] == FT_ERR
         assert "unknown session" in err["exception_message"]
@@ -314,25 +373,25 @@ def test_remove_upstream_fails_its_sessions_as_removed_by_host(
 
 def test_local_catalog_calls_refuse_an_upstream_name(con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         with pytest.raises(duckdb.InvalidInputException, match="served by an upstream"):
-            side.execute("SELECT * FROM n6k_serve_remove_catalog(?, 'a')", [fd]).fetchall()
+            side.execute("SELECT * FROM n6k_serve_remove_catalog(?, 'a')", [session_id]).fetchall()
         with pytest.raises(duckdb.InvalidInputException, match="served by an upstream"):
-            side.execute("SELECT * FROM n6k_serve_pause(?, 'a')", [fd]).fetchall()
+            side.execute("SELECT * FROM n6k_serve_pause(?, 'a')", [session_id]).fetchall()
 
 
 def test_resolve_can_add_an_upstream_for_a_parked_open(
-    con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
+    con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer, resolver: _Resolver
 ) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x', resolve => true") as (peer, fd):
+    with _serving(con, ", 'x'", resolver) as (peer, session_id):
         peer.send({"t": FT_OPEN, "ns": 1, "catalog": "a"})
         peer.recv_until(lambda f: f.get("ns") == 1)
-        assert peer.events == [{"resolve": "a"}]
+        assert resolver.called() == "a"
         catalogs, _ = _hello(side, upstream.link.fileno())
-        _add_upstream(side, fd, upstream.link.fileno(), catalogs)
-        side.execute("SELECT * FROM n6k_serve_resolved(?, 'a', NULL)", [fd]).fetchall()
+        _add_upstream(side, session_id, upstream.link.fileno(), catalogs)
+        resolver.answer()
         assert peer.recv_until(lambda f: f["t"] in (FT_OPEN_ACK, FT_OPEN_ERR) and f["ns"] == 1)["t"] == FT_OPEN_ACK
         assert _query(peer, 1, 1, "SELECT count(*) FROM a.main.t")[-1]["t"] == FT_RESP_END
 
@@ -341,8 +400,8 @@ def test_a_detached_forwarded_session_is_closed_upstream_too(
     con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
 ) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
         peer.send({"t": FT_CANCEL, "ns": 1, "id": 0})
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
@@ -417,10 +476,10 @@ def test_a_silent_upstream_is_dropped_as_a_ping_timeout(con: duckdb.DuckDBPyConn
     scripted.run(lambda peer: _answer_hello(peer, ["a"]))
     side = con.cursor()
     try:
-        with _serving(con, ", 'x', ping_interval_ms => 200") as (peer, fd):
+        with _serving(con, ", 'x', ping_interval_ms => 200") as (peer, session_id):
             catalogs, _ = _hello(side, scripted.link.fileno())
-            _add_upstream(side, fd, scripted.link.fileno(), catalogs)
-            reason = _wait_closed(side, fd, scripted.link.fileno(), timeout=20)
+            _add_upstream(side, session_id, scripted.link.fileno(), catalogs)
+            reason = _wait_closed(side, session_id, scripted.link.fileno(), timeout=20)
             assert "ping timeout" in reason
             assert peer.recv_until(lambda f: f["t"] == FT_PUSH and f["catalogs"] == ["x"])
     finally:
@@ -447,9 +506,9 @@ def test_an_upstreams_frames_on_a_session_not_forwarded_to_it_are_dropped(con: d
     scripted.run(script)
     side = con.cursor()
     try:
-        with _serving(con, ", 'x'") as (peer, fd):
+        with _serving(con, ", 'x'") as (peer, session_id):
             catalogs, _ = _hello(side, scripted.link.fileno())
-            _add_upstream(side, fd, scripted.link.fileno(), catalogs)
+            _add_upstream(side, session_id, scripted.link.fileno(), catalogs)
             assert peer.recv_push() == ["x", "a"]
             assert _open(peer, 2, "x")["t"] == FT_OPEN_ACK
             assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
@@ -463,56 +522,58 @@ def test_an_upstreams_frames_on_a_session_not_forwarded_to_it_are_dropped(con: d
 
 
 def test_add_upstream_takes_over_a_lazy_name_which_reverts_when_the_upstream_dies(
-    con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
+    con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer, resolver: _Resolver
 ) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x', resolve => true, lazy => MAP {'a': NULL}") as (peer, fd):
+    with _serving(con, ", 'x'" + _authenticate(con, {"lazy": {"a": None}}), resolver) as (peer, session_id):
         catalogs, _ = _hello(side, upstream.link.fileno())
-        assert _add_upstream(side, fd, upstream.link.fileno(), catalogs) == []
+        assert _add_upstream(side, session_id, upstream.link.fileno(), catalogs) == []
         assert peer.recv_push() == ["x", "a"]
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
         upstream.kill()
         assert peer.recv_push() == ["x", "a"]
-        _wait_closed(side, fd, upstream.link.fileno())
+        _wait_closed(side, session_id, upstream.link.fileno())
         peer.send({"t": FT_OPEN, "ns": 2, "catalog": "a"})
         peer.recv_until(lambda f: f.get("ns") == 2)
-        assert peer.events == [{"resolve": "a"}]
-        side.execute("SELECT * FROM n6k_serve_resolved(?, 'a', NULL)", [fd]).fetchall()
+        assert resolver.called() == "a"
+        resolver.answer()
 
 
-def _add_ranked(side: duckdb.DuckDBPyConnection, fd: int, up: _UpstreamServer, rank: int) -> list[str]:
+def _add_ranked(side: duckdb.DuckDBPyConnection, session_id: uuid.UUID, up: _UpstreamServer, rank: int) -> list[str]:
     catalogs, _ = _hello(side, up.link.fileno())
     row = side.execute(
-        "SELECT skipped FROM n6k_serve_add_upstream(?, ?, ?, rank => ?)", [fd, up.link.fileno(), catalogs, rank]
+        "SELECT skipped FROM n6k_serve_add_upstream(?, ?, ?, rank => ?)", [session_id, up.link.fileno(), catalogs, rank]
     ).fetchone()
     assert row is not None
     return list(row[0])
 
 
-def test_a_lazy_name_of_better_rank_keeps_the_name_from_an_upstream(con: duckdb.DuckDBPyConnection) -> None:
+def test_a_lazy_name_of_better_rank_keeps_the_name_from_an_upstream(
+    con: duckdb.DuckDBPyConnection, resolver: _Resolver
+) -> None:
     up = _UpstreamServer(["a", "b"])
     side = con.cursor()
     try:
-        with _serving(con, ", 'x', resolve => true, lazy => MAP {'a': 1}") as (peer, fd):
-            assert _add_ranked(side, fd, up, 2) == ["a"]
+        with _serving(con, ", 'x'" + _authenticate(con, {"lazy": {"a": 1}}), resolver) as (peer, session_id):
+            assert _add_ranked(side, session_id, up, 2) == ["a"]
             assert peer.recv_push() == ["x", "b", "a"]
             peer.send({"t": FT_OPEN, "ns": 1, "catalog": "a"})
             peer.recv_until(lambda f: f.get("ns") == 1)
-            assert peer.events == [{"resolve": "a"}]
-            side.execute("SELECT * FROM n6k_serve_resolved(?, 'a', NULL)", [fd]).fetchall()
+            assert resolver.called() == "a"
+            resolver.answer()
     finally:
         up.close()
 
 
-def test_an_upstream_of_better_rank_takes_a_lazy_name(con: duckdb.DuckDBPyConnection) -> None:
+def test_an_upstream_of_better_rank_takes_a_lazy_name(con: duckdb.DuckDBPyConnection, resolver: _Resolver) -> None:
     up = _UpstreamServer(["a"])
     side = con.cursor()
     try:
-        with _serving(con, ", resolve => true, lazy => MAP {'a': 5}") as (peer, fd):
-            assert _add_ranked(side, fd, up, 2) == []
+        with _serving(con, _authenticate(con, {"lazy": {"a": 5}}), resolver) as (peer, session_id):
+            assert _add_ranked(side, session_id, up, 2) == []
             assert peer.recv_push() == ["a"]
             assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
-            assert peer.events == []
+            assert resolver.calls_so_far() == []
     finally:
         up.close()
 
@@ -528,17 +589,17 @@ def test_the_better_ranked_upstream_wins_and_a_rank_change_moves_the_name(con: d
     up2 = _UpstreamServer(["b", "c"])
     side = con.cursor()
     try:
-        with _serving(con, "") as (peer, fd):
-            assert _add_ranked(side, fd, up1, 2) == []
+        with _serving(con, "") as (peer, session_id):
+            assert _add_ranked(side, session_id, up1, 2) == []
             assert peer.recv_push() == ["a", "b"]
             assert _open(peer, 1, "b")["t"] == FT_OPEN_ACK
             # Added later but ranked better: it takes b, and the session on up1's b is closed.
-            assert _add_ranked(side, fd, up2, 1) == []
+            assert _add_ranked(side, session_id, up2, 1) == []
             assert peer.recv_push() == ["a", "b", "c"]
             _assert_session_gone(peer, 1)
             assert _open(peer, 2, "b")["t"] == FT_OPEN_ACK
             row = side.execute(
-                "SELECT skipped FROM n6k_serve_set_upstream_rank(?, ?, 0)", [fd, up1.link.fileno()]
+                "SELECT skipped FROM n6k_serve_set_upstream_rank(?, ?, 0)", [session_id, up1.link.fileno()]
             ).fetchone()
             assert row is not None and list(row[0]) == []
             peer.recv_push()
@@ -551,11 +612,11 @@ def test_the_better_ranked_upstream_wins_and_a_rank_change_moves_the_name(con: d
 
 def test_a_local_catalog_beats_every_upstream(con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer) -> None:
     side = con.cursor()
-    with _serving(con, ", 'x'") as (peer, fd):
-        _attach_upstream(side, peer, fd, upstream)
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
         side.execute("ATTACH ':memory:' AS a")
-        side.execute("SELECT * FROM n6k_serve_add_catalog(?, 'a')", [fd]).fetchall()
+        side.execute("SELECT * FROM n6k_serve_add_catalog(?, 'a')", [session_id]).fetchall()
         peer.recv_push()
         _assert_session_gone(peer, 1)
         assert _open(peer, 2, "a")["t"] == FT_OPEN_ACK
@@ -563,8 +624,8 @@ def test_a_local_catalog_beats_every_upstream(con: duckdb.DuckDBPyConnection, up
         assert _query(peer, 2, 1, "SELECT count(*) FROM a.main.t")[-1]["t"] == FT_ERR
     second = _UpstreamServer(["x"])
     try:
-        with _serving(con, ", 'x'") as (peer, fd):
-            assert _add_ranked(side, fd, second, -100) == ["x"]
+        with _serving(con, ", 'x'") as (peer, session_id):
+            assert _add_ranked(side, session_id, second, -100) == ["x"]
     finally:
         second.close()
 
@@ -574,13 +635,13 @@ def test_when_the_winning_upstream_dies_the_next_ranked_one_takes_the_name(con: 
     up2 = _UpstreamServer(["b"])
     side = con.cursor()
     try:
-        with _serving(con, "") as (peer, fd):
-            assert _add_ranked(side, fd, up1, 1) == []
+        with _serving(con, "") as (peer, session_id):
+            assert _add_ranked(side, session_id, up1, 1) == []
             assert peer.recv_push() == ["b"]
-            assert _add_ranked(side, fd, up2, 2) == ["b"]
+            assert _add_ranked(side, session_id, up2, 2) == ["b"]
             up1.kill()
             assert peer.recv_until(lambda f: f["t"] == FT_PUSH and f["catalogs"] == ["b"])
-            _wait_closed(side, fd, up1.link.fileno())
+            _wait_closed(side, session_id, up1.link.fileno())
             assert _open(peer, 1, "b")["t"] == FT_OPEN_ACK
     finally:
         up1.close()
@@ -592,9 +653,9 @@ def test_the_first_upstream_to_serve_a_name_keeps_it(con: duckdb.DuckDBPyConnect
     up2 = _UpstreamServer(["b", "c"])
     side = con.cursor()
     try:
-        with _serving(con, "") as (peer, fd):
-            assert _add_upstream(side, fd, up1.link.fileno(), _hello(side, up1.link.fileno())[0]) == []
-            assert _add_upstream(side, fd, up2.link.fileno(), _hello(side, up2.link.fileno())[0]) == ["b"]
+        with _serving(con, "") as (peer, session_id):
+            assert _add_upstream(side, session_id, up1.link.fileno(), _hello(side, up1.link.fileno())[0]) == []
+            assert _add_upstream(side, session_id, up2.link.fileno(), _hello(side, up2.link.fileno())[0]) == ["b"]
             peer.recv_until(lambda f: f["t"] == FT_PUSH and f["catalogs"] == ["a", "b", "c"])
     finally:
         up1.close()

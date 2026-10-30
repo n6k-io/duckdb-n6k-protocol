@@ -13,9 +13,11 @@ from _paths import REPO_ROOT
 
 from n6k_protocol.engine import pack_frame, unpack_frame
 from n6k_protocol.protocol import (
+    FT_HELLO,
     FT_HELLO_ACK,
     FT_PING,
     FT_REQ,
+    N6K_PROTOCOL_VERSION,
     OP_CATALOG_LIST,
     STREAM_FRAME_JSONRPC,
     STREAM_FRAME_N6K,
@@ -62,11 +64,11 @@ class _Peer:
 @contextmanager
 def _serving(con: duckdb.DuckDBPyConnection) -> Iterator[_Peer]:
     peer_sock, served = socket.socketpair()
-    fd = served.fileno()
+    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchone()[0]
 
     def serve() -> None:
         try:
-            con.execute(f"CALL n6k_serve_fd({fd}, 'db')").fetchall()
+            con.execute("CALL n6k_serve_fd(?, 'db')", [session_id]).fetchall()
         except BaseException:
             pass
 
@@ -74,6 +76,7 @@ def _serving(con: duckdb.DuckDBPyConnection) -> Iterator[_Peer]:
     worker.start()
     peer = _Peer(peer_sock)
     try:
+        peer.send(STREAM_FRAME_N6K, pack_frame({"t": FT_HELLO, "token": "", "protocol_version": N6K_PROTOCOL_VERSION}))
         frame_type, payload = peer.recv()
         assert frame_type == STREAM_FRAME_N6K
         assert unpack_frame(payload)[0]["t"] == FT_HELLO_ACK

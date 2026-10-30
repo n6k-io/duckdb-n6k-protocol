@@ -18,8 +18,9 @@ struct HelloRequest {
 	std::vector<std::string> capabilities;
 };
 
-// Rejects (HELLO_ERR, then throws) a timeout, a first frame that is not a parseable FT_HELLO, a
-// missing token, or a missing or mismatched protocol_version. Throws without HELLO_ERR on any transport error,
+// Drops text frames before HELLO: no capability has been granted yet. Rejects (HELLO_ERR, then throws) a timeout,
+// a first binary frame that is not a parseable FT_HELLO, a missing token, or a missing or mismatched
+// protocol_version. Throws without HELLO_ERR on any transport error,
 // including the peer closing first.
 HelloRequest ReadHello(ServeTransport &conn);
 

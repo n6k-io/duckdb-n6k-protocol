@@ -53,7 +53,7 @@ export const FLAG_IS_ARROW_IPC = 0x04;
 
 export const STREAM_FRAME_JSONRPC = 0x01;
 export const STREAM_FRAME_N6K = 0x02;
-export const STREAM_FRAME_HOST = 0x03;
+export const STREAM_FRAME_CLOSE = 0x04;
 export const DEFAULT_BATCH_CREDITS = 8;
 export const MAX_CONCURRENT_REQS = 64;
 export const OPEN_PENDING_INTERVAL_MS = 2000;

@@ -92,7 +92,7 @@ first". See [Sessions](#sessions).
 | 10 | PONG | either | `{id?}` |
 | 11 | HELLO | C→S | `{token, protocol_version, capabilities?: [..]}` — the socket's handshake. Sent **once per socket**, as the first frame; no `ns`, no `catalog`. `token` is the socket's only credential: a required string, empty when anonymous. |
 | 12 | HELLO_ACK | S→C | `{protocol_version, capabilities: [..]}`; connection-scoped (see Capabilities). The socket is authenticated; the client may now send `OPEN`. |
-| 13 | HELLO_ERR | S→C | `{exception_type, exception_message, retriable?}`; connection-scoped (no `id`, no `ns`). Sent **in lieu of** HELLO_ACK when the handshake is rejected (bad token, a non-HELLO first frame — "first frame must be FT_HELLO", no HELLO within `HANDSHAKE_TIMEOUT_MS` (5s, `src/n6k_server/include/serve_handshake.hpp`) — "no FT_HELLO within 5000ms", a missing or mismatched `protocol_version`) and in reply to a second HELLO on the same socket. The extension half-closes after its own HELLO_ERR; `n6k_reject` only returns the frame, and the host closes the WS. |
+| 13 | HELLO_ERR | S→C | `{exception_type, exception_message, retriable?}`; connection-scoped (no `id`, no `ns`). Sent **in lieu of** HELLO_ACK when the handshake is rejected (bad token, a non-HELLO first frame — "first frame must be FT_HELLO", no HELLO within `HANDSHAKE_TIMEOUT_MS` (`src/n6k_server/include/serve_handshake.hpp`) — "no FT_HELLO within <HANDSHAKE_TIMEOUT_MS>ms", a missing or mismatched `protocol_version`) and in reply to a second HELLO on the same socket. After HELLO_ERR the extension closes the connection; for a HELLO it cannot read or accept, a Unix-socket serve only shuts down its write side, with no close frame. For an `authenticate` reject, see [Host callbacks](n6k-server.md#host-callbacks). |
 | 14 | — | — | Unused. |
 | 15 | OPEN | C→S | `{ns, catalog, capabilities?: [..]}` — opens a catalog session; sent once per ATTACH. `ns` is required and non-zero. |
 | 16 | OPEN_ACK | S→C | `{ns, max_concurrent_reqs, default_batch_credits, capabilities: [..]}` (see Capabilities). The session is usable. |
@@ -295,8 +295,15 @@ The client uses `{schema, name}` as the table identity on subsequent
    `RESP_CHUNK`; pauses at 0. Client sends `CREDIT{id, n}` (the refill count
    `n` is a header field) to refill.
 6. **Cancellation.** Client sends `CANCEL{id}`; server stops producing
-   and emits a terminal `RESP_END` with `{"cancelled": true}`.
-7. **Drop.** Either side closing fails all in-flight `req_id`s with a
+   and emits a terminal `RESP_END` with `{"cancelled": true}`, unless the
+   request has already ended.
+7. **One terminal frame.** Each request gets at most one `RESP_END` or
+   `ERR`, and nothing for its `req_id` follows it. It gets none if the
+   connection closes first. A `REQ` that reuses a `req_id` still in flight
+   is refused with an `ERR` on that `req_id`; the original keeps running and
+   still sends its own frames and terminal frame, so the client sees that
+   `req_id` end twice.
+8. **Drop.** Either side closing fails all in-flight `req_id`s with a
    transport error. The client must re-ATTACH — session resume is not
    supported.
 

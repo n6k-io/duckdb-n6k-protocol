@@ -5,12 +5,13 @@
 #include "n6k_served.hpp"
 #include "serve_bind_common.hpp"
 #include "serve_clients.hpp"
-#include "serve_handshake.hpp"
+#include "serve_options.hpp"
 #include "serve_reactor.hpp"
 #include "uds_transport.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -29,15 +30,14 @@ static constexpr const char *LISTEN_ENV = "N6K_LISTEN";
 static constexpr int ACCEPT_POLL_MS = 250;
 static constexpr const char *FN_NAME = "n6k_serve_socket";
 static constexpr const char *FD_FN_NAME = "n6k_serve_fd";
+static constexpr const char *CREATE_SESSION_FN_NAME = "n6k_serve_create_session";
 static constexpr const char *PUSH_FN_NAME = "n6k_serve_push_invalidate";
 static constexpr const char *STATS_FN_NAME = "n6k_serve_stats";
-static constexpr const char *HANDSHAKE_FN_NAME = "n6k_handshake";
-static constexpr const char *REJECT_FN_NAME = "n6k_reject";
-static constexpr const char *HELLO_PENDING_FN_NAME = "n6k_hello_pending";
-static constexpr const char *HELLO_ACK_FN_NAME = "n6k_hello_ack";
 static constexpr const char *OPEN_READY_FN_NAME = "n6k_serve_open_ready";
 static constexpr const char *OPEN_FAILED_FN_NAME = "n6k_serve_open_failed";
-static constexpr const char *RESOLVED_FN_NAME = "n6k_serve_resolved";
+static constexpr const char *SEND_TEXT_FN_NAME = "n6k_serve_send_text";
+static constexpr const char *CLOSE_FN_NAME = "n6k_serve_close";
+static constexpr const char *SESSION_STATS_FN_NAME = "n6k_serve_session_stats";
 static constexpr const char *UPSTREAM_HELLO_FN_NAME = "n6k_upstream_hello";
 static constexpr const char *ADD_UPSTREAM_FN_NAME = "n6k_serve_add_upstream";
 static constexpr const char *REMOVE_UPSTREAM_FN_NAME = "n6k_serve_remove_upstream";
@@ -58,26 +58,8 @@ struct N6kServeBindData : public TableFunctionData {
 	// `socket_path` doubles as the label reported in the result row.
 	string socket_path;
 	bool listen = false;
-	int fd = -1;
-	bool has_ping_interval = false;
-	int ping_interval_ms = 0;
-	vector<n6k::PendingCatalogSpec> pending;
-	// < 0 means OPEN_PENDING_INTERVAL_MS.
-	int64_t open_pending_interval_ms = -1;
-	// The FT_HELLO capabilities n6k_handshake returned.
-	vector<string> hello_capabilities;
-	vector<string> app_capabilities;
-	bool hello_acked = false;
-	bool resolve = false;
-	vector<std::pair<string, int64_t>> lazy;
-};
-
-struct N6kHandshakeBindData : public TableFunctionData {
-	int fd = -1;
-};
-
-struct N6kHelloFrameBindData : public TableFunctionData {
-	string frame;
+	hugeint_t session_id;
+	n6k::ServeOptions options;
 };
 
 struct N6kServeState : public GlobalTableFunctionState {
@@ -85,7 +67,7 @@ struct N6kServeState : public GlobalTableFunctionState {
 };
 
 struct N6kResolveOpenBindData : public TableFunctionData {
-	int fd = -1;
+	hugeint_t session_id;
 	string catalog;
 	bool ok = true;
 	string message;
@@ -94,10 +76,25 @@ struct N6kResolveOpenBindData : public TableFunctionData {
 enum class ServedCatalogOp { ADD, ADD_LAZY, REMOVE, PAUSE, RESUME, INFLIGHT, CANCEL_INFLIGHT };
 
 struct N6kServedCatalogBindData : public TableFunctionData {
-	int fd = -1;
+	hugeint_t session_id;
 	string catalog;
 	ServedCatalogOp op = ServedCatalogOp::ADD;
 	int64_t rank = n6k::NO_RANK;
+};
+
+struct N6kSendTextBindData : public TableFunctionData {
+	hugeint_t session_id;
+	string text;
+};
+
+struct N6kSessionStatsBindData : public TableFunctionData {
+	hugeint_t session_id;
+};
+
+struct N6kCloseBindData : public TableFunctionData {
+	hugeint_t session_id;
+	int code = 0;
+	string reason;
 };
 
 struct N6kUpstreamHelloBindData : public TableFunctionData {
@@ -108,11 +105,15 @@ struct N6kUpstreamHelloBindData : public TableFunctionData {
 enum class UpstreamOp { ADD, SET_RANK, REMOVE, STATUS };
 
 struct N6kUpstreamBindData : public TableFunctionData {
-	int fd = -1;
+	hugeint_t session_id;
 	int up_fd = -1;
 	vector<string> catalogs;
 	int64_t rank = 0;
 	UpstreamOp op = UpstreamOp::ADD;
+};
+
+struct N6kCreateSessionBindData : public TableFunctionData {
+	int fd = -1;
 };
 
 struct N6kPushInvalidateBindData : public TableFunctionData {
@@ -138,29 +139,11 @@ static int BindFdArgument(const TableFunctionBindInput &input, const char *fn_na
 	return static_cast<int>(fd);
 }
 
-static void BindHelloCapabilities(const TableFunctionBindInput &input, const char *fn_name, vector<string> &offered,
-                                  vector<string> &app_caps) {
-	auto caps = input.named_parameters.find("capabilities");
-	if (caps != input.named_parameters.end() && !caps->second.IsNull()) {
-		for (auto &cap : ListValue::GetChildren(caps->second)) {
-			if (!cap.IsNull()) {
-				offered.push_back(cap.GetValue<string>());
-			}
-		}
+static hugeint_t BindSessionIdArgument(const TableFunctionBindInput &input, const char *fn_name) {
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("%s requires a session id from %s", fn_name, CREATE_SESSION_FN_NAME);
 	}
-	auto app = input.named_parameters.find("app_capabilities");
-	if (app != input.named_parameters.end() && !app->second.IsNull()) {
-		for (auto &cap : ListValue::GetChildren(app->second)) {
-			if (cap.IsNull()) {
-				continue;
-			}
-			auto name = cap.GetValue<string>();
-			if (n6k::IntersectCaps(vector<string> {name}, n6k::APP_HELLO_CAPS).empty()) {
-				throw BinderException("%s: app_capabilities: unknown capability '%s'", fn_name, name);
-			}
-			app_caps.push_back(std::move(name));
-		}
-	}
+	return input.inputs[0].GetValue<hugeint_t>();
 }
 
 static unique_ptr<FunctionData> N6kServeBind(ClientContext &context, TableFunctionBindInput &input,
@@ -196,72 +179,21 @@ static unique_ptr<FunctionData> N6kServeBind(ClientContext &context, TableFuncti
 	return std::move(result);
 }
 
-// Same server, same result row; the fd arrives as an argument rather than through the environment.
+// Same server, same result row; the fd arrives through a session from n6k_serve_create_session.
 static unique_ptr<FunctionData> N6kServeFdBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
 	N6kServeReturnSchema(return_types, names);
 	n6k::ThrowIfServed(context, FD_FN_NAME);
 
-	auto fd = BindFdArgument(input, FD_FN_NAME);
-
 	auto result = make_uniq<N6kServeBindData>();
-	auto pending = input.named_parameters.find("pending");
+	result->session_id = BindSessionIdArgument(input, FD_FN_NAME);
 	result->catalogs = n6k::ResolveServedCatalogs(context, input.inputs, 1, FD_FN_NAME);
-	if (pending != input.named_parameters.end()) {
-		for (auto &entry : n6k::ResolvePendingCatalogs(pending->second, result->catalogs, FD_FN_NAME)) {
-			result->pending.push_back(n6k::PendingCatalogSpec {std::move(entry.first), std::move(entry.second)});
-		}
-	}
-	result->fd = fd;
-	result->socket_path = "fd:" + std::to_string(fd);
-
-	auto ping = input.named_parameters.find("ping_interval_ms");
-	if (ping != input.named_parameters.end() && !ping->second.IsNull()) {
-		auto ms = ping->second.GetValue<int64_t>();
-		if (ms < 0 || ms > std::numeric_limits<int>::max()) {
-			throw BinderException("%s: ping_interval_ms must be 0 (disabled) or positive", FD_FN_NAME);
-		}
-		result->has_ping_interval = true;
-		result->ping_interval_ms = static_cast<int>(ms);
-	}
-	auto beat = input.named_parameters.find("open_pending_interval_ms");
-	if (beat != input.named_parameters.end() && !beat->second.IsNull()) {
-		auto ms = beat->second.GetValue<int64_t>();
-		if (ms <= 0 || ms > std::numeric_limits<int>::max()) {
-			throw BinderException("%s: open_pending_interval_ms must be positive", FD_FN_NAME);
-		}
-		result->open_pending_interval_ms = ms;
-	}
-	BindHelloCapabilities(input, FD_FN_NAME, result->hello_capabilities, result->app_capabilities);
-	auto acked = input.named_parameters.find("hello_acked");
-	result->hello_acked =
-	    acked != input.named_parameters.end() && !acked->second.IsNull() && acked->second.GetValue<bool>();
-	auto resolve = input.named_parameters.find("resolve");
-	result->resolve =
-	    resolve != input.named_parameters.end() && !resolve->second.IsNull() && resolve->second.GetValue<bool>();
-	auto lazy = input.named_parameters.find("lazy");
-	if (lazy != input.named_parameters.end() && !lazy->second.IsNull()) {
-		for (auto &entry : MapValue::GetChildren(lazy->second)) {
-			auto &kv = StructValue::GetChildren(entry);
-			if (kv[0].IsNull()) {
-				throw BinderException("%s: lazy catalog names must not be NULL", FD_FN_NAME);
-			}
-			result->lazy.emplace_back(kv[0].GetValue<string>(),
-			                          kv[1].IsNull() ? n6k::NO_RANK : kv[1].GetValue<int64_t>());
-		}
-	}
-	if (!result->lazy.empty() && !result->resolve) {
-		throw BinderException("%s: lazy => MAP {...} needs resolve => true", FD_FN_NAME);
-	}
-	std::unordered_set<string> taken(result->catalogs.begin(), result->catalogs.end());
-	for (auto &spec : result->pending) {
-		taken.insert(spec.catalog);
-	}
-	for (auto &entry : result->lazy) {
-		if (!taken.insert(entry.first).second) {
-			throw BinderException("%s: lazy catalog \"%s\" is already served, pending or repeated", FD_FN_NAME,
-			                      entry.first);
-		}
+	result->socket_path = "session:" + UUID::ToString(result->session_id);
+	result->options = n6k::BindServeOptions(input, FD_FN_NAME);
+	auto request = input.named_parameters.find("request");
+	if (request != input.named_parameters.end() && !request->second.IsNull()) {
+		result->options.request = request->second.GetValue<string>();
+		result->options.has_request = true;
 	}
 	return std::move(result);
 }
@@ -282,7 +214,7 @@ static unique_ptr<FunctionData> N6kResolveOpenBind(ClientContext &context, Table
 	// A served client reaching this through OP_EXEC could settle another socket's pending open.
 	n6k::ThrowIfServed(context, fn_name);
 	auto result = make_uniq<N6kResolveOpenBindData>();
-	result->fd = BindFdArgument(input, fn_name);
+	result->session_id = BindSessionIdArgument(input, fn_name);
 	if (input.inputs.size() < 2 || input.inputs[1].IsNull()) {
 		throw BinderException("%s requires a catalog name", fn_name);
 	}
@@ -316,42 +248,97 @@ static void N6kResolveOpenScan(ClientContext &context, TableFunctionInput &data_
 		output.SetCardinality(0);
 		return;
 	}
-	n6k::ResolvePendingOpen(DatabaseInstance::GetDatabase(context), bind_data.fd, bind_data.catalog, bind_data.ok,
-	                        bind_data.message);
+	n6k::ResolvePendingOpen(DatabaseInstance::GetDatabase(context), bind_data.session_id, bind_data.catalog,
+	                        bind_data.ok, bind_data.message);
 	output.SetValue(0, 0, Value::BOOLEAN(true));
 	state.done = true;
 	output.SetCardinality(1);
 }
 
-static unique_ptr<FunctionData> N6kResolvedBind(ClientContext &context, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> N6kSendTextBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	names = {"resolved"};
+	names = {"sent"};
 	return_types = {LogicalType::BOOLEAN};
-	n6k::ThrowIfServed(context, RESOLVED_FN_NAME);
-	auto result = make_uniq<N6kResolveOpenBindData>();
-	result->fd = BindFdArgument(input, RESOLVED_FN_NAME);
+	n6k::ThrowIfServed(context, SEND_TEXT_FN_NAME);
+	auto result = make_uniq<N6kSendTextBindData>();
+	result->session_id = BindSessionIdArgument(input, SEND_TEXT_FN_NAME);
 	if (input.inputs.size() < 2 || input.inputs[1].IsNull()) {
-		throw BinderException("%s requires a catalog name", RESOLVED_FN_NAME);
+		throw BinderException("%s requires the text to send", SEND_TEXT_FN_NAME);
 	}
-	result->catalog = input.inputs[1].GetValue<string>();
-	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
-		result->message = input.inputs[2].GetValue<string>();
-		if (result->message.empty()) {
-			throw BinderException("%s: error must be NULL or a non-empty message", RESOLVED_FN_NAME);
-		}
-	}
+	result->text = input.inputs[1].GetValue<string>();
 	return std::move(result);
 }
 
-static void N6kResolvedScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<N6kResolveOpenBindData>();
+static void N6kSendTextScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<N6kSendTextBindData>();
 	auto &state = data_p.global_state->Cast<N6kServeState>();
 	if (state.done) {
 		output.SetCardinality(0);
 		return;
 	}
-	n6k::ResolveUnknownOpen(DatabaseInstance::GetDatabase(context), bind_data.fd, bind_data.catalog, bind_data.message);
+	n6k::SendServedText(DatabaseInstance::GetDatabase(context), bind_data.session_id, bind_data.text);
 	output.SetValue(0, 0, Value::BOOLEAN(true));
+	state.done = true;
+	output.SetCardinality(1);
+}
+
+static unique_ptr<FunctionData> N6kCloseBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"closed"};
+	return_types = {LogicalType::BOOLEAN};
+	n6k::ThrowIfServed(context, CLOSE_FN_NAME);
+	auto result = make_uniq<N6kCloseBindData>();
+	result->session_id = BindSessionIdArgument(input, CLOSE_FN_NAME);
+	if (input.inputs.size() < 2 || input.inputs[1].IsNull()) {
+		throw BinderException("%s requires a close code", CLOSE_FN_NAME);
+	}
+	result->code = input.inputs[1].GetValue<int32_t>();
+	if (result->code < 1000 || result->code > 4999) {
+		throw BinderException("%s: close code %d is out of range (1000-4999)", CLOSE_FN_NAME, result->code);
+	}
+	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+		result->reason = input.inputs[2].GetValue<string>();
+	}
+	return std::move(result);
+}
+
+static void N6kCloseScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<N6kCloseBindData>();
+	auto &state = data_p.global_state->Cast<N6kServeState>();
+	if (state.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	n6k::CloseServed(DatabaseInstance::GetDatabase(context), bind_data.session_id, bind_data.code, bind_data.reason);
+	output.SetValue(0, 0, Value::BOOLEAN(true));
+	state.done = true;
+	output.SetCardinality(1);
+}
+
+static unique_ptr<FunctionData> N6kSessionStatsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"frames_in",        "bytes_in",    "frames_out",      "bytes_out",
+	         "requests_handled", "duration_ms", "authenticate_ms", "peak_workers"};
+	return_types = vector<LogicalType>(names.size(), LogicalType::BIGINT);
+	n6k::ThrowIfServed(context, SESSION_STATS_FN_NAME);
+	auto result = make_uniq<N6kSessionStatsBindData>();
+	result->session_id = BindSessionIdArgument(input, SESSION_STATS_FN_NAME);
+	return std::move(result);
+}
+
+static void N6kSessionStatsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<N6kSessionStatsBindData>();
+	auto &state = data_p.global_state->Cast<N6kServeState>();
+	if (state.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	auto stats = n6k::ServedSessionStats(DatabaseInstance::GetDatabase(context), bind_data.session_id);
+	const vector<int64_t> values {stats.frames_in,        stats.bytes_in,    stats.frames_out,      stats.bytes_out,
+	                              stats.requests_handled, stats.duration_ms, stats.authenticate_ms, stats.peak_workers};
+	for (idx_t i = 0; i < output.ColumnCount(); i++) {
+		output.SetValue(i, 0, Value::BIGINT(values[i]));
+	}
 	state.done = true;
 	output.SetCardinality(1);
 }
@@ -442,7 +429,7 @@ static unique_ptr<FunctionData> N6kUpstreamBind(ClientContext &context, TableFun
 	// A served client reaching this through OP_EXEC could reroute another socket's sessions.
 	n6k::ThrowIfServed(context, fn_name);
 	auto result = make_uniq<N6kUpstreamBindData>();
-	result->fd = BindFdArgument(input, fn_name);
+	result->session_id = BindSessionIdArgument(input, fn_name);
 	if (input.inputs.size() < 2 || input.inputs[1].IsNull()) {
 		throw BinderException("%s requires the upstream's file descriptor", fn_name);
 	}
@@ -507,20 +494,21 @@ static void N6kUpstreamScan(ClientContext &context, TableFunctionInput &data_p, 
 	case UpstreamOp::ADD:
 		output.SetValue(0, 0,
 		                Value::LIST(LogicalType::VARCHAR,
-		                            VarcharValues(n6k::AddServedUpstream(db, bind_data.fd, bind_data.up_fd,
+		                            VarcharValues(n6k::AddServedUpstream(db, bind_data.session_id, bind_data.up_fd,
 		                                                                 bind_data.catalogs, bind_data.rank))));
 		break;
 	case UpstreamOp::SET_RANK:
 		output.SetValue(0, 0,
-		                Value::LIST(LogicalType::VARCHAR, VarcharValues(n6k::SetServedUpstreamRank(
-		                                                      db, bind_data.fd, bind_data.up_fd, bind_data.rank))));
+		                Value::LIST(LogicalType::VARCHAR,
+		                            VarcharValues(n6k::SetServedUpstreamRank(db, bind_data.session_id, bind_data.up_fd,
+		                                                                     bind_data.rank))));
 		break;
 	case UpstreamOp::REMOVE:
-		n6k::RemoveServedUpstream(db, bind_data.fd, bind_data.up_fd);
+		n6k::RemoveServedUpstream(db, bind_data.session_id, bind_data.up_fd);
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 		break;
 	case UpstreamOp::STATUS: {
-		auto status = n6k::ServedUpstreamStatus(db, bind_data.fd, bind_data.up_fd);
+		auto status = n6k::ServedUpstreamStatus(db, bind_data.session_id, bind_data.up_fd);
 		output.SetValue(0, 0, Value::BOOLEAN(status.open));
 		output.SetValue(1, 0, status.open ? Value() : Value(status.reason));
 		break;
@@ -562,7 +550,7 @@ static unique_ptr<FunctionData> N6kServedCatalogBind(ClientContext &context, Tab
 	// A served client reaching this through OP_EXEC could change another socket's catalogs.
 	n6k::ThrowIfServed(context, fn_name);
 	auto result = make_uniq<N6kServedCatalogBindData>();
-	result->fd = BindFdArgument(input, fn_name);
+	result->session_id = BindSessionIdArgument(input, fn_name);
 	if (input.inputs.size() < 2 || input.inputs[1].IsNull()) {
 		throw BinderException("%s requires a catalog name", fn_name);
 	}
@@ -625,122 +613,58 @@ static void N6kServedCatalogScan(ClientContext &context, TableFunctionInput &dat
 	auto &db = DatabaseInstance::GetDatabase(context);
 	switch (bind_data.op) {
 	case ServedCatalogOp::ADD:
-		n6k::AddServedCatalog(db, bind_data.fd, bind_data.catalog);
+		n6k::AddServedCatalog(db, bind_data.session_id, bind_data.catalog);
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 		break;
 	case ServedCatalogOp::ADD_LAZY:
-		n6k::AddServedLazyCatalog(db, bind_data.fd, bind_data.catalog, bind_data.rank);
+		n6k::AddServedLazyCatalog(db, bind_data.session_id, bind_data.catalog, bind_data.rank);
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 		break;
 	case ServedCatalogOp::REMOVE:
-		n6k::RemoveServedCatalog(db, bind_data.fd, bind_data.catalog);
+		n6k::RemoveServedCatalog(db, bind_data.session_id, bind_data.catalog);
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 		break;
 	case ServedCatalogOp::PAUSE:
-		n6k::PauseServedCatalog(db, bind_data.fd, bind_data.catalog);
+		n6k::PauseServedCatalog(db, bind_data.session_id, bind_data.catalog);
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 		break;
 	case ServedCatalogOp::RESUME:
-		n6k::ResumeServedCatalog(db, bind_data.fd, bind_data.catalog);
+		n6k::ResumeServedCatalog(db, bind_data.session_id, bind_data.catalog);
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 		break;
 	case ServedCatalogOp::INFLIGHT: {
-		const auto inflight = n6k::ServedCatalogInflight(db, bind_data.fd, bind_data.catalog);
+		const auto inflight = n6k::ServedCatalogInflight(db, bind_data.session_id, bind_data.catalog);
 		output.SetValue(0, 0, Value::BOOLEAN(inflight.holding));
 		output.SetValue(1, 0, Value::BIGINT(inflight.running));
 		break;
 	}
 	case ServedCatalogOp::CANCEL_INFLIGHT:
-		output.SetValue(0, 0, Value::BIGINT(n6k::CancelServedCatalogInflight(db, bind_data.fd, bind_data.catalog)));
+		output.SetValue(0, 0,
+		                Value::BIGINT(n6k::CancelServedCatalogInflight(db, bind_data.session_id, bind_data.catalog)));
 		break;
 	}
 	state.done = true;
 	output.SetCardinality(1);
 }
 
-static unique_ptr<FunctionData> N6kHandshakeBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	names = {"token", "capabilities"};
-	return_types = {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)};
-	n6k::ThrowIfServed(context, HANDSHAKE_FN_NAME);
-	auto result = make_uniq<N6kHandshakeBindData>();
-	result->fd = BindFdArgument(input, HANDSHAKE_FN_NAME);
+static unique_ptr<FunctionData> N6kCreateSessionBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"session_id"};
+	return_types = {LogicalType::UUID};
+	n6k::ThrowIfServed(context, CREATE_SESSION_FN_NAME);
+	auto result = make_uniq<N6kCreateSessionBindData>();
+	result->fd = BindFdArgument(input, CREATE_SESSION_FN_NAME);
 	return std::move(result);
 }
 
-// The handshake replies on the fd path are returned, not written: the host sends them itself, so it
-// knows when HELLO_ACK has reached the client.
-static void HelloFrameReturnSchema(vector<LogicalType> &return_types, vector<string> &names) {
-	names = {"frame"};
-	return_types = {LogicalType::BLOB};
-}
-
-static unique_ptr<FunctionData> N6kRejectBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
-	HelloFrameReturnSchema(return_types, names);
-	n6k::ThrowIfServed(context, REJECT_FN_NAME);
-	if (input.inputs.empty() || input.inputs[0].IsNull()) {
-		throw BinderException("%s requires a reason: SELECT * FROM %s('unauthorized')", REJECT_FN_NAME, REJECT_FN_NAME);
-	}
-	auto result = make_uniq<N6kHelloFrameBindData>();
-	result->frame = n6k::PackHelloErr("InvalidInputException", input.inputs[0].GetValue<string>());
-	return std::move(result);
-}
-
-static unique_ptr<FunctionData> N6kHelloPendingBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	HelloFrameReturnSchema(return_types, names);
-	n6k::ThrowIfServed(context, HELLO_PENDING_FN_NAME);
-	string message;
-	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
-		message = input.inputs[0].GetValue<string>();
-	}
-	auto result = make_uniq<N6kHelloFrameBindData>();
-	result->frame = n6k::PackHelloPending(message);
-	return std::move(result);
-}
-
-static unique_ptr<FunctionData> N6kHelloAckBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
-	HelloFrameReturnSchema(return_types, names);
-	n6k::ThrowIfServed(context, HELLO_ACK_FN_NAME);
-	vector<string> offered;
-	vector<string> app_caps;
-	BindHelloCapabilities(input, HELLO_ACK_FN_NAME, offered, app_caps);
-	auto result = make_uniq<N6kHelloFrameBindData>();
-	result->frame = n6k::PackHelloAck(n6k::GrantedHelloCaps(offered, app_caps));
-	return std::move(result);
-}
-
-static void N6kHelloFrameScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<N6kHelloFrameBindData>();
+static void N6kCreateSessionScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<N6kCreateSessionBindData>();
 	auto &state = data_p.global_state->Cast<N6kServeState>();
 	if (state.done) {
 		output.SetCardinality(0);
 		return;
 	}
-	output.SetValue(0, 0,
-	                Value::BLOB(reinterpret_cast<const_data_ptr_t>(bind_data.frame.data()), bind_data.frame.size()));
-	state.done = true;
-	output.SetCardinality(1);
-}
-
-static void N6kHandshakeScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<N6kHandshakeBindData>();
-	auto &state = data_p.global_state->Cast<N6kServeState>();
-	if (state.done) {
-		output.SetCardinality(0);
-		return;
-	}
-	n6k::UdsConnection conn;
-	conn.AdoptBlockingDupOfFd(bind_data.fd);
-	auto hello = n6k::ReadHello(conn);
-	vector<Value> caps;
-	for (auto &cap : hello.capabilities) {
-		caps.emplace_back(cap);
-	}
-	output.SetValue(0, 0, Value(hello.token));
-	output.SetValue(1, 0, Value::LIST(LogicalType::VARCHAR, std::move(caps)));
+	output.SetValue(0, 0, Value::UUID(n6k::CreateServeSession(DatabaseInstance::GetDatabase(context), bind_data.fd)));
 	state.done = true;
 	output.SetCardinality(1);
 }
@@ -772,7 +696,7 @@ static int64_t ServeListening(ClientContext &context, const N6kServeBindData &bi
 		const auto *catalogs = &bind_data.catalogs;
 		clients.Spawn(accepted, [&db, &context, &handled, catalogs](n6k::UdsConnection &conn) {
 			try {
-				n6k::ServeReactor reactor(conn, db, context, *catalogs, false);
+				n6k::ServeReactor reactor(conn, db, context, *catalogs);
 				handled.fetch_add(reactor.Run());
 			} catch (const std::exception &e) {
 				DUCKDB_LOG_WARNING(context, "n6k_serve_socket: connection reactor failed: %s", e.what());
@@ -803,21 +727,10 @@ static void N6kServeScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	// n6k_serve_fd: blocks the CALLING thread for the connection lifetime — the CALL is the server. Not a
 	// `SET threads` slot: a synchronous CALL runs its own root task inline, so the cost is one host thread.
 	auto &db = DatabaseInstance::GetDatabase(context);
+	n6k::ServeSessionClaim session(db, bind_data.session_id);
 	n6k::UdsConnection conn;
-	conn.AdoptBlockingDupOfFd(bind_data.fd);
-	n6k::ServeReactor reactor(conn, db, context, bind_data.catalogs, bind_data.fd >= 0, bind_data.pending,
-	                          bind_data.fd);
-	if (bind_data.has_ping_interval) {
-		reactor.SetPingIntervalMs(bind_data.ping_interval_ms);
-	}
-	if (bind_data.open_pending_interval_ms > 0) {
-		reactor.SetOpenPendingIntervalMs(static_cast<int>(bind_data.open_pending_interval_ms));
-	}
-	reactor.SetHelloCapabilities(bind_data.hello_capabilities);
-	reactor.SetAppCapabilities(bind_data.app_capabilities);
-	reactor.SetHelloAcked(bind_data.hello_acked);
-	reactor.SetResolveUnknown(bind_data.resolve);
-	reactor.SetLazyCatalogs(bind_data.lazy);
+	conn.AdoptBlockingDupOfFd(session.Fd());
+	n6k::ServeReactor reactor(conn, db, context, bind_data.catalogs, bind_data.options, bind_data.session_id);
 	int64_t handled = reactor.Run();
 
 	output.SetValue(0, 0, Value::BOOLEAN(true));
@@ -916,83 +829,71 @@ void RegisterN6kServePushInvalidateFunction(ExtensionLoader &loader) {
 }
 
 void RegisterN6kServeFdFunction(ExtensionLoader &loader) {
-	TableFunction func(FD_FN_NAME, {LogicalType::BIGINT}, N6kServeScan, N6kServeFdBind, N6kServeInitGlobal);
+	TableFunction func(FD_FN_NAME, {LogicalType::UUID}, N6kServeScan, N6kServeFdBind, N6kServeInitGlobal);
 	func.varargs = LogicalType::VARCHAR;
-	func.named_parameters["ping_interval_ms"] = LogicalType::BIGINT;
-	func.named_parameters["pending"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-	func.named_parameters["open_pending_interval_ms"] = LogicalType::BIGINT;
-	func.named_parameters["capabilities"] = LogicalType::LIST(LogicalType::VARCHAR);
-	func.named_parameters["app_capabilities"] = LogicalType::LIST(LogicalType::VARCHAR);
-	func.named_parameters["hello_acked"] = LogicalType::BOOLEAN;
-	func.named_parameters["resolve"] = LogicalType::BOOLEAN;
-	func.named_parameters["lazy"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT);
+	n6k::AddServeOptionParameters(func);
+	func.named_parameters["request"] = LogicalType::VARCHAR;
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));
 
-	TableFunction ready(OPEN_READY_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kResolveOpenScan,
+	TableFunction create_session(CREATE_SESSION_FN_NAME, {LogicalType::BIGINT}, N6kCreateSessionScan,
+	                             N6kCreateSessionBind, N6kServeInitGlobal);
+	loader.RegisterFunction(create_session);
+	TableFunction ready(OPEN_READY_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kResolveOpenScan,
 	                    N6kOpenReadyBind, N6kServeInitGlobal);
 	loader.RegisterFunction(ready);
-	TableFunction failed(OPEN_FAILED_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	TableFunction failed(OPEN_FAILED_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     N6kResolveOpenScan, N6kOpenFailedBind, N6kServeInitGlobal);
 	loader.RegisterFunction(failed);
 	TableFunction upstream_hello(UPSTREAM_HELLO_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR},
 	                             N6kUpstreamHelloScan, N6kUpstreamHelloBind, N6kServeInitGlobal);
 	loader.RegisterFunction(upstream_hello);
 	TableFunction add_upstream(ADD_UPSTREAM_FN_NAME,
-	                           {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::LIST(LogicalType::VARCHAR)},
+	                           {LogicalType::UUID, LogicalType::BIGINT, LogicalType::LIST(LogicalType::VARCHAR)},
 	                           N6kUpstreamScan, N6kAddUpstreamBind, N6kServeInitGlobal);
 	add_upstream.named_parameters["rank"] = LogicalType::BIGINT;
 	loader.RegisterFunction(add_upstream);
 	TableFunction set_upstream_rank(SET_UPSTREAM_RANK_FN_NAME,
-	                                {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT}, N6kUpstreamScan,
+	                                {LogicalType::UUID, LogicalType::BIGINT, LogicalType::BIGINT}, N6kUpstreamScan,
 	                                N6kSetUpstreamRankBind, N6kServeInitGlobal);
 	loader.RegisterFunction(set_upstream_rank);
-	TableFunction remove_upstream(REMOVE_UPSTREAM_FN_NAME, {LogicalType::BIGINT, LogicalType::BIGINT}, N6kUpstreamScan,
+	TableFunction remove_upstream(REMOVE_UPSTREAM_FN_NAME, {LogicalType::UUID, LogicalType::BIGINT}, N6kUpstreamScan,
 	                              N6kRemoveUpstreamBind, N6kServeInitGlobal);
 	loader.RegisterFunction(remove_upstream);
-	TableFunction upstream_status(UPSTREAM_STATUS_FN_NAME, {LogicalType::BIGINT, LogicalType::BIGINT}, N6kUpstreamScan,
+	TableFunction upstream_status(UPSTREAM_STATUS_FN_NAME, {LogicalType::UUID, LogicalType::BIGINT}, N6kUpstreamScan,
 	                              N6kUpstreamStatusBind, N6kServeInitGlobal);
 	loader.RegisterFunction(upstream_status);
-	TableFunction resolved(RESOLVED_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                       N6kResolvedScan, N6kResolvedBind, N6kServeInitGlobal);
-	loader.RegisterFunction(resolved);
-	TableFunction add(ADD_CATALOG_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kServedCatalogScan,
+	TableFunction send_text(SEND_TEXT_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kSendTextScan,
+	                        N6kSendTextBind, N6kServeInitGlobal);
+	loader.RegisterFunction(send_text);
+	TableFunction close(CLOSE_FN_NAME, {LogicalType::UUID, LogicalType::INTEGER, LogicalType::VARCHAR}, N6kCloseScan,
+	                    N6kCloseBind, N6kServeInitGlobal);
+	loader.RegisterFunction(close);
+	TableFunction session_stats(SESSION_STATS_FN_NAME, {LogicalType::UUID}, N6kSessionStatsScan, N6kSessionStatsBind,
+	                            N6kServeInitGlobal);
+	loader.RegisterFunction(session_stats);
+	TableFunction add(ADD_CATALOG_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan,
 	                  N6kAddCatalogBind, N6kServeInitGlobal);
 	loader.RegisterFunction(add);
-	TableFunction add_lazy(ADD_LAZY_CATALOG_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kServedCatalogScan,
+	TableFunction add_lazy(ADD_LAZY_CATALOG_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan,
 	                       N6kAddLazyCatalogBind, N6kServeInitGlobal);
 	add_lazy.named_parameters["rank"] = LogicalType::BIGINT;
 	loader.RegisterFunction(add_lazy);
-	TableFunction remove(REMOVE_CATALOG_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kServedCatalogScan,
+	TableFunction remove(REMOVE_CATALOG_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan,
 	                     N6kRemoveCatalogBind, N6kServeInitGlobal);
 	loader.RegisterFunction(remove);
-	TableFunction pause(PAUSE_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kServedCatalogScan, N6kPauseBind,
+	TableFunction pause(PAUSE_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan, N6kPauseBind,
 	                    N6kServeInitGlobal);
 	loader.RegisterFunction(pause);
-	TableFunction resume(RESUME_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kServedCatalogScan,
-	                     N6kResumeBind, N6kServeInitGlobal);
+	TableFunction resume(RESUME_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan, N6kResumeBind,
+	                     N6kServeInitGlobal);
 	loader.RegisterFunction(resume);
-	TableFunction inflight(INFLIGHT_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kServedCatalogScan,
+	TableFunction inflight(INFLIGHT_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan,
 	                       N6kInflightBind, N6kServeInitGlobal);
 	loader.RegisterFunction(inflight);
-	TableFunction cancel(CANCEL_INFLIGHT_FN_NAME, {LogicalType::BIGINT, LogicalType::VARCHAR}, N6kServedCatalogScan,
+	TableFunction cancel(CANCEL_INFLIGHT_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan,
 	                     N6kCancelInflightBind, N6kServeInitGlobal);
 	loader.RegisterFunction(cancel);
-}
-
-void RegisterN6kHandshakeFunctions(ExtensionLoader &loader) {
-	TableFunction handshake(HANDSHAKE_FN_NAME, {LogicalType::BIGINT}, N6kHandshakeScan, N6kHandshakeBind,
-	                        N6kServeInitGlobal);
-	loader.RegisterFunction(handshake);
-	TableFunction reject(REJECT_FN_NAME, {LogicalType::VARCHAR}, N6kHelloFrameScan, N6kRejectBind, N6kServeInitGlobal);
-	loader.RegisterFunction(reject);
-	TableFunction pending(HELLO_PENDING_FN_NAME, {LogicalType::VARCHAR}, N6kHelloFrameScan, N6kHelloPendingBind,
-	                      N6kServeInitGlobal);
-	loader.RegisterFunction(pending);
-	TableFunction ack(HELLO_ACK_FN_NAME, {}, N6kHelloFrameScan, N6kHelloAckBind, N6kServeInitGlobal);
-	ack.named_parameters["capabilities"] = LogicalType::LIST(LogicalType::VARCHAR);
-	ack.named_parameters["app_capabilities"] = LogicalType::LIST(LogicalType::VARCHAR);
-	loader.RegisterFunction(ack);
 }
 
 } // namespace duckdb

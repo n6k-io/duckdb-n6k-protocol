@@ -60,7 +60,7 @@ constexpr uint8_t OP_DROP_VIEW = 22;
 enum class StreamFrameType : uint8_t {
 	JSONRPC = 0x01,
 	N6K = 0x02,
-	HOST = 0x03,
+	CLOSE = 0x04,
 };
 
 constexpr int DEFAULT_BATCH_CREDITS = 8;

@@ -92,6 +92,11 @@ CALL n6k_serve_http('127.0.0.1', 0);
 out of range
 
 statement error
+CALL n6k_serve_http('127.0.0.1', 7823, max_connections => 0);
+----
+max_connections must be positive
+
+statement error
 CALL n6k_serve_http('127.0.0.1', 70000);
 ----
 out of range
@@ -113,41 +118,55 @@ CALL n6k_serve_http('127.0.0.1', 7823, 'memory', 'memory');
 ----
 listed more than once
 
-# n6k_serve_fd — bind-time errors only. Note there is deliberately no valid-fd +
-# valid-catalog case: that clears every bind check and would block the suite on a
-# peer that never arrives. The serving path is covered by the integration tests,
-# which own the socketpair.
+# n6k_serve_fd — bind-time errors, and a session id no n6k_serve_create_session returned. Note there is
+# deliberately no live-session + valid-catalog case: that would block the suite on a peer that never
+# arrives. The serving path is covered by the integration tests, which own the socketpair.
 
-# The fd is validated before the catalog list, so these need no attached catalog.
 statement error
-CALL n6k_serve_fd(NULL);
+SELECT * FROM n6k_serve_create_session(NULL);
 ----
 requires a file descriptor
 
 statement error
-CALL n6k_serve_fd(-1);
+SELECT * FROM n6k_serve_create_session(-1);
 ----
 is not a valid file descriptor
+
+# A NULL session id fails at bind before the catalog list; an unknown id fails only when the CALL runs.
+statement error
+CALL n6k_serve_fd(NULL);
+----
+requires a session id
+
+statement error
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID);
+----
+no n6k serve session 00000000-0000-4000-8000-000000000007
+
+statement error
+SELECT * FROM n6k_serve_close('00000000-0000-4000-8000-000000000007'::UUID, 1000, 'x');
+----
+no n6k serve session 00000000-0000-4000-8000-000000000007
 
 # Catalog validation is the shared helper, so it rejects exactly what the other
 # two forms reject.
 statement error
-CALL n6k_serve_fd(7, 'nope');
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, 'nope');
 ----
 is not attached
 
 statement error
-CALL n6k_serve_fd(7, NULL);
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, NULL);
 ----
 requires a catalog argument
 
 statement error
-CALL n6k_serve_fd(7, 'memory', 'memory');
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, 'memory', 'memory');
 ----
 listed more than once
 
 statement error
-CALL n6k_serve_fd(7, 'memory', ping_interval_ms => -1);
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, 'memory', ping_interval_ms => -1);
 ----
 ping_interval_ms must be 0 (disabled) or positive
 

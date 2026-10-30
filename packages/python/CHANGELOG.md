@@ -1,9 +1,15 @@
 # 0.11.4
 
+- `register(..., workers=N)` and `serve_and_close_connection(..., workers=N)`: requests the extension runs at once per connection, 1..`MAX_CONCURRENT_REQS`; None keeps the extension's default.
+
 Breaking, for downstream:
 
 - Needs the `duckdb-virtual-catalog` build with the `vcat` names: extensions `vcatbridge` / `vcatprovider` (`TYPE` too), SQL functions `vcatbridge_*` / `vcatprovider_*`, `vcatbridge_lockdown`.
 - `load_virtual_catalog_bridge` / `load_virtual_catalog_provider` → `load_vcatbridge` / `load_vcatprovider`; `VIRTUAL_CATALOG_BRIDGE` / `VIRTUAL_CATALOG_PROVIDER` → `VCATBRIDGE` / `VCATPROVIDER`.
+- `n6k_protocol.protocol.STREAM_FRAME_HOST` (0x03) → `STREAM_FRAME_CLOSE` (0x04).
+- `n6k_server.pump.HELLO_PENDING_FIRST_S` removed; the delay is the extension's `hello_pending_first_ms`.
+- Needs the extension built from the same commit: `n6k_handshake` / `n6k_hello_ack` are gone; `n6k_serve_fd` calls `authenticate` back.
+- `n6k_server.pump.build_serve_sql` takes the session id (`uuid.UUID`) from `n6k_serve_create_session` in place of the fd.
 
 # 0.11.3
 

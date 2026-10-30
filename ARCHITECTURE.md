@@ -10,7 +10,7 @@ The repo builds three DuckDB extensions:
 
 The in-process bridge and provider catalogs (`vcatbridge`,
 `vcatprovider`) come from the sibling `duckdb-virtual-catalog` repo.
-The only contract between the two repos is SQL functions and Arrow schema metadata; see
+The contract between the two repos is those extension names, their SQL functions, and Arrow schema metadata; see
 `VirtualCatalogPermissionsFunction` in `src/common/n6k_permissions.cpp`, `HostStreamOrNull`
 in `src/n6k_server/request_handlers.cpp`, and `PK_METADATA_KEY` in `provider.py`. The Python package (`bridge.py`, `provider.py`,
 `rpc_stream.py`) drives their SQL API; local builds resolve through
@@ -108,17 +108,17 @@ importable packages, split by dependency weight:
 ### Shape
 
 Python does not implement the protocol. The server is the `n6k_server` DuckDB
-extension (C++); Python accepts the WebSocket, reads the client's `FT_HELLO`
-token via `n6k_handshake(<fd>)`, decides which catalogs that identity may see,
-sends the handshake reply the extension builds (`n6k_hello_pending`, `n6k_reject`,
-`n6k_hello_ack`), hands the socket to `CALL n6k_serve_fd(..., hello_acked => true)`,
-and shuttles binary frames; text frames go to the app (see `server_fastapi/register.py`).
+extension (C++), which also runs the handshake. Python accepts the WebSocket, hands a
+socketpair end to `CALL n6k_serve_fd(...)` with its hooks as UDF callbacks
+([host callbacks](docs/n6k-server.md#host-callbacks)), and shuttles frames
+(see `server_fastapi/register.py`). A host that can hand over the socket itself uses
+`n6k_serve_ws` instead and relays nothing (`docs/n6k-server.md`).
 
 - **Protocol layer** (`n6k_protocol/`): the frame codec and the constants. No
   FastAPI `app`, no auth, no duckdb imports. A Python client or a wire test uses
   it to speak the protocol directly; the server does not.
 - **Pump** (`n6k_server/pump.py`): `socketpair()`, one end's integer fd passed to
-  `n6k_serve_fd` in SQL, the other pumped against the WebSocket. In-process
+  `n6k_serve_create_session` and the returned session id to `n6k_serve_fd` in SQL, the other pumped against the WebSocket. In-process
   rather than a spawned `duckdb`, because the reactor's workers must open
   connections on *this* `DatabaseInstance` — that is what lets a table backed by
   Python callbacks (`provider.py`) be served at all.
@@ -136,11 +136,12 @@ and shuttles binary frames; text frames go to the app (see `server_fastapi/regis
   *empty* DuckDB connection with the extensions loaded (sync, async, or an async
   generator for teardown), because the C++ reactor serves *catalogs*, not Python
   objects implementing ops.
-- **Identity before session.** `n6k_handshake` reads the `FT_HELLO` token and
-  `authenticate` decides what to serve (contract: the `register.py` docstring).
+- **Identity before session.** The extension authenticates the `FT_HELLO` token before it
+  serves anything ([host callbacks](docs/n6k-server.md#host-callbacks); Python contract: the
+  `register.py` docstring).
   The credential always rides the frame — never a WS upgrade header or query
   param — and the extension, not Python, parses it.
-- **Rejection.** `authenticate` raising sends `n6k_reject`'s FT_HELLO_ERR and
+- **Rejection.** `authenticate` raising sends FT_HELLO_ERR and
   serves nothing; close codes: `register.py` and `pump.py`.
 - **No re-entry.** n6k functions refuse to bind on a reactor's own connections (`n6k::ThrowIfServed`).
 

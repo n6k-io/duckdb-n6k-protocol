@@ -31,7 +31,7 @@ public:
 		std::lock_guard<std::mutex> lk(mu_);
 		all_.reserve(all_.size() + 1);
 		auto *raw = client.get();
-		client->worker = std::thread([raw, run]() {
+		client->worker = std::thread([raw, run = std::move(run)]() {
 			run(*raw->transport);
 			raw->finished.store(true);
 		});
