@@ -173,8 +173,9 @@ static unique_ptr<Catalog> N6kStorageAttach(optional_ptr<StorageExtensionInfo> s
 		token = ResolveAttachToken(context, base_url, token);
 	}
 
-	auto session = CatalogSession::Create(base_url, token, name, server_catalog, ws_id, ws_fd,
-	                                      [&context] { return context.IsInterrupted(); });
+	auto session = CatalogSession::Create(
+	    base_url, token, name, server_catalog, ws_id, ws_fd, [&context] { return context.IsInterrupted(); },
+	    db.GetDatabase().GetLogManager().GlobalLoggerReference());
 
 	auto catalog = make_uniq<N6kCatalog>(db, base_url, session);
 

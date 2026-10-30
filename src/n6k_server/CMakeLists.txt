@@ -40,7 +40,8 @@ n6k_common_sources(
   n6k_catalog_list
   n6k_exception_types
   n6k_served
-  n6k_fd_hello)
+  n6k_fd_hello
+  n6k_ws_log)
 n6k_nanoarrow_sources(EXTENSION_SOURCES)
 list(APPEND EXTENSION_SOURCES ${CROSSING_SUBSTRAIT_SOURCES}
      ${CROSSING_EXECUTE_SOURCES})

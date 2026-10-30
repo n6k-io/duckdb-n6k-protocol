@@ -2,6 +2,7 @@
 #include "insert_scan.hpp"
 #include "n6k_exception_types.hpp"
 #include "n6k_serve_function.hpp"
+#include "n6k_ws_log.hpp"
 #ifdef N6K_SERVER_WITH_WS
 #include "n6k_serve_http_function.hpp"
 #endif
@@ -23,6 +24,7 @@ void N6kServerLoadInternal(ExtensionLoader &loader) {
 	// The reactor maps its errors through this table (serve_reactor.cpp); registered here so a
 	// server-only process can read it too.
 	n6k::RegisterExceptionTypesFunction(loader);
+	n6k::RegisterWsLogType(loader.GetDatabaseInstance());
 }
 
 void N6kServerExtension::Load(ExtensionLoader &loader) {

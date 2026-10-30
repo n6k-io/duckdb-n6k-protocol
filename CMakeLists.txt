@@ -35,7 +35,7 @@ if(NOT WASM_LOADABLE_EXTENSIONS)
 endif()
 
 n6k_common_sources(EXTENSION_SOURCES n6k_permissions n6k_describe n6k_catalog_list
-                   n6k_exception_types n6k_arrow_frame_decoder n6k_served n6k_fd_hello)
+                   n6k_exception_types n6k_arrow_frame_decoder n6k_served n6k_fd_hello n6k_ws_log)
 n6k_nanoarrow_sources(EXTENSION_SOURCES)
 list(APPEND EXTENSION_SOURCES ${CROSSING_SOURCES} ${CROSSING_SUBSTRAIT_SOURCES})
 

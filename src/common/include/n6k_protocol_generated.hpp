@@ -33,6 +33,50 @@ enum class FrameType : uint8_t {
 	HELLO_PENDING = 19,
 };
 
+// nullptr for a value outside FrameType.
+inline const char *FrameTypeName(int type) {
+	switch (type) {
+	case 1:
+		return "REQ";
+	case 2:
+		return "RESP_SCHEMA";
+	case 3:
+		return "RESP_CHUNK";
+	case 4:
+		return "RESP_END";
+	case 5:
+		return "ERR";
+	case 6:
+		return "CANCEL";
+	case 7:
+		return "CREDIT";
+	case 8:
+		return "PUSH";
+	case 9:
+		return "PING";
+	case 10:
+		return "PONG";
+	case 11:
+		return "HELLO";
+	case 12:
+		return "HELLO_ACK";
+	case 13:
+		return "HELLO_ERR";
+	case 15:
+		return "OPEN";
+	case 16:
+		return "OPEN_ACK";
+	case 17:
+		return "OPEN_ERR";
+	case 18:
+		return "OPEN_PENDING";
+	case 19:
+		return "HELLO_PENDING";
+	default:
+		return nullptr;
+	}
+}
+
 constexpr uint8_t FLAG_END_OF_STREAM = 0x01;
 constexpr uint8_t FLAG_IS_ARROW_IPC = 0x04;
 

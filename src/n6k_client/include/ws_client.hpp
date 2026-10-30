@@ -3,6 +3,8 @@
 #include "n6k_protocol_generated.hpp"
 #include "ws_reactor.hpp"
 
+#include "duckdb/common/shared_ptr.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +18,9 @@
 #include <vector>
 
 namespace duckdb {
+
+class Logger;
+
 namespace n6k {
 
 struct Frame {
@@ -56,6 +61,8 @@ struct WsClientOptions {
 	int ws_fd = -1;
 	// !send_hello: the HELLO_ACK capabilities the socket owner negotiated, asked on every (re)connect.
 	std::function<std::vector<std::string>()> host_hello_capabilities;
+	// Receives a WsLogType row per frame sent and received; null logs nothing.
+	shared_ptr<Logger> logger;
 };
 
 class WsClient;

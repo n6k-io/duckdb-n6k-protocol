@@ -1,8 +1,10 @@
 #include "ws_client.hpp"
 #include "ws_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
+#include "n6k_ws_log.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/logging/logger.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -267,6 +269,9 @@ std::shared_ptr<Reactor> WsClient::CurrentReactor() const {
 }
 
 void WsClient::SendFrame(const std::string &frame_bytes) {
+	if (opts_.logger) {
+		DUCKDB_LOG(opts_.logger, WsLogType, "send", frame_bytes);
+	}
 	if (auto r = CurrentReactor()) {
 		r->Send(frame_bytes);
 	}
@@ -299,6 +304,9 @@ void WsClient::MarkDisconnectedIfChannelReset() {
 }
 
 void WsClient::OnMessage(const std::string &bytes, bool binary) {
+	if (opts_.logger) {
+		DUCKDB_LOG(opts_.logger, WsLogType, "recv", bytes);
+	}
 	if (!binary) {
 		RecordHandshakeError("unexpected text frame from server");
 		return;

@@ -17,6 +17,7 @@
 #include "n6k_secret.hpp"
 #include "n6k_login_function.hpp"
 #include "n6k_source.hpp"
+#include "n6k_ws_log.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
@@ -42,6 +43,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	RegisterN6kTablePermissions(loader);
 
 	auto &db = loader.GetDatabaseInstance();
+	n6k::RegisterWsLogType(db);
 	Crossing<N6kSource>::RegisterPass(db);
 	StorageExtension::Register(DBConfig::GetConfig(db), "n6k", CreateN6kStorageExtension());
 }
