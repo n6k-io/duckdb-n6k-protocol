@@ -1,61 +1,81 @@
 # name: test/sql/n6k_handshake.test
-# description: bind errors and frame shape for n6k_handshake / n6k_reject / n6k_hello_pending / n6k_hello_ack; binding n6k_serve_fd has no side effect
+# description: bind errors for serve functions and options; binding n6k_serve_fd has no side effect
 # group: [sql]
 
 require n6k_server
 
 statement error
-SELECT * FROM n6k_handshake(NULL);
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, authenticate => '');
 ----
-requires a file descriptor
+authenticate must name a scalar function
 
 statement error
-SELECT * FROM n6k_handshake(-1);
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, open_pending_interval_ms => 0);
 ----
-is not a valid file descriptor
+open_pending_interval_ms must be positive
 
 statement error
-SELECT * FROM n6k_reject(NULL);
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, hello_pending_first_ms => 0);
 ----
-requires a reason
-
-query I
-SELECT octet_length(frame) > 0 FROM n6k_reject('unauthorized');
-----
-true
-
-query I
-SELECT octet_length(frame) > 0 FROM n6k_hello_pending(NULL);
-----
-true
+hello_pending_first_ms must be positive
 
 statement error
-SELECT * FROM n6k_hello_ack(app_capabilities => ['nope']);
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, workers => 0);
 ----
-unknown capability 'nope'
-
-query I
-SELECT (SELECT frame FROM n6k_hello_ack(capabilities => ['jsonrpc', 'foo'])) = (SELECT frame FROM n6k_hello_ack());
-----
-true
-
-query I
-SELECT (SELECT frame FROM n6k_hello_ack(capabilities => ['jsonrpc'], app_capabilities => ['jsonrpc'])) = (SELECT frame FROM n6k_hello_ack());
-----
-false
+workers must be between 1 and 64
 
 statement error
-CALL n6k_serve_fd(7, auth_function => 'x');
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, workers => 65);
+----
+workers must be between 1 and 64
+
+statement error
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, idle_stream_timeout_ms => -1);
+----
+idle_stream_timeout_ms must be 0 (disabled) or positive
+
+statement error
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, idle_txn_timeout_ms => -1);
+----
+idle_txn_timeout_ms must be 0 (disabled) or positive
+
+statement error
+CALL n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, auth_function => 'x');
 ----
 auth_function
 
-statement ok
-EXPLAIN SELECT * FROM n6k_serve_fd(7, 'memory');
-
-statement ok
-EXPLAIN SELECT * FROM n6k_serve_fd(7, 'memory');
+statement error
+SELECT * FROM n6k_serve_send_text(NULL, 'x');
+----
+requires a session id
 
 statement error
-SELECT * FROM n6k_handshake(-1);
+SELECT * FROM n6k_serve_send_text('00000000-0000-4000-8000-000000000007'::UUID, NULL);
 ----
-is not a valid file descriptor
+requires the text to send
+
+statement error
+SELECT * FROM n6k_serve_session_stats(NULL);
+----
+requires a session id
+
+statement error
+SELECT * FROM n6k_serve_close('00000000-0000-4000-8000-000000000007'::UUID, 999, 'x');
+----
+out of range
+
+statement error
+CALL n6k_serve_ws('00000000-0000-4000-8000-000000000007'::UUID, 'not json');
+----
+request must be a JSON object
+
+statement error
+CALL n6k_serve_ws(NULL, '{}');
+----
+requires a session id
+
+statement ok
+EXPLAIN SELECT * FROM n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, 'memory');
+
+statement ok
+EXPLAIN SELECT * FROM n6k_serve_fd('00000000-0000-4000-8000-000000000007'::UUID, 'memory', authenticate => 'f', on_text => 'g', resolve => 'h', request => '{}');

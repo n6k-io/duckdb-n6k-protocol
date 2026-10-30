@@ -36,12 +36,13 @@ public:
 	                      std::chrono::steady_clock::time_point deadline) override;
 	void WriteFrame(StreamFrameType type, const std::string &frame) override;
 	void ShutdownWrite() override;
+	void SendClose(int code, const std::string &reason) override;
 
 	// Hand one received frame to the reactor. Called from ixwebsocket's callback thread.
 	void EnqueueFrameUnlessClosed(StreamFrameType type, std::string frame);
 
 	// Drains what is queued, then reports EOF from ReadFrame, which unwinds the reactor exactly as a
-	// closed Unix socket does.
+	// closed Unix socket does. Nothing is sent after it returns: ix may destroy the WebSocket next.
 	void CloseInbound();
 
 private:
@@ -51,6 +52,9 @@ private:
 	std::condition_variable cv_;
 	std::deque<std::pair<StreamFrameType, std::string>> in_q_;
 	bool closed_ = false;
+
+	std::mutex send_mu_;
+	bool send_closed_ = false;
 };
 
 } // namespace n6k

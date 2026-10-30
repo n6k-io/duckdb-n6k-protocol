@@ -686,8 +686,7 @@ async def _permissions(
     if table is not None:
         parts.append(f'"table" := {table!r}')
     sql = (
-        "SELECT schema, name, kind, verbs, primary_key "
-        f"FROM n6k_table_permissions({', '.join(parts)}) ORDER BY name"
+        "SELECT schema, name, kind, verbs, primary_key " f"FROM n6k_table_permissions({', '.join(parts)}) ORDER BY name"
     )
     return _writes_and_alter(await asyncio.to_thread(lambda: conn.sql(sql).fetchall()))
 

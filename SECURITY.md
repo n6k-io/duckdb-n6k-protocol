@@ -25,8 +25,7 @@ boundary.
 
 ## Hardening
 
-- Run `vcatbridge_lockdown` on the served instance; see `src/bridge/lockdown.cpp` in
-  `duckdb-virtual-catalog` for what it restricts.
+- Run `vcatbridge_lockdown` (from `duckdb-virtual-catalog`) on the served instance.
 
 ## n6k must
 

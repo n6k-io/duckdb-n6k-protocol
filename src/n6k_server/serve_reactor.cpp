@@ -1,22 +1,23 @@
 #include "serve_reactor.hpp"
 
 #include "frame_codec.hpp"
+#include "host_callbacks.hpp"
 #include "n6k_exception_types.hpp"
 #include "n6k_served.hpp"
 #include "n6k_sql_builder.hpp"
 #include "n6k_stream_framing.hpp"
 #include "n6k_protocol_generated.hpp"
-#include "n6k_yyjson_util.hpp"
 #include "request_handlers.hpp"
 #include "serve_handshake.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/logging/logger.hpp"
-#include "yyjson.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -29,10 +30,17 @@
 namespace duckdb {
 namespace n6k {
 
-// Bounded so a stuck query cannot pin the serving CALL open forever.
+// How long shutdown waits for requests to finish before interrupting them.
 static constexpr int SHUTDOWN_DRAIN_TIMEOUT_MS = 5000;
 
-// How long AwaitServeOnFd waits for the serve on its fd to register.
+// Past this many unsent payload bytes the client has stopped reading: the queue is dropped for a CLOSE and
+// nothing more is queued.
+static constexpr size_t MAX_QUEUED_OUT_BYTES = static_cast<size_t>(256) << 20;
+
+// JSON-RPC messages waiting for on_text; past it the client gets a busy error instead.
+static constexpr size_t MAX_QUEUED_TEXT = 64;
+
+// How long AwaitServe waits for the serve of its session to register.
 static constexpr int RESOLVE_REGISTER_WAIT_MS = 10000;
 
 // Idle connections get reaped by proxies, and a client-side timer is no substitute — browsers
@@ -63,31 +71,17 @@ static int ResolvePingIntervalMs() {
 }
 
 ServeReactor::ServeReactor(ServeTransport &conn, DatabaseInstance &db, ClientContext &context,
-                           std::vector<std::string> catalogs, bool hello_already_read,
-                           std::vector<PendingCatalogSpec> pending, int serve_fd)
-    : conn_(conn), db_(db), context_(context), served_(std::move(catalogs)), hello_already_read_(hello_already_read),
-      serve_fd_(serve_fd), open_pending_interval_ms_(OPEN_PENDING_INTERVAL_MS) {
+                           std::vector<std::string> catalogs, ServeOptions options, hugeint_t session_id)
+    : conn_(conn), db_(db), context_(context), served_(std::move(catalogs)), options_(std::move(options)),
+      session_id_(session_id), open_pending_interval_ms_(options_.open_pending_interval_ms),
+      resolve_unknown_(!options_.resolve.empty()) {
 	served_set_.insert(served_.begin(), served_.end());
 	listed_.insert(served_.begin(), served_.end());
-	for (auto &spec : pending) {
-		pending_order_.push_back(spec.catalog);
-		resolvable_.insert(spec.catalog);
-		listed_.insert(spec.catalog);
-		pending_[spec.catalog] = PendingOpen {std::move(spec.message), {}};
-	}
-	ping_interval_ms_ = ResolvePingIntervalMs();
+	ping_interval_ms_ = options_.ping_interval_ms >= 0 ? options_.ping_interval_ms : ResolvePingIntervalMs();
 }
 
 static std::string ResolvingMessage(const std::string &catalog) {
 	return "resolving catalog \"" + catalog + "\"";
-}
-
-static std::string ResolveEvent(const std::string &catalog) {
-	auto *doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
-	auto *root = duckdb_yyjson::yyjson_mut_obj(doc);
-	duckdb_yyjson::yyjson_mut_doc_set_root(doc, root);
-	duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, root, "resolve", catalog.c_str(), catalog.size());
-	return SerializeJsonDocAndFree(doc);
 }
 
 // CANCEL {ns, id: 0}: what a client sends on DETACH, sent upstream when a forwarded session moves off it.
@@ -112,7 +106,12 @@ static std::string JoinQuoted(const std::vector<std::string> &names) {
 }
 
 ServeReactor::~ServeReactor() {
-	StopPinger();
+	StopWorkers();
+	StopCallbackThreads();
+	StopWriter();
+}
+
+void ServeReactor::StopWriter() {
 	{
 		std::lock_guard<std::mutex> lk(out_mu_);
 		writer_stop_ = true;
@@ -123,38 +122,21 @@ ServeReactor::~ServeReactor() {
 	}
 }
 
-void ServeReactor::PingLoop() {
-	uint32_t ping_id = 0;
-	while (true) {
-		{
-			std::unique_lock<std::mutex> lk(ping_mu_);
-			if (ping_cv_.wait_for(lk, std::chrono::milliseconds(ping_interval_ms_), [&] { return ping_stop_; })) {
-				return;
-			}
-		}
-		if (stopping_.load()) {
-			return;
-		}
-		ping_id++;
-		SendFrame(PackPing(ping_id));
+void ServeReactor::StartPinging() {
+	if (ping_interval_ms_ <= 0) {
+		return;
 	}
-}
-
-void ServeReactor::StopPinger() {
 	{
-		std::lock_guard<std::mutex> lk(ping_mu_);
-		ping_stop_ = true;
+		std::lock_guard<std::mutex> lk(out_mu_);
+		pinging_ = true;
 	}
-	ping_cv_.notify_all();
-	if (pinger_.joinable()) {
-		pinger_.join();
-	}
+	out_cv_.notify_one();
 }
 
 void ServeReactor::SendFrame(std::string frame) {
 	{
 		std::lock_guard<std::mutex> lk(out_mu_);
-		out_q_.emplace_back(StreamFrameType::N6K, std::move(frame));
+		EnqueueOut(OutFrame {StreamFrameType::N6K, std::move(frame), 0});
 	}
 	out_cv_.notify_one();
 }
@@ -162,15 +144,72 @@ void ServeReactor::SendFrame(std::string frame) {
 void ServeReactor::SendJsonRpc(std::string message) {
 	{
 		std::lock_guard<std::mutex> lk(out_mu_);
-		out_q_.emplace_back(StreamFrameType::JSONRPC, std::move(message));
+		EnqueueOut(OutFrame {StreamFrameType::JSONRPC, std::move(message), 0});
 	}
 	out_cv_.notify_one();
 }
 
-void ServeReactor::SendHost(std::string message) {
+void ServeReactor::SendForRequest(RequestSlot &slot, std::string frame) {
+	std::lock_guard<std::mutex> lk(slot.mu);
+	if (!slot.ended) {
+		SendFrame(std::move(frame));
+	}
+}
+
+void ServeReactor::EndRequest(RequestSlot &slot, std::string terminal) {
+	std::lock_guard<std::mutex> lk(slot.mu);
+	if (slot.ended) {
+		return;
+	}
+	slot.ended = true;
+	slot.cancel.store(true);
+	SendFrame(std::move(terminal));
+}
+
+void ServeReactor::SendText(std::string text) {
+	if (!accepts_text_) {
+		throw InvalidInputException("n6k_server: the client was not granted jsonrpc or mcp");
+	}
+	SendJsonRpc(std::move(text));
+}
+
+// RFC 6455 caps a close reason at 123 bytes; cut on a UTF-8 boundary.
+static std::string CloseReason(std::string reason) {
+	static constexpr size_t MAX_CLOSE_REASON_BYTES = 123;
+	if (reason.size() <= MAX_CLOSE_REASON_BYTES) {
+		return reason;
+	}
+	size_t end = MAX_CLOSE_REASON_BYTES;
+	while (end > 0 && (static_cast<unsigned char>(reason[end]) & 0xC0) == 0x80) {
+		end--;
+	}
+	reason.resize(end);
+	return reason;
+}
+
+bool ServeReactor::EnqueueOut(OutFrame frame) {
+	if (out_overflowed_) {
+		return false;
+	}
+	if (frame.type != StreamFrameType::CLOSE && out_q_bytes_ + frame.payload.size() > MAX_QUEUED_OUT_BYTES) {
+		// Credits bound what a request may have queued, but not PONGs to a flood of PINGs, nor a client
+		// that grants credit it never reads.
+		out_overflowed_ = true;
+		out_q_.clear();
+		out_q_.push_back(OutFrame {StreamFrameType::CLOSE, CloseReason("client is not reading"), 1008});
+		out_q_bytes_ = out_q_.back().payload.size();
+		stopping_.store(true);
+		return false;
+	}
+	out_q_bytes_ += frame.payload.size();
+	out_q_.push_back(std::move(frame));
+	return true;
+}
+
+void ServeReactor::Close(int code, std::string reason) {
 	{
 		std::lock_guard<std::mutex> lk(out_mu_);
-		out_q_.emplace_back(StreamFrameType::HOST, std::move(message));
+		EnqueueOut(OutFrame {StreamFrameType::CLOSE, CloseReason(std::move(reason)), code});
 	}
 	out_cv_.notify_one();
 }
@@ -232,13 +271,19 @@ void ServeReactor::HandleOpen(const msgpack::object &header, const std::string &
 	}
 	if (resolve_unknown_) {
 		auto unresolved = unresolved_.find(catalog);
+		if (unresolved == unresolved_.end() && unresolved_.size() >= static_cast<size_t>(MAX_CONCURRENT_REQS)) {
+			SendFrame(PackOpenErr(ns, "InvalidInputException",
+			                      "too many catalogs resolving on this connection (limit " +
+			                          std::to_string(MAX_CONCURRENT_REQS) + ")"));
+			return;
+		}
 		if (unresolved == unresolved_.end()) {
 			{
 				std::lock_guard<std::mutex> lk(resolve_mu_);
 				resolving_.insert(catalog);
 			}
 			unresolved = unresolved_.emplace(catalog, std::vector<ParkedOpen> {}).first;
-			SendHost(ResolveEvent(catalog));
+			StartResolve(catalog);
 		}
 		unresolved->second.push_back(ParkedOpen {ns, std::move(capabilities), frame});
 		SendFrame(PackOpenPending(ns, ResolvingMessage(catalog)));
@@ -405,13 +450,6 @@ void ServeReactor::ReportUpstreamCatalogs(int up_fd, std::vector<std::string> na
 	}
 }
 
-void ServeReactor::SetLazyCatalogs(const std::vector<std::pair<std::string, int64_t>> &names) {
-	for (auto &entry : names) {
-		lazy_.push_back(entry.first);
-		lazy_claims_[entry.first] = Claim {entry.second, next_claim_seq_++};
-	}
-}
-
 std::vector<std::string> ServeReactor::AddUpstream(int up_fd, const std::vector<std::string> &catalogs, int64_t rank) {
 	auto up = std::make_shared<Upstream>();
 	up->id = up_fd;
@@ -482,7 +520,7 @@ void ServeReactor::AddCatalog(const std::string &catalog) {
 
 void ServeReactor::AddLazyCatalog(const std::string &catalog, int64_t rank) {
 	if (!resolve_unknown_) {
-		throw InvalidInputException("catalog \"%s\": a lazy catalog needs n6k_serve_fd(..., resolve => true)", catalog);
+		throw InvalidInputException("catalog \"%s\": a lazy catalog needs a resolve callback on this serve", catalog);
 	}
 	std::lock_guard<std::mutex> lk(resolve_mu_);
 	if (listed_.count(catalog) != 0 || lazy_claims_.count(catalog) != 0) {
@@ -569,7 +607,7 @@ int64_t ServeReactor::CancelInflight(const std::string &catalog) {
 				slot.cancel.store(true);
 				ctx = slot.context;
 			}
-			slot.cv.notify_all();
+			QueueParked(entry.second, RequestTask::Kind::CANCEL);
 			if (ctx) {
 				ctx->Interrupt();
 			}
@@ -724,7 +762,7 @@ void ServeReactor::ApplyCatalogChanges() {
 				pause_applied_.erase(change.catalog);
 			}
 			for (auto &req : reqs) {
-				AdmitAndSpawnRequestWorker(req.sess, req.req_id, req.op, std::move(req.body));
+				AdmitAndQueueRequest(req.sess, req.req_id, req.op, std::move(req.body));
 			}
 			continue;
 		}
@@ -1055,7 +1093,7 @@ void ServeReactor::ApplyRemove(const std::string &catalog) {
 }
 
 void ServeReactor::EvictSession(int64_t ns, const std::string &reason) {
-	std::vector<std::pair<uint32_t, shared_ptr<ClientContext>>> inflight;
+	std::vector<std::pair<std::shared_ptr<RequestSlot>, shared_ptr<ClientContext>>> inflight;
 	{
 		std::lock_guard<std::mutex> lk(map_mu_);
 		for (auto &entry : inflight_) {
@@ -1063,13 +1101,12 @@ void ServeReactor::EvictSession(int64_t ns, const std::string &reason) {
 				continue;
 			}
 			std::lock_guard<std::mutex> slk(entry.second->mu);
-			inflight.emplace_back(entry.first.req_id, entry.second->context);
+			inflight.emplace_back(entry.second, entry.second->context);
 		}
 	}
-	// ERR before cancelling: whatever the worker sends after this is for an id the client has already
-	// settled, so it is ignored.
+	// Ended now, not when each worker notices: a worker may be stuck in a long query or a host call.
 	for (auto &req : inflight) {
-		SendError(*this, FrameTarget {ns, req.first}, "InvalidInputException", reason);
+		EndRequest(*req.first, PackErr(FrameTarget {ns, req.first->req_id}, "InvalidInputException", reason, false));
 	}
 	for (auto &req : TakeHeldOf(ns)) {
 		SendError(*this, FrameTarget {ns, req.req_id}, "InvalidInputException", reason);
@@ -1161,15 +1198,22 @@ int ServeReactor::NotifyInvalidate(const std::string &catalog, const std::vector
 	return static_cast<int>(targets.size());
 }
 
-int64_t ServeReactor::BeginTxn(int64_t ns) {
+int64_t ServeReactor::BeginTxn(RequestSlot &slot) {
 	auto pinned = std::make_shared<PinnedTxn>();
 	pinned->conn = std::unique_ptr<Connection>(new Connection(db_));
 	MarkServed(*pinned->conn->context);
 	pinned->conn->BeginTransaction();
-	std::lock_guard<std::mutex> lk(txn_mu_);
-	auto txn = next_txn_++;
-	txns_[TxnKey {ns, txn}] = std::move(pinned);
-	return txn;
+	{
+		// Checked under txn_mu_: a session close sets `cancel` before DropTxnsOf takes it.
+		std::lock_guard<std::mutex> lk(txn_mu_);
+		if (!slot.cancel.load()) {
+			auto txn = next_txn_++;
+			txns_[TxnKey {slot.ns, txn}] = std::move(pinned);
+			return txn;
+		}
+	}
+	pinned->conn->Rollback();
+	throw InterruptException();
 }
 
 std::shared_ptr<PinnedTxn> ServeReactor::FindTxn(int64_t ns, int64_t txn) {
@@ -1252,10 +1296,63 @@ void ServeReactor::CloseSessionAndCancelItsRequests(int64_t ns) {
 				std::lock_guard<std::mutex> slk(entry.second->mu);
 				entry.second->cancel.store(true);
 			}
-			entry.second->cv.notify_all();
+			QueueParked(entry.second, RequestTask::Kind::CANCEL);
 		}
 	}
 	DropTxnsOf(ns);
+}
+
+void ServeReactor::ExpireIdle() {
+	if (options_.idle_stream_timeout_ms > 0) {
+		const auto cutoff =
+		    std::chrono::steady_clock::now() - std::chrono::milliseconds(options_.idle_stream_timeout_ms);
+		std::vector<std::shared_ptr<RequestSlot>> idle;
+		{
+			std::lock_guard<std::mutex> lk(map_mu_);
+			for (auto &entry : inflight_) {
+				std::lock_guard<std::mutex> slk(entry.second->mu);
+				if (entry.second->parked && entry.second->parked_at < cutoff) {
+					idle.push_back(entry.second);
+				}
+			}
+		}
+		for (auto &slot : idle) {
+			EndRequest(*slot, PackErr(FrameTarget {slot->ns, slot->req_id}, "IOException",
+			                          "n6k_server: stream idle for more than " +
+			                              std::to_string(options_.idle_stream_timeout_ms) + " ms without credit",
+			                          false));
+			QueueParked(slot, RequestTask::Kind::CANCEL);
+		}
+	}
+	if (options_.idle_txn_timeout_ms > 0) {
+		const auto cutoff = SteadyNowMs() - options_.idle_txn_timeout_ms;
+		// Taken out of `txns_` with `mu` held, so a request that found it first sees it closed.
+		std::vector<std::shared_ptr<PinnedTxn>> expired;
+		{
+			std::lock_guard<std::mutex> lk(txn_mu_);
+			for (auto it = txns_.begin(); it != txns_.end();) {
+				if (it->second->last_used_ms.load() < cutoff && it->second->mu.try_lock()) {
+					expired.push_back(std::move(it->second));
+					it = txns_.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		for (auto &pinned : expired) {
+			std::unique_lock<std::mutex> guard(pinned->mu, std::adopt_lock);
+			if (!pinned->conn) {
+				continue;
+			}
+			try {
+				pinned->conn->Rollback();
+			} catch (const std::exception &e) {
+				DUCKDB_LOG_WARNING(context_, "n6k_server: rolling back an idle transaction: %s",
+				                   ErrorData(e).Message());
+			}
+			pinned->conn.reset();
+		}
+	}
 }
 
 void ServeReactor::InterruptWorkers() {
@@ -1272,43 +1369,72 @@ void ServeReactor::InterruptWorkers() {
 	}
 }
 
-bool ServeReactor::AcquireCredit(RequestSlot &slot) {
-	std::unique_lock<std::mutex> lk(slot.mu);
-	// Counted before waiting: the metric is that the window ran dry, which is exactly the condition
-	// the predicate below is about to block on.
-	if (slot.credits <= 0 && !slot.cancel.load() && !stopping_.load()) {
-		credit_pauses_.fetch_add(1);
-	}
-	slot.cv.wait(lk, [&] { return slot.credits > 0 || slot.cancel.load() || stopping_.load(); });
+ServeReactor::CreditResult ServeReactor::TryAcquireCredit(RequestSlot &slot) {
+	std::lock_guard<std::mutex> lk(slot.mu);
 	if (slot.cancel.load() || stopping_.load()) {
-		return false;
+		return CreditResult::STOPPED;
+	}
+	if (slot.credits <= 0) {
+		credit_pauses_.fetch_add(1);
+		return CreditResult::EMPTY;
 	}
 	slot.credits--;
-	return true;
+	return CreditResult::TAKEN;
 }
 
-void ServeReactor::AddCredits(RequestSlot &slot, int n) {
+void ServeReactor::AddCredits(const std::shared_ptr<RequestSlot> &slot, int n) {
 	{
-		std::lock_guard<std::mutex> lk(slot.mu);
-		slot.credits += n;
+		std::lock_guard<std::mutex> lk(slot->mu);
+		slot->credits += n;
 	}
-	slot.cv.notify_all();
+	QueueParked(slot, RequestTask::Kind::RESUME);
 }
 
 void ServeReactor::WriterLoop() {
+	const auto ping_interval = std::chrono::milliseconds(ping_interval_ms_);
+	uint32_t ping_id = 0;
+	bool ping_armed = false;
+	std::chrono::steady_clock::time_point next_ping;
 	while (true) {
-		std::pair<StreamFrameType, std::string> frame;
+		OutFrame frame;
 		{
 			std::unique_lock<std::mutex> lk(out_mu_);
-			out_cv_.wait(lk, [&] { return !out_q_.empty() || writer_stop_; });
+			while (out_q_.empty() && !writer_stop_) {
+				if (!pinging_) {
+					out_cv_.wait(lk);
+					continue;
+				}
+				const auto now = std::chrono::steady_clock::now();
+				if (!ping_armed) {
+					next_ping = now + ping_interval;
+					ping_armed = true;
+				}
+				if (now < next_ping) {
+					out_cv_.wait_until(lk, next_ping);
+					continue;
+				}
+				next_ping = now + ping_interval;
+				if (!stopping_.load()) {
+					ping_id++;
+					EnqueueOut(OutFrame {StreamFrameType::N6K, PackPing(ping_id), 0});
+				}
+			}
 			if (out_q_.empty()) {
 				return;
 			}
 			frame = std::move(out_q_.front());
 			out_q_.pop_front();
+			out_q_bytes_ -= frame.payload.size();
 		}
 		try {
-			conn_.WriteFrame(frame.first, frame.second);
+			if (frame.type == StreamFrameType::CLOSE) {
+				conn_.SendClose(frame.close_code, frame.payload);
+				stopping_.store(true);
+				return;
+			}
+			conn_.WriteFrame(frame.type, frame.payload);
+			frames_out_.fetch_add(1, std::memory_order_relaxed);
+			bytes_out_.fetch_add(static_cast<int64_t>(frame.payload.size()), std::memory_order_relaxed);
 		} catch (const std::exception &) {
 			// Peer is gone; the reader will hit EOF and shut down.
 			stopping_.store(true);
@@ -1332,10 +1458,22 @@ std::vector<std::pair<DatabaseInstance *, ServeReactor *>> &RegistryEntries() {
 	return entries;
 }
 
-// Signalled on every registration, for AwaitServeOnFd racing a serve that has not reached Run().
+// Signalled on every registration and session release, for AwaitServe racing a serve that has not reached Run().
 std::condition_variable &RegistryCv() {
 	static std::condition_variable cv;
 	return cv;
+}
+
+struct ServeSession {
+	DatabaseInstance *db;
+	int fd;
+	bool claimed;
+};
+
+// Guarded by RegistryMutex.
+std::unordered_map<hugeint_t, ServeSession> &SessionEntries() {
+	static std::unordered_map<hugeint_t, ServeSession> entries;
+	return entries;
 }
 
 } // namespace
@@ -1367,6 +1505,38 @@ ServeReactorRegistration::~ServeReactorRegistration() {
 	Release();
 }
 
+hugeint_t CreateServeSession(DatabaseInstance &db, int fd) {
+	std::lock_guard<std::mutex> lk(RegistryMutex());
+	auto &entries = SessionEntries();
+	hugeint_t id;
+	do {
+		id = UUID::GenerateRandomUUID();
+	} while (entries.count(id));
+	entries.emplace(id, ServeSession {&db, fd, false});
+	return id;
+}
+
+ServeSessionClaim::ServeSessionClaim(DatabaseInstance &db, hugeint_t id) : id_(id) {
+	std::lock_guard<std::mutex> lk(RegistryMutex());
+	auto it = SessionEntries().find(id);
+	if (it == SessionEntries().end() || it->second.db != &db) {
+		throw InvalidInputException("no n6k serve session %s", UUID::ToString(id));
+	}
+	if (it->second.claimed) {
+		throw InvalidInputException("n6k serve session %s is already being served", UUID::ToString(id));
+	}
+	it->second.claimed = true;
+	fd_ = it->second.fd;
+}
+
+ServeSessionClaim::~ServeSessionClaim() {
+	{
+		std::lock_guard<std::mutex> lk(RegistryMutex());
+		SessionEntries().erase(id_);
+	}
+	RegistryCv().notify_all();
+}
+
 int BroadcastInvalidate(DatabaseInstance &db, const std::string &catalog, const std::vector<std::string> &schemas) {
 	// Lock held across NotifyInvalidate so a reactor cannot unregister and be destroyed between being
 	// found and being used. Safe to hold: NotifyInvalidate only enqueues, so it cannot block on the
@@ -1382,88 +1552,128 @@ int BroadcastInvalidate(DatabaseInstance &db, const std::string &catalog, const 
 }
 
 // Callers hold `lk` across their use of the result for the same reason as BroadcastInvalidate; no
-// ServeReactor method they call blocks on a socket or re-enters the registry.
-static ServeReactor &AwaitServeOnFd(std::unique_lock<std::mutex> &lk, DatabaseInstance &db, int fd) {
+// ServeReactor method they call blocks on a socket or re-enters the registry. An unknown id throws at
+// once; a known one waits for its serve to register, or gives up when that serve ends first or after
+// RESOLVE_REGISTER_WAIT_MS.
+static ServeReactor &AwaitServe(std::unique_lock<std::mutex> &lk, DatabaseInstance &db, hugeint_t session_id) {
+	auto &sessions = SessionEntries();
 	ServeReactor *reactor = nullptr;
-	RegistryCv().wait_for(lk, std::chrono::milliseconds(RESOLVE_REGISTER_WAIT_MS), [&] {
-		for (auto &entry : RegistryEntries()) {
-			if (entry.first == &db && entry.second->ServeFd() == fd) {
-				reactor = entry.second;
+	auto live = [&] {
+		auto it = sessions.find(session_id);
+		return it != sessions.end() && it->second.db == &db;
+	};
+	if (live()) {
+		RegistryCv().wait_for(lk, std::chrono::milliseconds(RESOLVE_REGISTER_WAIT_MS), [&] {
+			if (!live()) {
 				return true;
 			}
-		}
-		return false;
-	});
+			for (auto &entry : RegistryEntries()) {
+				if (entry.first == &db && entry.second->SessionId() == session_id) {
+					reactor = entry.second;
+					return true;
+				}
+			}
+			return false;
+		});
+	}
 	if (reactor == nullptr) {
-		throw InvalidInputException("no n6k_serve_fd is serving fd %d", fd);
+		throw InvalidInputException("no n6k serve session %s", UUID::ToString(session_id));
 	}
 	return *reactor;
 }
 
-void ResolvePendingOpen(DatabaseInstance &db, int fd, const std::string &catalog, bool ok, const std::string &message) {
+void ResolvePendingOpen(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog, bool ok,
+                        const std::string &message) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).ResolvePending(catalog, ok, message);
+	AwaitServe(lk, db, session_id).ResolvePending(catalog, ok, message);
 }
 
-void AddServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog) {
+void AddServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).AddCatalog(catalog);
+	AwaitServe(lk, db, session_id).AddCatalog(catalog);
 }
 
-void AddServedLazyCatalog(DatabaseInstance &db, int fd, const std::string &catalog, int64_t rank) {
+void AddServedLazyCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog, int64_t rank) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).AddLazyCatalog(catalog, rank);
+	AwaitServe(lk, db, session_id).AddLazyCatalog(catalog, rank);
 }
 
-void RemoveServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog) {
+void RemoveServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).RemoveCatalog(catalog);
+	AwaitServe(lk, db, session_id).RemoveCatalog(catalog);
 }
 
-void ResolveUnknownOpen(DatabaseInstance &db, int fd, const std::string &catalog, const std::string &error) {
+void SendServedText(DatabaseInstance &db, hugeint_t session_id, const std::string &text) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).Resolved(catalog, error);
+	AwaitServe(lk, db, session_id).SendText(text);
 }
 
-std::vector<std::string> AddServedUpstream(DatabaseInstance &db, int fd, int up_fd,
+void CloseServed(DatabaseInstance &db, hugeint_t session_id, int code, const std::string &reason) {
+	std::unique_lock<std::mutex> lk(RegistryMutex());
+	AwaitServe(lk, db, session_id).Close(code, reason);
+}
+
+std::vector<std::string> AddServedUpstream(DatabaseInstance &db, hugeint_t session_id, int up_fd,
                                            const std::vector<std::string> &catalogs, int64_t rank) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	return AwaitServeOnFd(lk, db, fd).AddUpstream(up_fd, catalogs, rank);
+	return AwaitServe(lk, db, session_id).AddUpstream(up_fd, catalogs, rank);
 }
 
-std::vector<std::string> SetServedUpstreamRank(DatabaseInstance &db, int fd, int up_fd, int64_t rank) {
+std::vector<std::string> SetServedUpstreamRank(DatabaseInstance &db, hugeint_t session_id, int up_fd, int64_t rank) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	return AwaitServeOnFd(lk, db, fd).SetUpstreamRank(up_fd, rank);
+	return AwaitServe(lk, db, session_id).SetUpstreamRank(up_fd, rank);
 }
 
-void RemoveServedUpstream(DatabaseInstance &db, int fd, int up_fd) {
+void RemoveServedUpstream(DatabaseInstance &db, hugeint_t session_id, int up_fd) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).RemoveUpstream(up_fd);
+	AwaitServe(lk, db, session_id).RemoveUpstream(up_fd);
 }
 
-UpstreamStatus ServedUpstreamStatus(DatabaseInstance &db, int fd, int up_fd) {
+UpstreamStatus ServedUpstreamStatus(DatabaseInstance &db, hugeint_t session_id, int up_fd) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	return AwaitServeOnFd(lk, db, fd).GetUpstreamStatus(up_fd);
+	return AwaitServe(lk, db, session_id).GetUpstreamStatus(up_fd);
 }
 
-void PauseServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog) {
+void PauseServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).Pause(catalog);
+	AwaitServe(lk, db, session_id).Pause(catalog);
 }
 
-void ResumeServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog) {
+void ResumeServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	AwaitServeOnFd(lk, db, fd).Resume(catalog);
+	AwaitServe(lk, db, session_id).Resume(catalog);
 }
 
-InflightState ServedCatalogInflight(DatabaseInstance &db, int fd, const std::string &catalog) {
+InflightState ServedCatalogInflight(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	return AwaitServeOnFd(lk, db, fd).Inflight(catalog);
+	return AwaitServe(lk, db, session_id).Inflight(catalog);
 }
 
-int64_t CancelServedCatalogInflight(DatabaseInstance &db, int fd, const std::string &catalog) {
+int64_t CancelServedCatalogInflight(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog) {
 	std::unique_lock<std::mutex> lk(RegistryMutex());
-	return AwaitServeOnFd(lk, db, fd).CancelInflight(catalog);
+	return AwaitServe(lk, db, session_id).CancelInflight(catalog);
+}
+
+SessionStats ServeReactor::Stats() const {
+	return SessionStats {
+	    frames_in_.load(),
+	    bytes_in_.load(),
+	    frames_out_.load(),
+	    bytes_out_.load(),
+	    reqs_handled_.load(),
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_).count(),
+	    authenticate_ms_,
+	    peak_workers_.load()};
+}
+
+SessionStats ServedSessionStats(DatabaseInstance &db, hugeint_t session_id) {
+	std::lock_guard<std::mutex> lk(RegistryMutex());
+	for (auto &entry : RegistryEntries()) {
+		if (entry.first == &db && entry.second->SessionId() == session_id) {
+			return entry.second->Stats();
+		}
+	}
+	throw InvalidInputException("no n6k serve session %s", UUID::ToString(session_id));
 }
 
 ServeStats CollectServeStats(DatabaseInstance &db) {
@@ -1481,23 +1691,260 @@ ServeStats CollectServeStats(DatabaseInstance &db) {
 	return stats;
 }
 
-int64_t ServeReactor::Run() {
+void ServeReactor::SetLazyCatalogs(const std::vector<std::pair<std::string, int64_t>> &names) {
+	for (auto &entry : names) {
+		lazy_.push_back(entry.first);
+		lazy_claims_[entry.first] = Claim {entry.second, next_claim_seq_++};
+	}
+}
+
+static Value VarcharList(const std::vector<std::string> &items) {
+	vector<Value> values;
+	for (auto &item : items) {
+		values.emplace_back(item);
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(values));
+}
+
+void ServeReactor::Reject(const std::string &reason, int code) {
+	SendFrame(PackHelloErr("InvalidInputException", reason));
+	Close(code, reason);
+}
+
+void ServeReactor::ApplyAuthResult(const AuthResult &result) {
+	if (!result.lazy.empty() && !resolve_unknown_) {
+		throw InvalidInputException("n6k_server: authenticate returned lazy catalogs, but the serve has no resolve "
+		                            "callback");
+	}
+	if (result.has_catalogs) {
+		Connection conn(db_);
+		auto attached = conn.Prepare("SELECT count(*) FROM duckdb_databases() WHERE database_name = ?");
+		if (attached->HasError()) {
+			attached->GetErrorObject().Throw();
+		}
+		for (auto &name : result.catalogs) {
+			vector<Value> params {Value(name)};
+			auto found = attached->Execute(params);
+			if (found->HasError()) {
+				found->ThrowError();
+			}
+			if (found->Fetch()->GetValue(0, 0).GetValue<int64_t>() == 0) {
+				throw InvalidInputException("n6k_server: authenticate returned catalog \"%s\", which is not attached",
+				                            name);
+			}
+		}
+		served_ = result.catalogs;
+		served_set_ = std::unordered_set<std::string>(served_.begin(), served_.end());
+	}
+	std::lock_guard<std::mutex> lk(resolve_mu_);
+	listed_ = std::unordered_set<std::string>(served_.begin(), served_.end());
+	for (auto &spec : result.pending) {
+		if (!listed_.insert(spec.catalog).second) {
+			throw InvalidInputException("n6k_server: authenticate: catalog \"%s\" is named twice", spec.catalog);
+		}
+		pending_order_.push_back(spec.catalog);
+		resolvable_.insert(spec.catalog);
+		pending_[spec.catalog] = PendingOpen {spec.message, {}};
+	}
+	for (auto &entry : result.lazy) {
+		if (listed_.count(entry.first) != 0) {
+			throw InvalidInputException("n6k_server: authenticate: catalog \"%s\" is named twice", entry.first);
+		}
+	}
+	SetLazyCatalogs(result.lazy);
+}
+
+bool ServeReactor::Authenticate(const HelloRequest &hello) {
+	static constexpr const char *INTERNAL_ERROR = "internal error";
+	static constexpr int INTERNAL_ERROR_CLOSE_CODE = 1011;
+	AuthResult result;
+	const auto auth_started = std::chrono::steady_clock::now();
+	if (!options_.authenticate.empty()) {
+		std::mutex mu;
+		std::condition_variable cv;
+		bool done = false;
+		std::string json;
+		std::string error;
+		std::thread caller([&] {
+			try {
+				HostCallback authenticate(db_, options_.authenticate, 4);
+				auto value =
+				    authenticate.Call({Value::UUID(session_id_), Value(hello.token), VarcharList(hello.capabilities),
+				                       options_.has_request ? Value(options_.request) : Value(LogicalType::VARCHAR)});
+				if (value.IsNull()) {
+					throw InvalidInputException("n6k_server: authenticate returned NULL");
+				}
+				json = value.GetValue<string>();
+			} catch (const std::exception &e) {
+				error = ErrorData(e).Message();
+			}
+			{
+				std::lock_guard<std::mutex> lk(mu);
+				done = true;
+			}
+			cv.notify_all();
+		});
+		auto next_beat = std::chrono::steady_clock::now() + std::chrono::milliseconds(options_.hello_pending_first_ms);
+		{
+			std::unique_lock<std::mutex> lk(mu);
+			while (!cv.wait_until(lk, next_beat, [&] { return done; })) {
+				SendFrame(PackHelloPending(options_.hello_pending_message));
+				next_beat = std::chrono::steady_clock::now() + std::chrono::milliseconds(open_pending_interval_ms_);
+			}
+		}
+		caller.join();
+		authenticate_ms_ =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - auth_started)
+		        .count();
+		if (!error.empty()) {
+			DUCKDB_LOG_WARNING(context_, "n6k_server: authenticate failed: %s", error);
+			Reject(INTERNAL_ERROR, INTERNAL_ERROR_CLOSE_CODE);
+			return false;
+		}
+		try {
+			result = ParseAuthResult(json);
+		} catch (const std::exception &e) {
+			DUCKDB_LOG_WARNING(context_, "%s", ErrorData(e).Message());
+			Reject(INTERNAL_ERROR, INTERNAL_ERROR_CLOSE_CODE);
+			return false;
+		}
+	}
+	if (result.reject) {
+		Reject(result.reason, result.code);
+		return false;
+	}
 	try {
-		if (!hello_already_read_) {
-			hello_offered_caps_ = ReadHello(conn_).capabilities;
+		ApplyAuthResult(result);
+	} catch (const std::exception &e) {
+		DUCKDB_LOG_WARNING(context_, "%s", ErrorData(e).Message());
+		Reject(INTERNAL_ERROR, INTERNAL_ERROR_CLOSE_CODE);
+		return false;
+	}
+	app_caps_ = result.app_capabilities;
+	for (auto &cap : IntersectCaps(hello.capabilities, APP_HELLO_CAPS)) {
+		if (app_caps_.empty() || std::find(app_caps_.begin(), app_caps_.end(), cap) != app_caps_.end()) {
+			accepts_text_ = true;
 		}
-		if (!hello_acked_) {
-			conn_.WriteFrame(StreamFrameType::N6K, PackHelloAck(GrantedHelloCaps(hello_offered_caps_, app_caps_)));
+	}
+	SendFrame(PackHelloAck(GrantedHelloCaps(hello.capabilities, app_caps_)));
+	return true;
+}
+
+void ServeReactor::TextWorkerLoop() {
+	unique_ptr<HostCallback> on_text;
+	try {
+		on_text = make_uniq<HostCallback>(db_, options_.on_text, 2);
+	} catch (const std::exception &e) {
+		DUCKDB_LOG_WARNING(context_, "%s", ErrorData(e).Message());
+	}
+	while (true) {
+		std::string text;
+		{
+			std::unique_lock<std::mutex> lk(text_mu_);
+			text_cv_.wait(lk, [&] { return !text_q_.empty() || text_stop_; });
+			if (text_stop_) {
+				return;
+			}
+			text = std::move(text_q_.front());
+			text_q_.pop_front();
 		}
+		if (!on_text) {
+			continue;
+		}
+		try {
+			auto reply = on_text->Call({Value::UUID(session_id_), Value(std::move(text))});
+			if (!reply.IsNull()) {
+				auto message = reply.GetValue<string>();
+				if (!message.empty()) {
+					SendJsonRpc(std::move(message));
+				}
+			}
+		} catch (const std::exception &e) {
+			DUCKDB_LOG_WARNING(context_, "%s", ErrorData(e).Message());
+		}
+	}
+}
+
+void ServeReactor::StartResolve(const std::string &catalog) {
+	{
+		std::lock_guard<std::mutex> lk(resolve_q_mu_);
+		resolve_q_.push_back(catalog);
+	}
+	resolve_q_cv_.notify_one();
+	if (!resolver_.joinable()) {
+		resolver_ = std::thread(&ServeReactor::ResolverLoop, this);
+	}
+}
+
+void ServeReactor::ResolverLoop() {
+	while (true) {
+		std::string catalog;
+		{
+			std::unique_lock<std::mutex> lk(resolve_q_mu_);
+			resolve_q_cv_.wait(lk, [&] { return !resolve_q_.empty() || resolve_stop_; });
+			if (resolve_stop_) {
+				return;
+			}
+			catalog = std::move(resolve_q_.front());
+			resolve_q_.pop_front();
+		}
+		std::string error;
+		try {
+			HostCallback resolve(db_, options_.resolve, 2);
+			auto result = resolve.Call({Value::UUID(session_id_), Value(catalog)});
+			if (!result.IsNull()) {
+				error = result.GetValue<string>();
+			}
+		} catch (const std::exception &e) {
+			error = ErrorData(e).RawMessage();
+		}
+		try {
+			Resolved(catalog, error);
+		} catch (const std::exception &) {
+		}
+	}
+}
+
+void ServeReactor::StopCallbackThreads() {
+	{
+		std::lock_guard<std::mutex> lk(text_mu_);
+		text_stop_ = true;
+	}
+	text_cv_.notify_all();
+	if (text_worker_.joinable()) {
+		text_worker_.join();
+	}
+	{
+		std::lock_guard<std::mutex> lk(resolve_q_mu_);
+		resolve_stop_ = true;
+	}
+	resolve_q_cv_.notify_all();
+	if (resolver_.joinable()) {
+		resolver_.join();
+	}
+}
+
+int64_t ServeReactor::Run() {
+	started_ = std::chrono::steady_clock::now();
+	HelloRequest hello;
+	try {
+		hello = ReadHello(conn_);
 	} catch (const std::exception &) {
 		return 0;
 	}
-
-	ServeReactorRegistration registration(db_, *this);
 	writer_ = std::thread(&ServeReactor::WriterLoop, this);
-	if (ping_interval_ms_ > 0) {
-		pinger_ = std::thread(&ServeReactor::PingLoop, this);
+	if (!Authenticate(hello)) {
+		StopWriter();
+		conn_.ShutdownWrite();
+		return 0;
 	}
+
+	// After HELLO_ACK is queued, so nothing a host sends through the registry precedes it.
+	ServeReactorRegistration registration(db_, *this);
+	if (!options_.on_text.empty()) {
+		text_worker_ = std::thread(&ServeReactor::TextWorkerLoop, this);
+	}
+	StartPinging();
 
 	// Poll with a timeout so Ctrl-C (interrupt) ends the loop even on an idle peer.
 	std::string frame;
@@ -1508,6 +1955,7 @@ int64_t ServeReactor::Run() {
 			const bool readable = conn_.WaitReadable(250);
 			ApplyCatalogChanges();
 			SendDuePendingBeats();
+			ExpireIdle();
 			if (!readable) {
 				if (context_.IsInterrupted()) {
 					break;
@@ -1517,12 +1965,30 @@ int64_t ServeReactor::Run() {
 			if (!conn_.ReadFrame(frame, frame_type)) {
 				break;
 			}
+			frames_in_.fetch_add(1, std::memory_order_relaxed);
+			bytes_in_.fetch_add(static_cast<int64_t>(frame.size()), std::memory_order_relaxed);
 			if (frame_type == StreamFrameType::JSONRPC) {
-				auto reply = JsonRpcMethodNotFoundReply(frame);
-				if (reply.empty()) {
-					DUCKDB_LOG_WARNING(context_, "n6k_server: discarding a JSON-RPC message (no JSON-RPC methods)");
-				} else {
-					SendJsonRpc(std::move(reply));
+				if (options_.on_text.empty()) {
+					auto reply = JsonRpcMethodNotFoundReply(frame);
+					if (reply.empty()) {
+						DUCKDB_LOG_WARNING(context_, "n6k_server: discarding a JSON-RPC message (no JSON-RPC methods)");
+					} else {
+						SendJsonRpc(std::move(reply));
+					}
+				} else if (accepts_text_) {
+					std::string busy;
+					{
+						std::lock_guard<std::mutex> lk(text_mu_);
+						if (text_q_.size() < MAX_QUEUED_TEXT) {
+							text_q_.push_back(std::move(frame));
+						} else {
+							busy = JsonRpcErrorReply(frame, -32000, "Server busy: too many unanswered messages");
+						}
+					}
+					text_cv_.notify_one();
+					if (!busy.empty()) {
+						SendJsonRpc(std::move(busy));
+					}
 				}
 				continue;
 			}
@@ -1597,14 +2063,14 @@ int64_t ServeReactor::Run() {
 					held_count_++;
 					break;
 				}
-				AdmitAndSpawnRequestWorker(SessionRef {ns, *catalog}, req_id, op, std::move(body));
+				AdmitAndQueueRequest(SessionRef {ns, *catalog}, req_id, op, std::move(body));
 				break;
 			}
 			case FrameType::CREDIT: {
 				const auto n = static_cast<int>(GetInt(h, "n", 0));
 				auto slot = FindSlot(ns, req_id);
 				if (slot && n > 0) {
-					AddCredits(*slot, n);
+					AddCredits(slot, n);
 				}
 				break;
 			}
@@ -1624,7 +2090,7 @@ int64_t ServeReactor::Run() {
 						std::lock_guard<std::mutex> lk(slot->mu);
 						slot->cancel.store(true);
 					}
-					slot->cv.notify_all();
+					QueueParked(slot, RequestTask::Kind::CANCEL);
 				}
 				break;
 			}
@@ -1654,10 +2120,10 @@ int64_t ServeReactor::Run() {
 	// about to stop.
 	registration.Release();
 	{
+		// A parked stream is on no worker, so it would never see `stopping_` by itself.
 		std::lock_guard<std::mutex> lk(map_mu_);
 		for (auto &entry : inflight_) {
-			{ std::lock_guard<std::mutex> slk(entry.second->mu); }
-			entry.second->cv.notify_all();
+			QueueParked(entry.second, RequestTask::Kind::CANCEL);
 		}
 	}
 	{
@@ -1670,32 +2136,28 @@ int64_t ServeReactor::Run() {
 			lk.unlock();
 			InterruptWorkers();
 			lk.lock();
-			// Unbounded after the interrupt, deliberately: these workers are detached and hold a
-			// reference to this reactor, so returning while one is live is a use-after-free. A
-			// hang is recoverable; that is not.
+			// Unbounded after the interrupt, deliberately: a running request holds references into
+			// this reactor and its transactions, so moving on while one is live is a use-after-free.
+			// A hang is recoverable; that is not.
 			workers_cv_.wait(lk, [&] { return active_workers_ == 0; });
 		}
 	}
+	StopWorkers();
+	StopCallbackThreads();
 	DropAllTxns();
-	StopPinger();
 	// Before the writer stops: an upstream's reader forwards onto it.
 	for (auto &entry : upstreams_) {
 		StopUpstream(*entry.second);
 	}
-	{
-		std::lock_guard<std::mutex> lk(out_mu_);
-		writer_stop_ = true;
-	}
-	out_cv_.notify_all();
-	if (writer_.joinable()) {
-		writer_.join();
-	}
+	StopWriter();
 	conn_.ShutdownWrite();
 	return reqs_handled_.load();
 }
 
-void ServeReactor::AdmitAndSpawnRequestWorker(const SessionRef &sess, uint32_t req_id, uint8_t op, std::string body) {
+void ServeReactor::AdmitAndQueueRequest(const SessionRef &sess, uint32_t req_id, uint8_t op, std::string body) {
 	auto slot = std::make_shared<RequestSlot>();
+	slot->ns = sess.ns;
+	slot->req_id = req_id;
 	slot->catalog = sess.catalog;
 	const InflightKey key {sess.ns, req_id};
 	{
@@ -1705,9 +2167,9 @@ void ServeReactor::AdmitAndSpawnRequestWorker(const SessionRef &sess, uint32_t r
 			          "req_id " + std::to_string(req_id) + " in use");
 			return;
 		}
-		// Enforce the window advertised in every OPEN_ACK. Each accepted REQ costs a detached
-		// thread, so an unbounded queue is a client-driven thread bomb; refusing is what the
-		// advertised limit means.
+		// Enforce the window advertised in every OPEN_ACK. Each accepted REQ holds a queue entry,
+		// then a Connection while it runs or parks, so an unbounded window is a client-driven memory bomb; refusing is
+		// what the advertised limit means.
 		if (inflight_.size() >= static_cast<size_t>(MAX_CONCURRENT_REQS)) {
 			SendError(*this, FrameTarget {sess.ns, req_id}, "InvalidInputException",
 			          "too many concurrent requests on this connection (limit " + std::to_string(MAX_CONCURRENT_REQS) +
@@ -1721,34 +2183,144 @@ void ServeReactor::AdmitAndSpawnRequestWorker(const SessionRef &sess, uint32_t r
 		std::lock_guard<std::mutex> lk(workers_mu_);
 		active_workers_++;
 	}
-	std::thread(&ServeReactor::WorkerMain, this, sess, req_id, slot, op, std::move(body)).detach();
+	QueueTask(RequestTask {RequestTask::Kind::START, sess, req_id, std::move(slot), op, std::move(body), nullptr});
 }
 
-void ServeReactor::WorkerMain(const SessionRef &sess, uint32_t req_id, const std::shared_ptr<RequestSlot> &slot,
-                              uint8_t op, const std::string &body) {
-	try {
-		Connection conn(db_);
-		MarkServed(*conn.context);
-		{
-			std::lock_guard<std::mutex> lk(slot->mu);
-			slot->context = conn.context;
+void ServeReactor::QueueTask(RequestTask task) {
+	{
+		std::lock_guard<std::mutex> lk(workers_mu_);
+		tasks_.push_back(std::move(task));
+		if (tasks_.size() > static_cast<size_t>(idle_workers_) &&
+		    worker_threads_.size() < static_cast<size_t>(options_.workers)) {
+			worker_threads_.emplace_back(&ServeReactor::WorkerLoop, this);
+			peak_workers_.store(static_cast<int64_t>(worker_threads_.size()));
 		}
-		HandleRequest(*this, conn, sess, op, body.data(), body.size(), req_id, *slot);
+	}
+	tasks_cv_.notify_one();
+}
+
+void ServeReactor::QueueParked(const std::shared_ptr<RequestSlot> &slot, RequestTask::Kind kind) {
+	std::unique_ptr<ParkedStream> stream;
+	{
+		std::lock_guard<std::mutex> lk(slot->mu);
+		stream = std::move(slot->parked);
+	}
+	if (stream) {
+		QueueTask(
+		    RequestTask {kind, SessionRef {slot->ns, slot->catalog}, slot->req_id, slot, 0, {}, std::move(stream)});
+	}
+}
+
+bool ServeReactor::HasWaitingRequests() {
+	std::lock_guard<std::mutex> lk(workers_mu_);
+	return !tasks_.empty();
+}
+
+void ServeReactor::WorkerLoop() {
+	std::unique_lock<std::mutex> lk(workers_mu_);
+	while (true) {
+		idle_workers_++;
+		tasks_cv_.wait(lk, [&] { return workers_stop_ || !tasks_.empty(); });
+		idle_workers_--;
+		if (tasks_.empty()) {
+			return;
+		}
+		auto task = std::move(tasks_.front());
+		tasks_.pop_front();
+		lk.unlock();
+		RunRequest(task);
+		lk.lock();
+	}
+}
+
+void ServeReactor::RunRequest(RequestTask &task) {
+	auto &slot = *task.slot;
+	if (task.kind == RequestTask::Kind::RESUME && stopping_.load()) {
+		task.kind = RequestTask::Kind::CANCEL;
+	}
+	try {
+		switch (task.kind) {
+		case RequestTask::Kind::START: {
+			if (stopping_.load()) {
+				break;
+			}
+			// Cancelled while queued: never run.
+			if (slot.cancel.load()) {
+				EndRequest(slot, PackRespEndCancelled(FrameTarget {slot.ns, slot.req_id}));
+				break;
+			}
+			std::unique_ptr<Connection> conn(new Connection(db_));
+			MarkServed(*conn->context);
+			{
+				std::lock_guard<std::mutex> lk(slot.mu);
+				slot.context = conn->context;
+			}
+			task.stream = HandleRequest(*this, conn, task.sess, task.op, task.body.data(), task.body.size(), slot);
+			break;
+		}
+		case RequestTask::Kind::RESUME:
+			break;
+		case RequestTask::Kind::CANCEL:
+			task.stream->Cancel(*this, slot);
+			task.stream.reset();
+			break;
+		}
+		if (task.stream) {
+			auto result = task.stream->Pump(*this, slot);
+			if (result != PumpResult::DONE) {
+				ParkOrQueue(std::move(task), result);
+				return;
+			}
+		}
 	} catch (const std::exception &e) {
 		ErrorData err(e);
-		SendError(*this, FrameTarget {sess.ns, req_id}, n6k::WireExceptionName(err.Type()), err.RawMessage(),
-		          n6k::IsRetriableExceptionType(err.Type()));
+		EndRequest(slot, PackErr(FrameTarget {task.sess.ns, task.req_id}, n6k::WireExceptionName(err.Type()),
+		                         err.RawMessage(), n6k::IsRetriableExceptionType(err.Type())));
 	}
+	// Before the request retires: an RPC stream's close runs the host generator's `finally`.
+	task.stream.reset();
 
 	{
 		std::lock_guard<std::mutex> lk(map_mu_);
-		inflight_.erase(InflightKey {sess.ns, req_id});
+		inflight_.erase(InflightKey {task.sess.ns, task.req_id});
 	}
 	{
 		std::lock_guard<std::mutex> lk(workers_mu_);
 		active_workers_--;
 	}
 	workers_cv_.notify_all();
+}
+
+void ServeReactor::ParkOrQueue(RequestTask task, PumpResult result) {
+	if (result == PumpResult::PARKED) {
+		auto &slot = *task.slot;
+		std::lock_guard<std::mutex> lk(slot.mu);
+		const bool stopped = slot.cancel.load() || stopping_.load();
+		if (!stopped && slot.credits <= 0) {
+			slot.parked = std::move(task.stream);
+			slot.parked_at = std::chrono::steady_clock::now();
+			return;
+		}
+		task.kind = stopped ? RequestTask::Kind::CANCEL : RequestTask::Kind::RESUME;
+	} else {
+		task.kind = RequestTask::Kind::RESUME;
+	}
+	QueueTask(std::move(task));
+}
+
+void ServeReactor::StopWorkers() {
+	std::vector<std::thread> workers;
+	{
+		std::lock_guard<std::mutex> lk(workers_mu_);
+		workers_stop_ = true;
+		workers.swap(worker_threads_);
+	}
+	tasks_cv_.notify_all();
+	for (auto &worker : workers) {
+		if (worker.joinable()) {
+			worker.join();
+		}
+	}
 }
 
 } // namespace n6k

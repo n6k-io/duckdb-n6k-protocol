@@ -9,6 +9,7 @@ import socket
 import struct
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional, Sequence
 
@@ -108,6 +109,16 @@ def test_a_non_positive_max_text_inflight_is_refused():
 def test_a_non_positive_max_mcp_inflight_is_refused():
     with pytest.raises(ValueError, match="max_mcp_inflight"):
         register(FastAPI(), "", connect=_never_connect, authenticate=_never_authenticate, max_mcp_inflight=0)
+
+
+def test_a_non_positive_workers_is_refused():
+    with pytest.raises(ValueError, match="workers"):
+        register(FastAPI(), "", connect=_never_connect, authenticate=_never_authenticate, workers=0)
+
+
+def test_a_non_positive_max_connections_is_refused():
+    with pytest.raises(ValueError, match="max_connections"):
+        register(FastAPI(), "", connect=_never_connect, authenticate=_never_authenticate, max_connections=0)
 
 
 def test_two_registrations_are_independent():
@@ -474,7 +485,9 @@ def test_closing_a_socket_while_a_provider_query_waits_on_the_loop_does_not_dead
 
     async def on_serve(ws: Any, handle: pump.LiveServe) -> None:
         cur = host.cons[0].cursor()
-        asyncio.ensure_future(asyncio.to_thread(lambda: cur.execute("SELECT schema_name FROM duckdb_schemas()").fetchall()))
+        asyncio.ensure_future(
+            asyncio.to_thread(lambda: cur.execute("SELECT schema_name FROM duckdb_schemas()").fetchall())
+        )
 
     host = _Host(with_provider, on_serve)
 
@@ -565,7 +578,7 @@ def test_an_attach_that_returns_without_attaching_answers_open_err():
     host = _Host(_pending(attach))
     with TestClient(host.app()).websocket_connect("/ws") as ws:
         _hello_and_open(ws, "late")
-        while (frame := _recv_skipping_pings(ws))["t"] == FT_OPEN_PENDING:
+        while (frame := _recv_skipping_pings(ws))["t"] in (FT_OPEN_PENDING, FT_PUSH):
             pass
         assert frame["t"] == FT_OPEN_ERR
         assert "not attached" in frame["exception_message"]
@@ -656,14 +669,50 @@ def test_a_catalog_returned_twice_is_a_rejection():
         assert _recv(ws)["t"] == FT_HELLO_ERR
 
 
-def test_build_serve_sql_renders_pending_as_a_map():
-    sql = build_serve_sql(7, ["db"], pending={"late": "it's warming"})
-    assert sql == "CALL n6k_serve_fd(7, 'db', pending => MAP {'late': 'it''s warming'})"
+_SESSION_ID = uuid.UUID("00000000-0000-4000-8000-000000000007")
 
 
-def test_build_serve_sql_renders_hello_capabilities_as_a_list():
-    sql = build_serve_sql(7, ["db"], capabilities=["crossing", "it's"])
-    assert sql == "CALL n6k_serve_fd(7, 'db', capabilities => ['crossing', 'it''s'])"
+def test_build_serve_sql_renders_the_callbacks():
+    sql = build_serve_sql(_SESSION_ID, ["db"], authenticate="auth", resolve="res", hello_pending_message="it's warming")
+    assert sql == (
+        f"CALL n6k_serve_fd('{_SESSION_ID}'::UUID, 'db', authenticate => 'auth', resolve => 'res', "
+        "hello_pending_message => 'it''s warming')"
+    )
+
+
+def test_build_serve_sql_renders_workers():
+    assert build_serve_sql(_SESSION_ID, ["db"], workers=2) == (
+        f"CALL n6k_serve_fd('{_SESSION_ID}'::UUID, 'db', workers => 2)"
+    )
+
+
+def test_a_connection_past_max_connections_is_closed_try_again_later():
+    host = _Host(_attach_db)
+    app = FastAPI()
+    register(app, "", connect=host.connect, authenticate=host.authenticate, max_connections=1)
+    hello = pack_frame({"t": FT_HELLO, "token": "", "protocol_version": N6K_PROTOCOL_VERSION})
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as first:
+            first.send_bytes(hello)
+            assert _recv(first)["t"] == FT_HELLO_ACK
+            with client.websocket_connect("/ws") as second:
+                assert _expect_disconnect(second) == 1013
+            first.close()
+            host.wait_for("teardown")
+        # The slot frees just after the host's teardown, so the first retry may still be refused.
+        host.events.clear()
+        deadline = time.monotonic() + 10
+        while True:
+            with client.websocket_connect("/ws") as third:
+                third.send_bytes(hello)
+                try:
+                    assert _recv(third)["t"] == FT_HELLO_ACK
+                except WebSocketDisconnect as refused:
+                    assert refused.code == 1013 and time.monotonic() < deadline
+                    continue
+                third.close()
+                host.wait_for("teardown")
+                break
 
 
 def _recv_catalogs_changed(ws: Any) -> list[str]:
@@ -699,10 +748,6 @@ def _recv_open_reply(ws: Any) -> tuple[dict[str, Any], int]:
             pendings += 1
         elif frame["t"] in (FT_OPEN_ACK, FT_OPEN_ERR):
             return frame, pendings
-
-
-def test_build_serve_sql_renders_resolve():
-    assert build_serve_sql(7, [], resolve=True) == "CALL n6k_serve_fd(7, resolve => true)"
 
 
 def test_resolve_attaches_an_unknown_catalog_lazily():
@@ -1075,7 +1120,9 @@ def test_mcp_requests_past_max_inflight_answer_busy_until_one_is_answered_or_can
         while not any(m.get("id") == 1 for m in sent):
             await asyncio.sleep(0)
         assert session.feed(_ping(3), send_text) == ""
-        session.feed(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}}), send_text)
+        session.feed(
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}}), send_text
+        )
         assert session.feed(_ping(4), send_text) == ""
         await session.aclose()
 
@@ -1182,11 +1229,6 @@ def test_without_max_text_inflight_text_handlers_are_not_limited():
         host.wait_for("text:39")
         assert _query(ws, 1)["t"] == FT_RESP_END
         _end_serve(ws, host)
-
-
-def test_build_serve_sql_renders_app_capabilities():
-    sql = build_serve_sql(7, ["db"], app_capabilities=["jsonrpc", "mcp"])
-    assert sql == "CALL n6k_serve_fd(7, 'db', app_capabilities => ['jsonrpc', 'mcp'])"
 
 
 def _hello_with_caps(ws: Any) -> list[str]:
@@ -1424,14 +1466,13 @@ class _UpstreamDb:
         load_n6k_server(self.con)
         self.con.execute(f"ATTACH ':memory:' AS {catalog}")
         self.link, self._served = socket.socketpair()
-        self.fd = self._served.fileno()
+        row = self.con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [self._served.fileno()]).fetchone()
+        assert row is not None
+        session_id = row[0]
 
         def serve() -> None:
             try:
-                row = self.con.execute("SELECT capabilities FROM n6k_handshake(?)", [self.fd]).fetchone()
-                assert row is not None
-                caps = ", ".join(f"'{c}'" for c in row[0])
-                self.con.execute(f"CALL n6k_serve_fd({self.fd}, '{catalog}', capabilities => [{caps}])").fetchall()
+                self.con.execute(f"CALL n6k_serve_fd('{session_id}'::UUID, '{catalog}')").fetchall()
             except Exception:  # noqa: BLE001 - a killed upstream ends its serve with an error
                 pass
 
@@ -1684,11 +1725,6 @@ def test_cancelling_connect_upstream_during_hello_pending_returns_promptly_and_c
         pending.join(5)
         theirs.close()
         link.close()
-
-
-def test_build_serve_sql_renders_lazy():
-    sql = build_serve_sql(7, ["db"], resolve=True, lazy={"remote": None, "it's": 2})
-    assert sql == "CALL n6k_serve_fd(7, 'db', resolve => true, lazy => MAP {'remote': NULL, 'it''s': 2})"
 
 
 def test_a_lazy_catalog_is_listed_at_once_and_resolve_serves_it_from_an_upstream_on_open():

@@ -444,11 +444,11 @@ def header_variant_schema(variant: dict[str, Any]) -> dict[str, Any]:
 
 # ── Stream framing ───────────────────────────────────────────────────────────
 # A raw byte stream frames every message as [4-byte BE payload length][1-byte type][payload].
-# JSONRPC and N6K are the RFC 6455 text/binary opcodes; HOST is not one. HOST is extension -> host only,
-# on the host's own socketpair: it never reaches a client, and nothing sends it to the extension.
+# JSONRPC and N6K are the RFC 6455 text/binary opcodes. CLOSE is extension -> host only, on the host's own
+# socketpair: msgpack {code, reason}, the WebSocket close the host performs; nothing follows it.
 STREAM_FRAME_JSONRPC: Final = 0x01
 STREAM_FRAME_N6K: Final = 0x02
-STREAM_FRAME_HOST: Final = 0x03
+STREAM_FRAME_CLOSE: Final = 0x04
 
 # ── Server tunables (advertised via OPEN_ACK) ────────────────────────────────
 DEFAULT_BATCH_CREDITS = 8

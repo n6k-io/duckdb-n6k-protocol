@@ -79,6 +79,11 @@ namespace ix
                                                const OnChunkCallback& onChunkCallback,
                                                const CancellationRequest& isCancellationRequested);
 
+        int getFd() const
+        {
+            return _sockfd;
+        }
+
         static int getErrno();
         static bool isWaitNeeded();
         static void closeSocket(int fd);

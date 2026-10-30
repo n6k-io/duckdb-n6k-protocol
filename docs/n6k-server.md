@@ -9,44 +9,31 @@ ops it answers. For the **on-the-wire** frame format, see
 side — `ATTACH`, auth, and the function registry — see
 [`n6k-network.md`](n6k-network.md).
 
-The extension exposes three `CALL`-able entry points, all of which block the
-calling thread and serve one or more catalogs.
+The extension's serving `CALL`s each block the calling thread and serve one or more catalogs.
 
 - **`n6k_serve_socket`** listens on a Unix domain socket and serves every client
   that connects until interrupted.
-- **`n6k_serve_fd(<fd>, <catalog>... [, named params])`** serves one connection
-  on a socket the *caller* already owns and passes by file descriptor, then returns. This is
-  what an embedding host uses: it accepts the WebSocket itself, makes a
-  `socketpair()`, and hands over one end. It assumes the client's `FT_HELLO` was
-  already read (by `n6k_handshake`), sends `HELLO_ACK`, then serves `OPEN`s.
-  `hello_acked => true` means the host already sent `HELLO_ACK` itself
-  (`n6k_hello_ack`), so `n6k_serve_fd` does not.
-  `ping_interval_ms`: omitted or NULL uses `$N6K_PING_INTERVAL` (`ResolvePingIntervalMs`), 0 disables the
-  keepalive, a negative value is a `BinderException`.
-  `capabilities => [...]` passes on the list `n6k_handshake` returned, so the
-  `HELLO_ACK` carries the negotiated intersection; omitted, it carries none.
-  `app_capabilities => ['jsonrpc', 'mcp']` names the `APP_HELLO_CAPS` the host
-  serves on the socket's text frames; the others are never granted. An unknown
-  name is a `BinderException`.
-  `pending => MAP {'name': 'status'}` also serves catalogs that are not attached
-  yet: their `OPEN`s get `FT_OPEN_PENDING` until the host calls
-  `n6k_serve_open_ready(<fd>, 'name')` (after ATTACHing it, from another cursor)
-  or `n6k_serve_open_failed(<fd>, 'name', 'reason')`. The Python framework drives
+- **`n6k_serve_fd(<session>, <catalog>... [, named params])`** serves one connection
+  on a socket the *caller* already owns, then returns. `<session>` is the UUID
+  `n6k_serve_create_session(<fd>)` returned for that socket's file descriptor. This is
+  what an embedding host that cannot hand over its WebSocket uses (the Python framework): it
+  accepts the WebSocket itself, makes a `socketpair()`, hands over one end and pumps frames
+  between the two. The extension reads the client's `FT_HELLO`, runs the host's callbacks (see
+  [Host callbacks](#host-callbacks)), sends `HELLO_ACK`, then serves `OPEN`s.
+  `request => '<json>'` is passed through to `authenticate` as its `request` argument.
+  Pending catalogs (`"pending"` from `authenticate`) are served before they are attached:
+  their `OPEN`s get `FT_OPEN_PENDING` until the host calls
+  `n6k_serve_open_ready(<session>, 'name')` (after ATTACHing it, from another cursor)
+  or `n6k_serve_open_failed(<session>, 'name', 'reason')`. The Python framework drives
   this from a `PendingCatalog` returned by `authenticate`.
-  `resolve => true` parks an `OPEN` for a catalog that is not served, pending
-  or failed: it gets `FT_OPEN_PENDING` (every `open_pending_interval_ms`) and the
-  host gets one `STREAM_FRAME_HOST` `{"resolve": "name"}` per name, however many
-  `OPEN`s wait on it. The host settles it with
-  `n6k_serve_resolved(<fd>, 'name', NULL)` once it has done what it will (e.g.
-  `n6k_serve_add_catalog`, which ACKs the parked `OPEN`s at once), or
-  `n6k_serve_resolved(<fd>, 'name', 'reason')` on failure. Parked `OPEN`s then get
-  `OPEN_ACK` if the catalog is served, else `OPEN_ERR` ("not found", or the
-  reason). Nothing is remembered: the next `OPEN` of a failed name asks again.
+  With a `resolve` callback, an `OPEN` for a catalog that is not served parks until
+  `resolve` returns (see [Host callbacks](#host-callbacks)).
   The Python framework drives this from `register(..., resolve=...)`.
-  `lazy => MAP {'name': rank, ...}` (with `resolve => true`; a NULL rank loses to
-  every upstream) and `n6k_serve_add_lazy_catalog(<fd>, 'name', rank => N)` list
+  Lazy catalogs (`"lazy": {"name": rank}` from `authenticate`, which needs a `resolve`
+  callback; a NULL rank loses to every upstream) and
+  `n6k_serve_add_lazy_catalog(<session>, 'name', rank => N)` list
   names before anything serves them, so clients can find them; opening one
-  resolves it as above. Once
+  calls `resolve`. Once
   served it is listed once; while nothing serves it (a failed resolve, or its
   upstream gone) it is listed as lazy again. `n6k_serve_remove_catalog` stops
   listing it.
@@ -55,8 +42,8 @@ calling thread and serve one or more catalogs.
   `HELLO_PENDING`) and returns `(catalogs, capabilities)`: capabilities from
   `HELLO_ACK`, catalogs from `CATALOG_LIST`. The token may be NULL; a stalled
   reply times out.
-  `n6k_serve_add_upstream(<fd>, <up_fd>, ['a', ...], rank => N)` (default 0) then
-  serves the ones it wins and returns the rest; `n6k_serve_set_upstream_rank(<fd>,
+  `n6k_serve_add_upstream(<session>, <up_fd>, ['a', ...], rank => N)` (default 0) then
+  serves the ones it wins and returns the rest; `n6k_serve_set_upstream_rank(<session>,
   <up_fd>, N)` re-ranks it. A local catalog always wins a name; otherwise the
   lowest rank among lazy names and upstreams that report it wins (then the
   earliest added), re-decided on every change, including names an upstream
@@ -67,55 +54,142 @@ calling thread and serve one or more catalogs.
   updates the served set. The upstream is this connection's alone, so `ns` and
   request ids need no rewriting. The reactor PINGs it and drops it after
   `OPEN_PENDING_STALL_MS` past the ping interval with nothing received. When it
-  goes (EOF, ping timeout, or `n6k_serve_remove_upstream(<fd>, <up_fd>)`), its
+  goes (EOF, ping timeout, or `n6k_serve_remove_upstream(<session>, <up_fd>)`), its
   opening sessions get `OPEN_ERR` and in-flight requests `FT_ERR` with
   `upstream for catalog "a" closed: <reason>`, and
-  `n6k_serve_upstream_status(<fd>, <up_fd>)` returns `(open, reason)`.
+  `n6k_serve_upstream_status(<session>, <up_fd>)` returns `(open, reason)`.
   `n6k_serve_add_catalog`, `n6k_serve_remove_catalog` and `n6k_serve_pause` refuse an upstream's names.
-  While it serves, `n6k_serve_add_catalog(<fd>, 'name')` (already attached) and
-  `n6k_serve_remove_catalog(<fd>, 'name')` change the served set. Removing closes
+  While it serves, `n6k_serve_add_catalog(<session>, 'name')` (already attached) and
+  `n6k_serve_remove_catalog(<session>, 'name')` change the served set. Removing closes
   that catalog's sessions: in-flight requests get `FT_ERR` and later ones on that
   `ns` get "unknown session". Any change of the listed set sends a connection-scoped
   `PUSH {op: CATALOGS_CHANGED, catalogs}` with the full list. The Python
   framework exposes this as the `LiveServe` handle passed to `on_serve`.
   To swap a served catalog without closing its sessions,
-  `n6k_serve_pause(<fd>, 'name')` holds new requests for it (CREDIT, CANCEL and
-  PING still flow), `n6k_serve_inflight(<fd>, 'name')` returns
+  `n6k_serve_pause(<session>, 'name')` holds new requests for it (CREDIT, CANCEL and
+  PING still flow), `n6k_serve_inflight(<session>, 'name')` returns
   `(holding BOOLEAN, running BIGINT)` — whether the pause has applied, and how
   many requests still run against it; drained is `holding AND running = 0`. It
   raises on a catalog that is not paused. And
-  `n6k_serve_cancel_inflight(<fd>, 'name')` cancels them. After the host
-  re-attaches it, `n6k_serve_resume(<fd>, 'name')` runs the held requests in
+  `n6k_serve_cancel_inflight(<session>, 'name')` cancels them. After the host
+  re-attaches it, `n6k_serve_resume(<session>, 'name')` runs the held requests in
   order. Held-request limits and refusals: `ServeReactor`. Python wraps this as
   `async with handle.paused('name')`.
 - **`n6k_serve_http`** listens on a TCP host/port and serves many WebSocket
   clients concurrently until interrupted.
+- **`n6k_serve_ws(<session>, '<request>', <catalog>... [, named params])`** serves one
+  WebSocket on a TCP socket the host accepted itself and whose HTTP upgrade request it
+  already read, then returns. The extension completes the upgrade and owns the
+  WebSocket, so no frame passes through the host. See [`n6k_serve_ws`](#n6k_serve_ws).
 
-These helpers let a host authenticate before it builds anything, on the same fd:
+While a serve runs, these reach it by its session id: the UUID from
+`n6k_serve_create_session`, or for `n6k_serve_http`, one the extension makes per accepted
+socket and passes to `authenticate`. Unlike an fd number, a session id is never reused, so a
+call for a session that ended raises instead of reaching a later one:
 
-- **`n6k_handshake(<fd>) -> (token, capabilities)`** reads the client's
-  `FT_HELLO` and returns its token and offered capabilities. It sends nothing on
-  success; a failure (`ReadHello`) gets `HELLO_ERR` and raises.
-- **`n6k_hello_pending('status') -> frame BLOB`** returns one `FT_HELLO_PENDING`
-  for the host to send between `n6k_handshake` and `HELLO_ACK` / `HELLO_ERR`. The
-  Python framework repeats it while `authenticate` runs (`pump.py`).
-- **`n6k_reject(<reason>) -> frame BLOB`** returns `HELLO_ERR {reason}` for the
-  host to send before it closes the socket.
-- **`n6k_hello_ack([capabilities => [...]] [, app_capabilities => [...]]) -> frame BLOB`**
-  returns the `HELLO_ACK` `n6k_serve_fd` would send, for the host to send itself
-  before `n6k_serve_fd(..., hello_acked => true)`. Sending it from the host orders
-  it before any text frame the host sends.
+- **`n6k_serve_send_text(<session>, 'text')`** sends a JSON-RPC text frame to the client,
+  after anything already queued. It raises unless the client offered `jsonrpc` or
+  `mcp` and the host serves it (`app_capabilities` names it, or is empty, which accepts
+  any offered one).
+- **`n6k_serve_close(<session>, code, 'reason')`** closes the client's WebSocket with that
+  code after what is already queued, and ends the session. A code outside 1000–4999 is a
+  `BinderException`; a reason over 123 bytes is cut on a UTF-8 boundary (`CloseReason`).
+- **`n6k_serve_session_stats(<session>)`** returns the session's traffic so far (columns as
+  in [Session stats](#session-stats)). It raises at once if no serve has registered `session`.
 
-These return the frame (no stream header) rather than writing the fd, so the host
-puts every handshake reply on the socket itself.
+A session registers only once `HELLO_ACK` is queued. Until then every session control
+function except `n6k_serve_session_stats` (the `open_ready` / `open_failed`, catalog, pause,
+inflight, upstream, `send_text` and `close` ones) waits up to `RESOLVE_REGISTER_WAIT_MS`
+(`AwaitServe`) for it and then raises, so a callback must not call them for its own session
+before it returns. A session id that was never created, or whose serve has ended, raises at once.
 
 One DuckDB may serve any number of sockets. The connections a reactor opens to
-run client requests are marked served, and every serve and handshake function
+run client requests are marked served, and every serve function
 refuses to bind on them ("not callable from a served connection"), so a client's
 SQL cannot reach process file descriptors.
 
-All three run the same `ServeReactor`; only the `ServeTransport` behind it differs
+Every serving `CALL` runs the same `ServeReactor`; only the `ServeTransport` behind it differs
 (`src/n6k_server/include/serve_transport.hpp`).
+
+## Host callbacks
+
+`n6k_serve_fd`, `n6k_serve_http` and `n6k_serve_ws` take the same named parameters
+(defaults in `ServeOptions`, accepted ranges and the `BinderException` outside them in
+`BindServeOptions`). Besides the callbacks:
+
+- `ping_interval_ms`: omitted or NULL resolves through `ResolvePingIntervalMs`; 0 disables
+  the keepalive.
+- `workers`: requests that run at once on the connection; the rest of the window waits in
+  arrival order.
+- `idle_stream_timeout_ms` (0 is off): a stream parked for credit longer than this is
+  answered `FT_ERR` and ended.
+- `idle_txn_timeout_ms` (0 is off): a pinned transaction no request has used for this long
+  is rolled back, and a later request naming it gets `TransactionException`.
+
+The callbacks are the
+names of scalar UDFs the host registered on the database; the extension calls each on
+a served connection of its own, from its own threads, with the session id first:
+
+| Parameter | UDF signature | Without it |
+|---|---|---|
+| `authenticate` | `(session UUID, token VARCHAR, capabilities VARCHAR[], request VARCHAR) -> VARCHAR` | every token is acked; the catalogs are the serve's own |
+| `on_text` | `(session UUID, text VARCHAR) -> VARCHAR` reply or NULL | a JSON-RPC request gets -32601 |
+| `resolve` | `(session UUID, catalog VARCHAR) -> VARCHAR` error or NULL | an `OPEN` of an unknown catalog fails at once |
+
+`authenticate` returns JSON, every key optional:
+
+```json
+{"reject": "reason", "code": 4403}
+{"catalogs": ["a"], "pending": {"b": "warming"}, "lazy": {"c": null}, "app_capabilities": ["jsonrpc"]}
+```
+
+Any `reject` key rejects: it sends `HELLO_ERR {reason}` (an empty or non-string reason is
+`"unauthorized"`) and closes the WebSocket with `code` (default: `AuthResult::code`,
+`src/n6k_server/include/host_callbacks.hpp`; a non-integer `code` also gets it, and `code` is
+not range-checked). An `authenticate` that raises or returns NULL, malformed JSON, a
+non-object root, a `pending` or `lazy` that is neither an object nor null, a
+`catalogs` or `app_capabilities` that is not an array of strings, an unknown app capability, a name given twice, an unattached catalog, or lazy catalogs
+without `resolve` send `HELLO_ERR "internal error"` and close with 1011. `"catalogs"` replaces the serve's own list. `request` is
+`{"uri", "headers"}` from the upgrade on `n6k_serve_http` / `n6k_serve_ws`, and the
+host's `request =>` (or NULL) on `n6k_serve_fd`. While `authenticate` runs, the client
+gets `FT_HELLO_PENDING {hello_pending_message}` after `hello_pending_first_ms`
+(`ServeOptions::hello_pending_first_ms`) and then every `open_pending_interval_ms`.
+
+`on_text` gets text frames only after `HELLO_ACK`, and only from a client that offered
+`jsonrpc` or `mcp` where `app_capabilities` is empty or names it. One thread per session calls it, in arrival order, so it should return
+quickly and send later replies with `n6k_serve_send_text`. At most `MAX_QUEUED_TEXT`
+messages wait for it; past that a request is answered `-32000` (server busy) and a notification is
+dropped.
+
+With `resolve`, an `OPEN` for a catalog that is not served, pending or failed parks: it gets
+`FT_OPEN_PENDING` every `open_pending_interval_ms`. `resolve` is called once per name, however
+many `OPEN`s wait on it, on one thread per session, a name at a time in arrival order, and may
+block until it has served the catalog. When it returns, parked `OPEN`s get `OPEN_ACK` if the
+catalog is served by then (e.g. it ran `n6k_serve_add_catalog`), are forwarded if an upstream
+serves it, else `OPEN_ERR` ("not found", or the returned text or raised message). Nothing is
+remembered: the next `OPEN` of a failed name calls it again. At most `MAX_CONCURRENT_REQS`
+names wait on `resolve` (queued or running); an `OPEN` for one more is answered `OPEN_ERR`.
+
+Callbacks may run SQL on any other connection to the database, but not on
+the one running the serving `CALL`, which is busy until the session ends.
+
+## Session stats
+
+`n6k_serve_ws` returns them in its result row when the session ends, and
+`n6k_serve_session_stats(<session>)` returns them while it runs:
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `frames_in` | BIGINT | frames read from the client after `HELLO` |
+| `bytes_in` | BIGINT | their payload bytes |
+| `frames_out` | BIGINT | frames written to the client |
+| `bytes_out` | BIGINT | their payload bytes |
+| `requests_handled` | BIGINT | `FT_REQ` frames admitted to the worker queue |
+| `duration_ms` | BIGINT | since the session started reading `HELLO` |
+| `authenticate_ms` | BIGINT | time in `authenticate` (0 without it) |
+| `peak_workers` | BIGINT | worker threads started, at most `workers` (`n6k_serve_session_stats` only) |
+
+Payload bytes exclude stream and WebSocket framing.
 
 ## `n6k_serve_socket`
 
@@ -187,7 +261,9 @@ errors are identical. `N6K_LISTEN` is not read. A port outside 1–65535 is a
 bind error.
 
 Every accepted connection gets its own `ServeReactor` on its own thread, so this
-form serves many clients at once and survives any one of them disconnecting. It
+form serves many clients at once and survives any one of them disconnecting.
+`max_connections` (default: ixwebsocket's `kDefaultMaxConnections`) caps how many are open at once; ixwebsocket closes
+any connection past it as soon as it is accepted. It
 blocks until interrupted (`Ctrl-C`), then stops the listener and drains every
 reactor.
 
@@ -203,7 +279,8 @@ Its declared return schema is:
 interrupt, and DuckDB aborts an interrupted statement instead of materialising
 its result — the same thing happens to any long query you `Ctrl-C`. The schema is
 declared because a table function must declare one. `n6k_serve_socket` is the
-same; only `n6k_serve_fd`, which ends when its one peer disconnects, returns its row.
+same; only `n6k_serve_fd` and `n6k_serve_ws`, which end when their one peer disconnects,
+return their row.
 
 ```sh
 duckdb mydata.duckdb -c "CALL n6k_serve_http('127.0.0.1', 7823, 'mydata')"
@@ -218,10 +295,32 @@ Two things follow from all clients sharing one `DatabaseInstance`:
   `duckdb.connect()` per WebSocket before handing over its fd. Here concurrent writers
   meet DuckDB's MVCC; transaction conflicts come back as `FT_ERR` with
   `"retriable":true`.
-- **No authentication.** This form reads `FT_HELLO` itself, ignores its `token`,
-  and acks. A Unix socket has file permissions as its
+- **No authentication unless given an `authenticate` callback.** Without one this form
+  acks every `token`. A Unix socket has file permissions as its
   trust boundary; a TCP port has no equivalent. Bind `127.0.0.1` unless something in
   front is doing authn. There is also no TLS — plain `ws://` only, terminate at a proxy.
+
+## `n6k_serve_ws`
+
+```sql
+CALL n6k_serve_ws(<session>, '{"method":"GET","uri":"/","version":"HTTP/1.1","headers":{...}}', 'mydata',
+                  authenticate => 'my_auth');
+```
+
+For a host that accepts TCP itself (to route by path, or share a port) but can hand over
+the socket. The host reads the upgrade request up to and not past its blank line, gives
+up the fd (the extension owns and closes it) to
+`n6k_serve_create_session`, and passes the returned session and the parsed request. The extension sends the `101` and serves the session on the CALL's
+thread. Plain `ws://` only: a TLS connection cannot be
+handed over. Catalog arguments and named parameters are as for `n6k_serve_http`, without
+`max_connections`.
+
+It returns when the WebSocket closes:
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `connected` | BOOLEAN | the upgrade succeeded |
+| `requests_handled`, `frames_in`, ... | BIGINT | the session's [stats](#session-stats) |
 
 ## Sessions (`ns`)
 
@@ -237,7 +336,7 @@ default session.
 |---|---|
 | `OPEN {ns, catalog}` naming a served catalog | `OPEN_ACK {ns, max_concurrent_reqs, default_batch_credits, capabilities}` — session open |
 | `OPEN` naming an unserved catalog | `OPEN_ERR {ns}`, listing what *is* served |
-| `OPEN` naming an unserved catalog, with `resolve => true` | `OPEN_PENDING {ns, message}` while the host resolves it, then `OPEN_ACK` or `OPEN_ERR` on `n6k_serve_resolved` |
+| `OPEN` naming an unserved catalog, with a `resolve` callback | `OPEN_PENDING {ns, message}` while `resolve` runs, then `OPEN_ACK` or `OPEN_ERR` |
 | `OPEN` naming a pending catalog | `OPEN_PENDING {ns, message}` now and every `open_pending_interval_ms`, then `OPEN_ACK` on `n6k_serve_open_ready` or `OPEN_ERR` on `n6k_serve_open_failed` |
 | `OPEN` naming a pending catalog that failed | `OPEN_ERR {ns}` with the host's reason |
 | `OPEN` for an `ns` already open or pending | `OPEN_ERR {ns}` — duplicate |
@@ -259,9 +358,11 @@ default session.
   `[4-byte big-endian length][1-byte type][payload]`, where the length counts the
   payload bytes. Type `0x02` (`STREAM_FRAME_N6K`) is an n6k frame (msgpack header + optional Arrow
   body), `0x01` (`STREAM_FRAME_JSONRPC`) a JSON-RPC message; any other type closes the connection. The
-  values are the WebSocket binary/text opcodes. `0x03` (`STREAM_FRAME_HOST`) flows
-  only from `n6k_serve_fd` to its host, never to a client: a JSON host event
-  (`{"resolve": name}`). A WebSocket supplies message
+  values are the WebSocket binary/text opcodes. `0x04` (`STREAM_FRAME_CLOSE`) flows
+  only from a Unix-socket serve (`n6k_serve_fd`, `n6k_serve_socket`) to its peer, never
+  the other way: msgpack `{code, reason}`,
+  the WebSocket close the host performs; it is the last frame. A `HELLO` the serve cannot
+  read or accept gets `HELLO_ERR` and a write shutdown instead, with no `CLOSE`. A WebSocket supplies message
   boundaries and types for free; a raw stream socket needs this header. This is the same
   "transport owns length-framing" convention used by the
   [native `wsFd` attach path](n6k-network.md#attaching-an-existing-socket-fd-native)
@@ -269,12 +370,7 @@ default session.
   socket and a real WebSocket unchanged — which is what `n6k_server.pump` does for
   `n6k_serve_fd`. Over `n6k_serve_http` there is no prefix: one binary message is
   one frame.
-- **Handshake.** The client's first frame is `HELLO {token, protocol_version,
-  capabilities}`. `n6k_serve_socket` and `n6k_serve_http` read it themselves,
-  ignore the token, and send `HELLO_ACK {protocol_version, capabilities}`. With
-  `n6k_serve_fd` the host reads it first via `n6k_handshake` and either rejects
-  (sends `n6k_reject`'s frame) or sends `n6k_hello_ack`'s frame and calls
-  `n6k_serve_fd(..., hello_acked => true)`. Each
+- **Handshake.** See [Host callbacks](#host-callbacks). Each
   `OPEN` then gets an `OPEN_ACK {ns, ..., capabilities}` — see
   [Sessions](#sessions-ns).
 
@@ -291,13 +387,20 @@ three roles:
   the serve loop even against an idle peer. The session table is **reader-owned**:
   nothing else reads or writes it, which is why it needs no lock;
 - a **writer thread** serializes all outbound frames onto the socket so frames
-  never interleave;
-- one **worker thread per in-flight `(ns, req_id)`**, each with its own DuckDB
-  `Connection` (connections aren't thread-safe), its own credit counter, and a
-  cancel flag. A worker gets a *copy* of its session's `{ns, catalog}`, so it
-  never reaches back into the reader's table and survives its session being
-  closed mid-request. Shutdown drains workers (each closes its `Connection`)
-  before the `CALL` returns.
+  never interleave, and sends the keepalive `FT_PING` `ping_interval_ms` after the previous
+  one, or once the queue drains if it is not empty then; outbound traffic does not reset the
+  interval. Past `MAX_QUEUED_OUT_BYTES` queued for a client that is not reading, it drops
+  the queue and closes the connection with 1008;
+- up to **`workers` worker threads**, started only as the queue needs them, running admitted
+  `(ns, req_id)`s in arrival order. Each request gets its own DuckDB `Connection`
+  (connections aren't thread-safe), its own credit counter, and a cancel flag. A request
+  carries a *copy* of its session's `{ns, catalog}`, so it never reaches back into the
+  reader's table and survives its session being closed mid-request. A stream out of
+  credit **parks**: it leaves its worker and holds no thread until `FT_CREDIT` (or a
+  cancel) queues it again, and one that could keep sending yields between frames while
+  another request waits. A read in a pinned transaction is materialized, so it releases
+  the transaction before it streams. Shutdown drains requests (each closes its
+  `Connection`) and joins the workers before the `CALL` returns.
 
 ## Op coverage
 
@@ -389,12 +492,10 @@ name; see its docstring.
 - **RPC** (`RPC_SCALAR`/`RPC_TABLE`) resolution: `ResolveRpcTarget`
   (`src/n6k_server/request_handlers.cpp`). What is callable is whatever the host
   put in the database.
-- **Auth** is the host's job and only on the `n6k_serve_fd` path: the host reads
-  the token with `n6k_handshake`, decides what that identity may see, and either
-  sends `n6k_reject`'s frame or attaches those catalogs, sends `n6k_hello_ack`'s
-  frame and calls `n6k_serve_fd`.
-  `n6k_serve_socket` and `n6k_serve_http` are unauthenticated — the local socket
-  is trusted.
+- **Auth** is the host's job, through the `authenticate` callback on `n6k_serve_fd`,
+  `n6k_serve_http` and `n6k_serve_ws`: it gets the token, decides what that identity
+  may see, attaches it, and returns the catalogs or a reject.
+  `n6k_serve_socket` is unauthenticated — the local socket is trusted.
 - **`QUERY`** is raw passthrough SQL and is *not* catalog-qualified, so a query
   could reach another attached catalog. Every other
   op qualifies as `"catalog"."schema"."table"` and so stays inside its session,
@@ -407,7 +508,8 @@ name; see its docstring.
 ## Testing
 
 - **Integration:** `integration_tests/test_reactor_wire.py` (`n6k_serve_fd`),
-  `integration_tests/test_n6k_serve_http.py`, `integration_tests/test_n6k_serve_listen.py`.
+  `integration_tests/test_n6k_serve_http.py`, `integration_tests/test_n6k_serve_ws.py`,
+  `integration_tests/test_n6k_serve_listen.py`.
 - **Binder contract:** `test/sql/n6k_server.test` covers bind-time errors only —
   the serving path can't go in sqllogictest because the scan blocks until
   interrupted. Note there is deliberately no `CALL n6k_serve_socket()` or
@@ -423,10 +525,10 @@ name; see its docstring.
 Built alongside `n6k_client` via the root `extension_config.cmake` (platform conditions there).
 The extension links `duckdb_yyjson` and compiles the vendored nanoarrow sources
 (for Arrow IPC encode/decode). Native builds additionally compile in the vendored
-ixwebsocket objects for `n6k_serve_http`, which forces an OpenSSL link even though
+ixwebsocket objects for `n6k_serve_http` and `n6k_serve_ws`, which forces an OpenSSL link even though
 the listener only speaks plain `ws://` — the vendored library is built with
 `IXWEBSOCKET_USE_TLS`/`IXWEBSOCKET_USE_OPEN_SSL`. A wasm build defines neither
-`N6K_SERVER_WITH_WS` nor `n6k_serve_http` and keeps only the Unix-socket form.
+`N6K_SERVER_WITH_WS` nor `n6k_serve_http` / `n6k_serve_ws` and keeps only the Unix-socket forms.
 Source lives in `src/n6k_server/` (`README.md` there is the implementation
 reference).
 

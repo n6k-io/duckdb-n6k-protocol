@@ -32,6 +32,8 @@ void WsServeTransport::CloseInbound() {
 		closed_ = true;
 	}
 	cv_.notify_all();
+	std::lock_guard<std::mutex> lk(send_mu_);
+	send_closed_ = true;
 }
 
 bool WsServeTransport::WaitReadable(int timeout_ms) {
@@ -73,21 +75,29 @@ FrameRead WsServeTransport::ReadFrameBy(std::string &out, StreamFrameType &type,
 }
 
 void WsServeTransport::WriteFrame(StreamFrameType type, const std::string &frame) {
+	std::lock_guard<std::mutex> lk(send_mu_);
+	if (send_closed_) {
+		throw IOException("n6k_server: the client's WebSocket is closed");
+	}
 	auto sent = type == StreamFrameType::JSONRPC ? ws_.sendUtf8Text(frame) : ws_.sendBinary(frame);
 	if (!sent.success) {
-		throw IOException("n6k_serve_http: sending a %llu byte frame to the client failed",
+		throw IOException("n6k_server: sending a %llu byte frame to the client failed",
 		                  static_cast<uint64_t>(frame.size()));
 	}
 }
 
 void WsServeTransport::ShutdownWrite() {
-	{
-		std::lock_guard<std::mutex> lk(mu_);
-		if (closed_) {
-			return;
-		}
+	std::lock_guard<std::mutex> lk(send_mu_);
+	if (!send_closed_) {
+		ws_.close();
 	}
-	ws_.close();
+}
+
+void WsServeTransport::SendClose(int code, const std::string &reason) {
+	std::lock_guard<std::mutex> lk(send_mu_);
+	if (!send_closed_) {
+		ws_.close(static_cast<uint16_t>(code), reason);
+	}
 }
 
 } // namespace n6k

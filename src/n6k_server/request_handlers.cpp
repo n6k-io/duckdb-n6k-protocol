@@ -59,8 +59,8 @@ void SendError(ServeReactor &reactor, const FrameTarget &target, const std::stri
 	reactor.SendFrame(PackErr(target, type, message, retriable));
 }
 
-static void HandleSchemaList(ServeReactor &reactor, Connection &conn, const std::string &catalog,
-                             const FrameTarget &target) {
+static void HandleSchemaList(ServeReactor &reactor, Connection &conn, const std::string &catalog, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	vector<string> schemas;
 	// Direct catalog introspection needs an active transaction (unlike SendQuery).
 	conn.context->RunFunctionInTransaction([&]() {
@@ -68,8 +68,8 @@ static void HandleSchemaList(ServeReactor &reactor, Connection &conn, const std:
 		ListCatalogSchemas(*conn.context, cat, schemas);
 	});
 
-	reactor.SendFrame(PackSchemasChunk(target, schemas));
-	reactor.SendFrame(PackRespEnd(target));
+	reactor.SendForRequest(slot, PackSchemasChunk(target, schemas));
+	reactor.EndRequest(slot, PackRespEnd(target));
 }
 
 static void PackStrings(msgpack::packer<msgpack::sbuffer> &pk, const vector<string> &strings) {
@@ -111,6 +111,15 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 }
 
 struct TxnScope {
+	TxnScope() = default;
+	TxnScope(TxnScope &&) = default;
+	TxnScope &operator=(TxnScope &&) = default;
+	~TxnScope() {
+		if (pinned) {
+			pinned->Touch();
+		}
+	}
+
 	std::shared_ptr<PinnedTxn> pinned;
 	std::unique_lock<std::mutex> guard;
 	Connection *conn = nullptr;
@@ -141,7 +150,8 @@ static TxnScope ConnectionFor(ServeReactor &reactor, Connection &own, const Sess
 }
 
 static void HandleTablesList(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                             size_t body_len, const FrameTarget &target) {
+                             size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	string schema_filter_str;
 	bool has_filter = false;
 	JsonDoc doc(body, body_len);
@@ -172,8 +182,8 @@ static void HandleTablesList(ServeReactor &reactor, Connection &own, const Sessi
 		CollectCatalogPermissions(*conn.context, cat, schema_filter, nullptr, rows);
 		CollectSchemaPermissions(*conn.context, cat, schema_filter, schemas);
 	});
-	reactor.SendFrame(PackTablesChunk(target, rows, schemas));
-	reactor.SendFrame(PackRespEnd(target));
+	reactor.SendForRequest(slot, PackTablesChunk(target, rows, schemas));
+	reactor.EndRequest(slot, PackRespEnd(target));
 }
 
 // Per-request cap on rows per RESP_CHUNK; 0 leaves batching to DuckDB.
@@ -186,70 +196,122 @@ static idx_t RequestedBatchRows(duckdb_yyjson::yyjson_val *root) {
 	return static_cast<idx_t>(JsonGetUint(root, "_batch_rows", 0));
 }
 
-static bool SendRowsAsCreditedFrames(ServeReactor &reactor, ArrowIpcStreamEncoder &enc, const FrameTarget &target,
-                                     RequestSlot &slot, DataChunk &chunk, idx_t batch_rows) {
-	if (batch_rows == 0 || chunk.size() <= batch_rows) {
-		if (!reactor.AcquireCredit(slot)) {
-			return false;
-		}
-		reactor.SendFrame(PackRespChunkArrow(target, enc.EncodeChunk(chunk)));
-		return true;
+// A query result sent as credited Arrow chunks, one frame at a time, so it can park between any two frames.
+class SqlResultStream final : public ParkedStream {
+public:
+	SqlResultStream(std::unique_ptr<Connection> conn_p, const FrameTarget &target, idx_t batch_rows)
+	    : conn(std::move(conn_p)), target_(target), batch_rows_(batch_rows) {
 	}
-	// A real copy at ordinary vector capacity: slicing `chunk` as a view hands the Arrow encoder
-	// dictionary vectors borrowing the parent's buffers, and sizing the destination to `batch_rows`
-	// gives it a capacity of 1 or 2 — the encoder survives neither.
-	//
-	// DataChunk::Copy takes the range as [offset, source_count) over `sel` and requires the
-	// destination empty and flat, hence the Reset each round.
-	SelectionVector sel(chunk.size());
-	for (idx_t i = 0; i < chunk.size(); i++) {
-		sel.set_index(i, i);
-	}
-	DataChunk slice;
-	slice.Initialize(Allocator::DefaultAllocator(), chunk.GetTypes());
-	for (idx_t offset = 0; offset < chunk.size(); offset += batch_rows) {
-		const idx_t end = MinValue<idx_t>(offset + batch_rows, chunk.size());
-		slice.Reset();
-		chunk.Copy(slice, sel, end, offset);
-		if (!reactor.AcquireCredit(slot)) {
-			return false;
-		}
-		reactor.SendFrame(PackRespChunkArrow(target, enc.EncodeChunk(slice)));
-	}
-	return true;
-}
 
-static void StreamResult(ServeReactor &reactor, QueryResult &result, ClientContext &context, const FrameTarget &target,
-                         RequestSlot &slot, idx_t batch_rows = 0) {
-	if (result.HasError()) {
-		result.ThrowError();
-	}
-	ArrowIpcStreamEncoder enc(context, result.types, result.names);
-	reactor.SendFrame(PackRespSchema(target, enc.SchemaMessage()));
-	bool cancelled = false;
-	while (auto chunk = result.Fetch()) {
-		if (chunk->size() == 0) {
-			continue;
+	void Start(ServeReactor &reactor, RequestSlot &slot, unique_ptr<QueryResult> result) {
+		if (result->HasError()) {
+			result->ThrowError();
 		}
-		if (!SendRowsAsCreditedFrames(reactor, enc, target, slot, *chunk, batch_rows)) {
-			cancelled = true;
-			break;
+		result_ = std::move(result);
+		enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, result_->types, result_->names);
+		reactor.SendForRequest(slot, PackRespSchema(target_, enc_->SchemaMessage()));
+	}
+
+	PumpResult Pump(ServeReactor &reactor, RequestSlot &slot) override {
+		while (true) {
+			if (!chunk_) {
+				chunk_ = result_->Fetch();
+				if (!chunk_) {
+					auto eos = enc_->TakeEndOfStreamMessage();
+					if (!eos.empty()) {
+						reactor.SendForRequest(slot, PackRespChunkArrow(target_, eos));
+					}
+					reactor.EndRequest(slot, PackRespEndRowcountNull(target_));
+					return PumpResult::DONE;
+				}
+				offset_ = 0;
+				if (chunk_->size() == 0) {
+					chunk_.reset();
+					continue;
+				}
+			}
+			switch (reactor.TryAcquireCredit(slot)) {
+			case ServeReactor::CreditResult::STOPPED:
+				Cancel(reactor, slot);
+				return PumpResult::DONE;
+			case ServeReactor::CreditResult::EMPTY:
+				return PumpResult::PARKED;
+			case ServeReactor::CreditResult::TAKEN:
+				break;
+			}
+			SendNextFrame(reactor, slot);
+			if (reactor.HasWaitingRequests()) {
+				return PumpResult::YIELD;
+			}
 		}
 	}
-	if (cancelled) {
-		reactor.SendFrame(PackRespEndCancelled(target));
-		return;
+
+	void Cancel(ServeReactor &reactor, RequestSlot &slot) override {
+		reactor.EndRequest(slot, PackRespEndCancelled(target_));
 	}
-	auto eos = enc.TakeEndOfStreamMessage();
-	if (!eos.empty()) {
-		reactor.SendFrame(PackRespChunkArrow(target, eos));
+
+	// Declared before `enc_`, which holds a reference to its context.
+	std::unique_ptr<Connection> conn;
+	// What the result may still read while it streams: the plan, and OP_RPC_TABLE's staged input. Declared
+	// before `result_` so they outlive it.
+	shared_ptr<Relation> rel;
+	std::string input;
+	InsertArrowBytes input_bytes {nullptr, 0};
+
+private:
+	void SendNextFrame(ServeReactor &reactor, RequestSlot &slot) {
+		auto &chunk = *chunk_;
+		if (batch_rows_ == 0 || chunk.size() <= batch_rows_) {
+			reactor.SendForRequest(slot, PackRespChunkArrow(target_, enc_->EncodeChunk(chunk)));
+			chunk_.reset();
+			return;
+		}
+		// A real copy at ordinary vector capacity: slicing `chunk` as a view hands the Arrow encoder
+		// dictionary vectors borrowing the parent's buffers, and sizing the destination to a small
+		// `batch_rows` gives it a tiny capacity — the encoder survives neither.
+		//
+		// DataChunk::Copy takes the range as [offset, source_count) over `sel` and requires the
+		// destination empty and flat, hence the Reset each round.
+		if (offset_ == 0) {
+			sel_.Initialize(chunk.size());
+			for (idx_t i = 0; i < chunk.size(); i++) {
+				sel_.set_index(i, i);
+			}
+			if (slice_.ColumnCount() == 0) {
+				slice_.Initialize(Allocator::DefaultAllocator(), chunk.GetTypes());
+			}
+		}
+		const idx_t end = MinValue<idx_t>(offset_ + batch_rows_, chunk.size());
+		slice_.Reset();
+		chunk.Copy(slice_, sel_, end, offset_);
+		reactor.SendForRequest(slot, PackRespChunkArrow(target_, enc_->EncodeChunk(slice_)));
+		offset_ = end;
+		if (offset_ >= chunk.size()) {
+			chunk_.reset();
+		}
 	}
-	reactor.SendFrame(PackRespEndRowcountNull(target));
+
+	FrameTarget target_;
+	idx_t batch_rows_;
+	unique_ptr<QueryResult> result_;
+	unique_ptr<ArrowIpcStreamEncoder> enc_;
+	unique_ptr<DataChunk> chunk_;
+	idx_t offset_ = 0;
+	SelectionVector sel_;
+	DataChunk slice_;
+};
+
+static std::unique_ptr<ParkedStream> StreamQuery(ServeReactor &reactor, std::unique_ptr<Connection> conn,
+                                                 const std::string &sql, RequestSlot &slot, idx_t batch_rows) {
+	const FrameTarget target {slot.ns, slot.req_id};
+	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(conn), target, batch_rows));
+	stream->Start(reactor, slot, stream->conn->SendQuery(sql));
+	return std::move(stream);
 }
 
 // Raw passthrough SQL: not catalog-qualified, so it can reach other catalogs.
-static void HandleQuery(ServeReactor &reactor, Connection &conn, const char *body, size_t body_len,
-                        const FrameTarget &target, RequestSlot &slot) {
+static std::unique_ptr<ParkedStream> HandleQuery(ServeReactor &reactor, std::unique_ptr<Connection> &conn,
+                                                 const char *body, size_t body_len, RequestSlot &slot) {
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_QUERY body is not valid JSON");
@@ -259,9 +321,7 @@ static void HandleQuery(ServeReactor &reactor, Connection &conn, const char *bod
 	if (sql.empty()) {
 		throw InvalidInputException("n6k_server: OP_QUERY requires a \"sql\" field");
 	}
-	const auto batch_rows = RequestedBatchRows(root);
-	auto result = conn.SendQuery(sql);
-	StreamResult(reactor, *result, *conn.context, target, slot, batch_rows);
+	return StreamQuery(reactor, std::move(conn), sql, slot, RequestedBatchRows(root));
 }
 
 static SubstraitCatalogCheck PlanCatalogCheck(ServeReactor &reactor, RequestSlot &slot) {
@@ -270,8 +330,10 @@ static SubstraitCatalogCheck PlanCatalogCheck(ServeReactor &reactor, RequestSlot
 	};
 }
 
-static void HandleReadPlan(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                           size_t body_len, const FrameTarget &target, RequestSlot &slot) {
+static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::unique_ptr<Connection> &own,
+                                                    const SessionRef &sess, const char *body, size_t body_len,
+                                                    RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_READ_PLAN body is not valid JSON");
@@ -282,19 +344,30 @@ static void HandleReadPlan(ServeReactor &reactor, Connection &own, const Session
 		throw InvalidInputException("n6k_server: OP_READ_PLAN requires a \"plan\" field");
 	}
 	const auto batch_rows = RequestedBatchRows(root);
-	auto scope = ConnectionFor(reactor, own, sess, root);
+	auto scope = ConnectionFor(reactor, *own, sess, root);
 	auto &conn = *scope.conn;
 	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, "", PlanCatalogCheck(reactor, slot));
 	auto result = conn.context->Query(make_uniq<RelationStatement>(rel), QueryParameters(!scope.pinned));
-	StreamResult(reactor, *result, *conn.context, target, slot, batch_rows);
+	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(own), target, batch_rows));
+	if (scope.pinned) {
+		// Materialized, so the rows no longer need the transaction's Connection: a slow reader must not
+		// hold its commit back.
+		scope.guard.unlock();
+	} else {
+		stream->rel = rel;
+	}
+	stream->Start(reactor, slot, std::move(result));
+	return std::move(stream);
 }
 
-static void HandleTxnBegin(ServeReactor &reactor, const SessionRef &sess, const FrameTarget &target) {
-	reactor.SendFrame(PackRespEndTxn(target, reactor.BeginTxn(sess.ns)));
+static void HandleTxnBegin(ServeReactor &reactor, const SessionRef &sess, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
+	reactor.EndRequest(slot, PackRespEndTxn(target, reactor.BeginTxn(slot)));
 }
 
 static void HandleTxnEnd(ServeReactor &reactor, const SessionRef &sess, const char *body, size_t body_len,
-                         const FrameTarget &target, bool commit) {
+                         RequestSlot &slot, bool commit) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: transaction body is not valid JSON");
@@ -315,11 +388,12 @@ static void HandleTxnEnd(ServeReactor &reactor, const SessionRef &sess, const ch
 		pinned->conn->Rollback();
 	}
 	pinned->conn.reset();
-	reactor.SendFrame(PackRespEndOk(target));
+	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
 static void HandleTableSchema(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                              size_t body_len, const FrameTarget &target) {
+                              size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_TABLE_SCHEMA body is not valid JSON");
@@ -337,13 +411,13 @@ static void HandleTableSchema(ServeReactor &reactor, Connection &own, const Sess
 		result->ThrowError();
 	}
 	ArrowIpcStreamEncoder enc(*conn.context, result->types, result->names);
-	reactor.SendFrame(PackRespSchema(target, enc.SchemaMessage()));
-	reactor.SendFrame(PackRespEnd(target));
+	reactor.SendForRequest(slot, PackRespSchema(target, enc.SchemaMessage()));
+	reactor.EndRequest(slot, PackRespEnd(target));
 }
 
 // The result's first cell is the affected-row count (absent → 0).
-static void HandleExec(ServeReactor &reactor, Connection &conn, const char *body, size_t body_len,
-                       const FrameTarget &target) {
+static void HandleExec(ServeReactor &reactor, Connection &conn, const char *body, size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_EXEC body is not valid JSON");
@@ -363,11 +437,12 @@ static void HandleExec(ServeReactor &reactor, Connection &conn, const char *body
 			rowcount = value.GetValue<int64_t>();
 		}
 	}
-	reactor.SendFrame(PackRespEndRowcount(target, rowcount));
+	reactor.EndRequest(slot, PackRespEndRowcount(target, rowcount));
 }
 
 static void HandleCreateTable(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
-                              size_t body_len, const FrameTarget &target) {
+                              size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	using namespace duckdb_yyjson; // NOLINT
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
@@ -384,11 +459,12 @@ static void HandleCreateTable(ServeReactor &reactor, Connection &conn, const std
 	if (result->HasError()) {
 		result->ThrowError();
 	}
-	reactor.SendFrame(PackRespEndOk(target));
+	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
 static void HandleAlterTable(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
-                             size_t body_len, const FrameTarget &target) {
+                             size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_ALTER_TABLE body is not valid JSON");
@@ -405,7 +481,7 @@ static void HandleAlterTable(ServeReactor &reactor, Connection &conn, const std:
 	if (result->HasError()) {
 		result->ThrowError();
 	}
-	reactor.SendFrame(PackRespEndOk(target));
+	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
 static OnCreateConflict ViewOnConflict(const std::string &on_conflict) {
@@ -422,7 +498,8 @@ static OnCreateConflict ViewOnConflict(const std::string &on_conflict) {
 }
 
 static void HandleCreateView(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                             size_t body_len, const FrameTarget &target, RequestSlot &slot) {
+                             size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_CREATE_VIEW body is not valid JSON");
@@ -449,11 +526,12 @@ static void HandleCreateView(ServeReactor &reactor, Connection &own, const Sessi
 	if (result->HasError()) {
 		result->ThrowError();
 	}
-	reactor.SendFrame(PackRespEndOk(target));
+	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
 static void HandleDropView(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                           size_t body_len, const FrameTarget &target) {
+                           size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_DROP_VIEW body is not valid JSON");
@@ -478,11 +556,12 @@ static void HandleDropView(ServeReactor &reactor, Connection &own, const Session
 	if (result->HasError()) {
 		result->ThrowError();
 	}
-	reactor.SendFrame(PackRespEndOk(target));
+	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
 static void HandleInsert(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
-                         size_t body_len, const FrameTarget &target) {
+                         size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	auto *nl = static_cast<const char *>(memchr(body, '\n', body_len));
 	if (!nl) {
 		throw InvalidInputException("n6k_server: OP_INSERT body missing header newline");
@@ -507,7 +586,7 @@ static void HandleInsert(ServeReactor &reactor, Connection &conn, const std::str
 	auto rel = conn.TableFunction(N6K_INSERT_SCAN_FN, {Value::POINTER(reinterpret_cast<uintptr_t>(&bytes))});
 	rel->Insert(catalog, schema, table);
 
-	reactor.SendFrame(PackRespEndRowcount(target, rowcount));
+	reactor.EndRequest(slot, PackRespEndRowcount(target, rowcount));
 }
 
 static CrossingVerb WriteVerbOf(const std::string &verb) {
@@ -543,7 +622,8 @@ static idx_t WriteInTransaction(Connection &conn, bool pinned, const CrossingWri
 }
 
 static void HandleWritePlan(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                            size_t body_len, const FrameTarget &target, RequestSlot &slot) {
+                            size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	const std::string &catalog = sess.catalog;
 	auto *nl = static_cast<const char *>(memchr(body, '\n', body_len));
 	if (!nl) {
@@ -582,7 +662,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 		throw InvalidInputException("n6k_server: OP_WRITE_PLAN carries neither rows nor a plan");
 	}
 	auto rowcount = WriteInTransaction(conn, scope.pinned != nullptr, write, std::move(seam));
-	reactor.SendFrame(PackRespEndRowcount(target, NumericCast<int64_t>(rowcount)));
+	reactor.EndRequest(slot, PackRespEndRowcount(target, NumericCast<int64_t>(rowcount)));
 }
 
 // A generator in the host process, reached through three scalar UDFs it registered on the served
@@ -721,8 +801,8 @@ static std::string RpcArgsJson(duckdb_yyjson::yyjson_val *args) {
 // Closing runs the host generator's own `finally`, so a subscription unsubscribes when the client
 // cancels or the query errors rather than whenever the host's GC gets to it.
 struct RpcStreamCloser {
-	RpcStreamCloser(Connection &conn, const std::string &close_udf, std::string handle)
-	    : conn(conn), close_udf(close_udf), handle(std::move(handle)) {
+	RpcStreamCloser(Connection &conn, std::string close_udf, std::string handle)
+	    : conn(conn), close_udf(std::move(close_udf)), handle(std::move(handle)) {
 	}
 
 	~RpcStreamCloser() {
@@ -753,7 +833,7 @@ struct RpcStreamCloser {
 	}
 
 	Connection &conn;
-	const std::string &close_udf;
+	std::string close_udf;
 	std::string handle;
 	bool closed = false;
 };
@@ -763,18 +843,92 @@ struct RpcStreamCloser {
 //
 // Pull a batch, THEN wait for credit, so a generator that paces itself in wall-clock time keeps its
 // cadence instead of starting its next interval only once the client's credit arrives.
-//
+class HostRpcStream final : public ParkedStream {
+public:
+	HostRpcStream(std::unique_ptr<Connection> conn, const StreamFunctionInfo &rpc, const std::string &handle,
+	              const FrameTarget &target)
+	    : conn_(std::move(conn)), next_udf_(rpc.next_udf), handle_(handle), target_(target),
+	      closer_(*conn_, rpc.close_udf, handle) {
+	}
+
+	void Start(ServeReactor &reactor, RequestSlot &slot, const std::string &schema_message) {
+		reactor.SendForRequest(slot, PackRespSchema(target_, schema_message));
+		next_stmt_ = conn_->Prepare("SELECT " + QuoteIdent(next_udf_) + "(?)");
+		if (next_stmt_->HasError()) {
+			next_stmt_->GetErrorObject().Throw("n6k_server: RPC next function \"" + next_udf_ + "\" is unusable: ");
+		}
+	}
+
+	PumpResult Pump(ServeReactor &reactor, RequestSlot &slot) override {
+		while (true) {
+			if (!has_batch_) {
+				vector<Value> next_params;
+				next_params.emplace_back(handle_);
+				auto next_result = next_stmt_->Execute(next_params);
+				if (next_result->HasError()) {
+					next_result->ThrowError();
+				}
+				auto chunk = next_result->Fetch();
+				if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).IsNull()) {
+					auto trailing = closer_.CloseAndTakeTrailingBytes();
+					if (!trailing.empty()) {
+						reactor.SendForRequest(slot, PackRespChunkArrow(target_, trailing));
+					}
+					reactor.EndRequest(slot, PackRespEndRowcountNull(target_));
+					return PumpResult::DONE;
+				}
+				batch_ = chunk->GetValue(0, 0);
+				has_batch_ = true;
+			}
+			switch (reactor.TryAcquireCredit(slot)) {
+			case ServeReactor::CreditResult::STOPPED:
+				Cancel(reactor, slot);
+				return PumpResult::DONE;
+			case ServeReactor::CreditResult::EMPTY:
+				return PumpResult::PARKED;
+			case ServeReactor::CreditResult::TAKEN:
+				break;
+			}
+			reactor.SendForRequest(slot, PackRespChunkArrow(target_, StringValue::Get(batch_)));
+			has_batch_ = false;
+			batch_ = Value();
+			if (reactor.HasWaitingRequests()) {
+				return PumpResult::YIELD;
+			}
+		}
+	}
+
+	// No trailing end-of-stream bytes on a cancelled stream.
+	void Cancel(ServeReactor &reactor, RequestSlot &slot) override {
+		closer_.CloseAndTakeTrailingBytes();
+		reactor.EndRequest(slot, PackRespEndCancelled(target_));
+	}
+
+private:
+	// In this order so the closer runs before its statement and Connection go.
+	std::unique_ptr<Connection> conn_;
+	std::string next_udf_;
+	std::string handle_;
+	FrameTarget target_;
+	unique_ptr<PreparedStatement> next_stmt_;
+	Value batch_;
+	bool has_batch_ = false;
+	RpcStreamCloser closer_;
+};
+
 // The catalog entry is only used to find the UDF names: binding it as SQL would decode the host's
 // Arrow blobs into vectors and immediately re-encode them, and would buffer where this does not.
-// `SELECT * FROM db.main.<name>(...)` takes the bound path instead, inside vcatprovider.
-static void HandleRpcStream(ServeReactor &reactor, Connection &conn, const StreamFunctionInfo &rpc,
-                            const std::string &function, const std::string &args_json, const uint8_t *input,
-                            size_t input_len, const FrameTarget &target, RequestSlot &slot) {
+// `SELECT * FROM db.<RPC_SCHEMA>.<name>(...)` takes the bound path instead, inside vcatprovider.
+static std::unique_ptr<ParkedStream> StartRpcStream(ServeReactor &reactor, std::unique_ptr<Connection> conn,
+                                                    const StreamFunctionInfo &rpc, const std::string &function,
+                                                    const std::string &args_json, const uint8_t *input,
+                                                    size_t input_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	// Only ever a bound parameter, so a counter suffices to keep concurrent calls apart.
 	static std::atomic<uint64_t> handle_counter {0};
 	const std::string handle = "h" + std::to_string(handle_counter.fetch_add(1) + 1);
 
-	auto open_stmt = conn.Prepare("SELECT " + QuoteIdent(rpc.open_udf) + "(?, ?, ?, ?)");
+	auto open_stmt = conn->Prepare("SELECT " + QuoteIdent(rpc.open_udf) + "(?, ?, ?, ?)");
 	if (open_stmt->HasError()) {
 		open_stmt->GetErrorObject().Throw("n6k_server: RPC open function \"" + rpc.open_udf + "\" is unusable: ");
 	}
@@ -800,61 +954,23 @@ static void HandleRpcStream(ServeReactor &reactor, Connection &conn, const Strea
 		throw IOException("n6k_server: RPC \"%s\" returned no Arrow schema when opened", function);
 	}
 	// Opened, so the generator exists and must be closed on every path out of here.
-	RpcStreamCloser closer(conn, rpc.close_udf, handle);
+	std::unique_ptr<HostRpcStream> stream(new HostRpcStream(std::move(conn), rpc, handle, target));
 	const auto &schema_message = StringValue::Get(schema_value);
 	// Empty is rejected rather than forwarded: RESP_SCHEMA is what tells the client how to read
 	// every chunk that follows, and an empty one fails later and further away.
 	if (schema_message.empty()) {
 		throw IOException("n6k_server: RPC \"%s\" returned an empty Arrow schema when opened", function);
 	}
-	reactor.SendFrame(PackRespSchema(target, schema_message));
-
-	auto next_stmt = conn.Prepare("SELECT " + QuoteIdent(rpc.next_udf) + "(?)");
-	if (next_stmt->HasError()) {
-		next_stmt->GetErrorObject().Throw("n6k_server: RPC next function \"" + rpc.next_udf + "\" is unusable: ");
-	}
-
-	bool cancelled = false;
-	for (;;) {
-		vector<Value> next_params;
-		next_params.emplace_back(handle);
-		auto next_result = next_stmt->Execute(next_params);
-		if (next_result->HasError()) {
-			next_result->ThrowError();
-		}
-		auto chunk = next_result->Fetch();
-		if (!chunk || chunk->size() == 0) {
-			break;
-		}
-		auto batch = chunk->GetValue(0, 0);
-		// NULL is how the host says the generator is exhausted; there is no separate end signal.
-		if (batch.IsNull()) {
-			break;
-		}
-		if (!reactor.AcquireCredit(slot)) {
-			cancelled = true;
-			break;
-		}
-		reactor.SendFrame(PackRespChunkArrow(target, StringValue::Get(batch)));
-	}
-
-	auto trailing = closer.CloseAndTakeTrailingBytes();
-	if (cancelled) {
-		// No trailing marker on a cancelled stream, matching what a cancelled SQL result sends.
-		reactor.SendFrame(PackRespEndCancelled(target));
-		return;
-	}
-	if (!trailing.empty()) {
-		reactor.SendFrame(PackRespChunkArrow(target, trailing));
-	}
-	reactor.SendFrame(PackRespEndRowcountNull(target));
+	stream->Start(reactor, slot, schema_message);
+	return std::move(stream);
 }
 
 // "Scalar" describes the ARGUMENTS, not the return: both RPC ops answer with an Arrow stream. The
 // name resolves through ordinary DuckDB resolution rather than a registry, so what is callable is
 // whatever the host put in the served catalog or registered on the instance.
-static void HandleRpcScalar(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
-                            size_t body_len, const FrameTarget &target, RequestSlot &slot) {
+static std::unique_ptr<ParkedStream> HandleRpcScalar(ServeReactor &reactor, std::unique_ptr<Connection> &conn,
+                                                     const std::string &catalog, const char *body, size_t body_len,
+                                                     RequestSlot &slot) {
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_RPC_SCALAR body is not valid JSON");
@@ -864,25 +980,26 @@ static void HandleRpcScalar(ServeReactor &reactor, Connection &conn, const std::
 	if (function.empty()) {
 		throw InvalidInputException("n6k_server: OP_RPC_SCALAR requires a \"function\" field");
 	}
-	auto rpc = ResolveRpcTarget(conn, catalog, RPC_SCHEMA, function);
+	auto rpc = ResolveRpcTarget(*conn, catalog, RPC_SCHEMA, function);
 	if (rpc.stream) {
-		HandleRpcStream(reactor, conn, *rpc.stream, function, RpcArgsJson(duckdb_yyjson::yyjson_obj_get(root, "args")),
-		                nullptr, 0, target, slot);
-		return;
+		return StartRpcStream(reactor, std::move(conn), *rpc.stream, function,
+		                      RpcArgsJson(duckdb_yyjson::yyjson_obj_get(root, "args")), nullptr, 0, slot);
 	}
 	auto sql = BuildRpcCallSql(rpc.catalog, RPC_SCHEMA, function, duckdb_yyjson::yyjson_obj_get(root, "args"));
-	const auto batch_rows = RequestedBatchRows(root);
-	auto result = conn.SendQuery(sql);
-	StreamResult(reactor, *result, *conn.context, target, slot, batch_rows);
+	return StreamQuery(reactor, std::move(conn), sql, slot, RequestedBatchRows(root));
 }
 
 // Like RPC_SCALAR, plus a table of rows pushed in the request body.
 //
 // The rows arrive as Arrow IPC after the header's newline exactly as OP_INSERT's do, so they are
 // staged through the same private scan function and exposed as a temp view. Every request builds
-// its own Connection and therefore its own temp catalog, so the fixed name cannot collide.
-static void HandleRpcTable(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
-                           size_t body_len, const FrameTarget &target, RequestSlot &slot) {
+// its own Connection and therefore its own temp catalog, so the fixed name cannot collide. The view
+// scans the rows while the result streams, so the stream owns a copy: the request body is gone once
+// it parks.
+static std::unique_ptr<ParkedStream> HandleRpcTable(ServeReactor &reactor, std::unique_ptr<Connection> &conn,
+                                                    const std::string &catalog, const char *body, size_t body_len,
+                                                    RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
 	auto *nl = static_cast<const char *>(memchr(body, '\n', body_len));
 	if (!nl) {
 		throw InvalidInputException("n6k_server: OP_RPC_TABLE body missing header newline");
@@ -903,86 +1020,85 @@ static void HandleRpcTable(ServeReactor &reactor, Connection &conn, const std::s
 
 	// Resolved before the rows are staged: a host stream takes the Arrow bytes as they arrived, so
 	// building a view it would only read back would be pure cost.
-	auto rpc = ResolveRpcTarget(conn, catalog, RPC_SCHEMA, function);
+	auto rpc = ResolveRpcTarget(*conn, catalog, RPC_SCHEMA, function);
 	if (rpc.stream) {
-		HandleRpcStream(reactor, conn, *rpc.stream, function, RpcArgsJson(duckdb_yyjson::yyjson_obj_get(root, "args")),
-		                arrow, arrow_len, target, slot);
-		return;
+		return StartRpcStream(reactor, std::move(conn), *rpc.stream, function,
+		                      RpcArgsJson(duckdb_yyjson::yyjson_obj_get(root, "args")), arrow, arrow_len, slot);
 	}
 
-	InsertArrowBytes bytes {arrow, arrow_len};
-	auto rel = conn.TableFunction(N6K_INSERT_SCAN_FN, {Value::POINTER(reinterpret_cast<uintptr_t>(&bytes))});
+	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(conn), target, RequestedBatchRows(root)));
+	stream->input.assign(reinterpret_cast<const char *>(arrow), arrow_len);
+	stream->input_bytes = InsertArrowBytes {reinterpret_cast<const uint8_t *>(stream->input.data()), arrow_len};
+	auto rel = stream->conn->TableFunction(N6K_INSERT_SCAN_FN,
+	                                       {Value::POINTER(reinterpret_cast<uintptr_t>(&stream->input_bytes))});
 	rel->CreateView(RPC_INPUT_VIEW, /*replace=*/true, /*temporary=*/true);
 
 	const std::string table_arg = rpc.takes_table_arg ? "(SELECT * FROM " + QuoteIdent(RPC_INPUT_VIEW) + ")"
 	                                                  : "'" + std::string(RPC_INPUT_VIEW) + "'";
 	auto sql =
 	    BuildRpcCallSql(rpc.catalog, RPC_SCHEMA, function, duckdb_yyjson::yyjson_obj_get(root, "args"), table_arg);
-	const auto batch_rows = RequestedBatchRows(root);
-	auto result = conn.SendQuery(sql);
-	StreamResult(reactor, *result, *conn.context, target, slot, batch_rows);
+	stream->Start(reactor, slot, stream->conn->SendQuery(sql));
+	return std::move(stream);
 }
 
-void HandleRequest(ServeReactor &reactor, Connection &conn, const SessionRef &sess, uint8_t op, const char *body,
-                   size_t body_len, uint32_t req_id, RequestSlot &slot) {
-	const FrameTarget target {sess.ns, req_id};
+std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_ptr<Connection> &own,
+                                            const SessionRef &sess, uint8_t op, const char *body, size_t body_len,
+                                            RequestSlot &slot) {
 	const std::string &catalog = sess.catalog;
+	auto &conn = *own;
 	switch (op) {
 	case OP_SCHEMA_LIST:
-		HandleSchemaList(reactor, conn, catalog, target);
+		HandleSchemaList(reactor, conn, catalog, slot);
 		break;
 	case OP_TABLES_LIST:
-		HandleTablesList(reactor, conn, sess, body, body_len, target);
+		HandleTablesList(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_TABLE_SCHEMA:
-		HandleTableSchema(reactor, conn, sess, body, body_len, target);
+		HandleTableSchema(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_QUERY:
-		HandleQuery(reactor, conn, body, body_len, target, slot);
-		break;
+		return HandleQuery(reactor, own, body, body_len, slot);
 	case OP_READ_PLAN:
-		HandleReadPlan(reactor, conn, sess, body, body_len, target, slot);
-		break;
+		return HandleReadPlan(reactor, own, sess, body, body_len, slot);
 	case OP_WRITE_PLAN:
-		HandleWritePlan(reactor, conn, sess, body, body_len, target, slot);
+		HandleWritePlan(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_TXN_BEGIN:
-		HandleTxnBegin(reactor, sess, target);
+		HandleTxnBegin(reactor, sess, slot);
 		break;
 	case OP_TXN_COMMIT:
-		HandleTxnEnd(reactor, sess, body, body_len, target, true);
+		HandleTxnEnd(reactor, sess, body, body_len, slot, true);
 		break;
 	case OP_TXN_ROLLBACK:
-		HandleTxnEnd(reactor, sess, body, body_len, target, false);
+		HandleTxnEnd(reactor, sess, body, body_len, slot, false);
 		break;
 	case OP_INSERT:
-		HandleInsert(reactor, conn, catalog, body, body_len, target);
+		HandleInsert(reactor, conn, catalog, body, body_len, slot);
 		break;
 	case OP_EXEC:
-		HandleExec(reactor, conn, body, body_len, target);
+		HandleExec(reactor, conn, body, body_len, slot);
 		break;
 	case OP_CREATE_TABLE:
-		HandleCreateTable(reactor, conn, catalog, body, body_len, target);
+		HandleCreateTable(reactor, conn, catalog, body, body_len, slot);
 		break;
 	case OP_ALTER_TABLE:
-		HandleAlterTable(reactor, conn, catalog, body, body_len, target);
+		HandleAlterTable(reactor, conn, catalog, body, body_len, slot);
 		break;
 	case OP_CREATE_VIEW:
-		HandleCreateView(reactor, conn, sess, body, body_len, target, slot);
+		HandleCreateView(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_DROP_VIEW:
-		HandleDropView(reactor, conn, sess, body, body_len, target);
+		HandleDropView(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_RPC_SCALAR:
-		HandleRpcScalar(reactor, conn, catalog, body, body_len, target, slot);
-		break;
+		return HandleRpcScalar(reactor, own, catalog, body, body_len, slot);
 	case OP_RPC_TABLE:
-		HandleRpcTable(reactor, conn, catalog, body, body_len, target, slot);
-		break;
+		return HandleRpcTable(reactor, own, catalog, body, body_len, slot);
 	default:
 		// Unimplemented ops throw a typed FT_ERR rather than dropping the request.
 		throw NotImplementedException("n6k_server: op %d not implemented yet", static_cast<int>(op));
 	}
+	return nullptr;
 }
 
 } // namespace n6k

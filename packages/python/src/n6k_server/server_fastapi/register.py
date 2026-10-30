@@ -80,6 +80,8 @@ def register(
     mcp: Optional["MCPServer"] = None,
     max_text_inflight: Optional[int] = None,
     max_mcp_inflight: Optional[int] = 8,
+    workers: Optional[int] = None,
+    max_connections: Optional[int] = None,
 ) -> APIRouter:
     """Mount `<prefix>/ws` on `app` and return the router.
 
@@ -88,7 +90,9 @@ def register(
     `authenticate` as keyword arguments. `ping_interval_ms`: None leaves the keepalive to
     `$N6K_PING_INTERVAL` (seconds), 0 disables it. `max_text_inflight`: None sets no limit on text
     handlers running at once. `max_mcp_inflight`: MCP requests running at once per connection; past
-    it a request is answered "server busy". None sets no limit.
+    it a request is answered "server busy". None sets no limit. `workers`: as in
+    `serve_and_close_connection`. `max_connections`: WebSockets served at once
+    on this route; past it one is closed 1013 (try again later). None sets no limit.
     """
     if ping_interval_ms is not None and ping_interval_ms < 0:
         raise ValueError(f"ping_interval_ms must be None, 0 (disabled) or positive, got {ping_interval_ms}")
@@ -98,13 +102,23 @@ def register(
         raise ValueError(f"prefix must not end with '/' (FastAPI convention), got {prefix!r}")
     if max_text_inflight is not None and max_text_inflight <= 0:
         raise ValueError(f"max_text_inflight must be None (no limit) or positive, got {max_text_inflight}")
+    if workers is not None and workers <= 0:
+        raise ValueError(f"workers must be None (the extension's default) or positive, got {workers}")
+    if max_connections is not None and max_connections <= 0:
+        raise ValueError(f"max_connections must be None (no limit) or positive, got {max_connections}")
     _text_app(on_text, jsonrpc, mcp, max_mcp_inflight)
 
     router = APIRouter(prefix=prefix)
+    serving = 0
 
     @router.websocket("/ws")
     async def _ws(ws: WebSocket) -> None:
+        nonlocal serving
         await ws.accept()
+        if max_connections is not None and serving >= max_connections:
+            await _close(ws, 1013, "too many connections")
+            return
+        serving += 1
         started = time.perf_counter()
         params = {str(k): str(v) for k, v in ws.path_params.items()}
         logger.info("ws accept path=%s params=%s", ws.url.path, params)
@@ -123,6 +137,7 @@ def register(
                 mcp=mcp,
                 max_text_inflight=max_text_inflight,
                 max_mcp_inflight=max_mcp_inflight,
+                workers=workers,
             )
         except WsReject as reject:
             await _close(ws, reject.code, reject.reason)
@@ -132,6 +147,7 @@ def register(
             logger.exception("ws failed path=%s", ws.url.path)
             await _close(ws, 1011, str(exc))
         finally:
+            serving -= 1
             logger.info("ws close path=%s duration_ms=%.1f", ws.url.path, (time.perf_counter() - started) * 1000)
 
     app.include_router(router)
@@ -153,6 +169,7 @@ async def serve_ws(
     mcp: Optional["MCPServer"] = None,
     max_text_inflight: Optional[int] = None,
     max_mcp_inflight: Optional[int] = 8,
+    workers: Optional[int] = None,
 ) -> None:
     """Open the connection `connect` describes, authenticate and serve it, and let it clean up."""
     text_app = _text_app(on_text, jsonrpc, mcp, max_mcp_inflight)
@@ -173,6 +190,7 @@ async def serve_ws(
                 on_text=on_text,
                 text_app=text_app,
                 max_text_inflight=max_text_inflight,
+                workers=workers,
             )
         finally:
             # Resumes the generator past its `yield` so its `finally` runs. It must not
@@ -194,6 +212,7 @@ async def serve_ws(
         on_text=on_text,
         text_app=text_app,
         max_text_inflight=max_text_inflight,
+        workers=workers,
     )
 
 

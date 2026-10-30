@@ -1,5 +1,6 @@
 #include "uds_transport.hpp"
 
+#include "n6k_msgpack.hpp"
 #include "n6k_stream_framing.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -206,6 +207,18 @@ void UdsConnection::ShutdownWrite() {
 	if (fd_ >= 0) {
 		::shutdown(fd_, SHUT_WR);
 	}
+}
+
+void UdsConnection::SendClose(int code, const std::string &reason) {
+	msgpack::sbuffer sbuf;
+	msgpack::packer<msgpack::sbuffer> pk(&sbuf);
+	pk.pack_map(2);
+	pk.pack("code");
+	pk.pack(code);
+	pk.pack("reason");
+	pk.pack(reason);
+	WriteFrame(StreamFrameType::CLOSE, std::string(sbuf.data(), sbuf.size()));
+	ShutdownWrite();
 }
 
 void UdsConnection::CloseInbound() {

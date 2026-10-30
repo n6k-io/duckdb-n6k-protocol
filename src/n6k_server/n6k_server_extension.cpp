@@ -13,11 +13,11 @@ namespace duckdb {
 void N6kServerLoadInternal(ExtensionLoader &loader) {
 	RegisterN6kServeFunction(loader);
 	RegisterN6kServeFdFunction(loader);
-	RegisterN6kHandshakeFunctions(loader);
 	RegisterN6kServePushInvalidateFunction(loader);
 	RegisterN6kServeStatsFunction(loader);
 #ifdef N6K_SERVER_WITH_WS
 	RegisterN6kServeHttpFunction(loader);
+	RegisterN6kServeWsFunction(loader);
 #endif
 	n6k::RegisterInsertScanFunction(loader);
 	// The reactor maps its errors through this table (serve_reactor.cpp); registered here so a

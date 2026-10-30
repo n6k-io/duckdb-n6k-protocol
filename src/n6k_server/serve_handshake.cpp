@@ -28,17 +28,16 @@ HelloRequest ReadHello(ServeTransport &conn) {
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(HANDSHAKE_TIMEOUT_MS);
 	std::string frame;
 	StreamFrameType type;
-	switch (conn.ReadFrameBy(frame, type, deadline)) {
-	case FrameRead::FRAME:
-		break;
-	case FrameRead::CLOSED:
-		throw IOException("n6k_server: peer closed before FT_HELLO");
-	case FrameRead::TIMED_OUT:
-		RejectHandshake(conn, "no FT_HELLO within " + std::to_string(HANDSHAKE_TIMEOUT_MS) + "ms");
-	}
-	if (type != StreamFrameType::N6K) {
-		RejectHandshake(conn, "first frame must be FT_HELLO");
-	}
+	do {
+		switch (conn.ReadFrameBy(frame, type, deadline)) {
+		case FrameRead::FRAME:
+			break;
+		case FrameRead::CLOSED:
+			throw IOException("n6k_server: peer closed before FT_HELLO");
+		case FrameRead::TIMED_OUT:
+			RejectHandshake(conn, "no FT_HELLO within " + std::to_string(HANDSHAKE_TIMEOUT_MS) + "ms");
+		}
+	} while (type == StreamFrameType::JSONRPC);
 	msgpack::object_handle oh;
 	const char *body;
 	size_t body_len;

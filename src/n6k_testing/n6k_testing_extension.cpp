@@ -1,6 +1,7 @@
 #include "n6k_testing_extension.hpp"
 
 #include "arrow_ipc_decode_selftest.hpp"
+#include "wire_codec_bench.hpp"
 #include "fixture_functions.hpp"
 #include "sql_builder_functions.hpp"
 
@@ -11,6 +12,7 @@ namespace duckdb {
 void N6kTestingLoadInternal(ExtensionLoader &loader) {
 	RegisterN6kTestingSqlBuilders(loader);
 	RegisterN6kTestingArrowIpcDecode(loader);
+	RegisterN6kTestingWireCodecBench(loader);
 	n6k::RegisterN6kTestingFixtures(loader);
 }
 

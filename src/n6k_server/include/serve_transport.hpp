@@ -26,11 +26,15 @@ public:
 	                              std::chrono::steady_clock::time_point deadline) = 0;
 
 	// Write one whole frame; throws on error. Never called concurrently: before Run() starts the
-	// writer thread only the reader writes (the handshake), after that only the writer does, so
-	// implementations need no send-side lock of their own.
+	// writer thread only the reader writes (reading HELLO), after that only the writer does. A
+	// transport whose close arrives on another thread must still guard sends against it.
 	virtual void WriteFrame(StreamFrameType type, const std::string &frame) = 0;
 
 	virtual void ShutdownWrite() = 0;
+
+	// Send a close carrying `code` and `reason`; the caller writes nothing after it. ServeReactor bounds `reason`
+	// with CloseReason. Same caller rule as WriteFrame.
+	virtual void SendClose(int code, const std::string &reason) = 0;
 };
 
 } // namespace n6k

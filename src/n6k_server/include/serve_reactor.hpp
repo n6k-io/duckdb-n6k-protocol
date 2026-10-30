@@ -2,11 +2,15 @@
 
 #include "n6k_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
+#include "parked_stream.hpp"
+#include "serve_handshake.hpp"
+#include "serve_options.hpp"
 #include "serve_transport.hpp"
 #include "uds_transport.hpp"
 
 // duckdb::shared_ptr is its own type, not an alias for std::shared_ptr.
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/hugeint.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -32,6 +36,8 @@ class Connection;
 
 namespace n6k {
 
+struct AuthResult;
+
 // One session opened by an OPEN: the `ns` every response for it is stamped with, and the catalog its
 // ops are qualified against.
 struct SessionRef {
@@ -39,16 +45,24 @@ struct SessionRef {
 	std::string catalog;
 };
 
-// Per-request state; the worker waits on cv, the reader signals it.
+// Per-request state, shared by the reader and whichever worker carries the request.
 struct RequestSlot {
+	// Set before the slot is published; never change.
+	int64_t ns = 0;
+	uint32_t req_id = 0;
 	std::atomic<bool> cancel {false};
 	std::mutex mu;
-	std::condition_variable cv;
+	// Its terminal frame went out: nothing more is sent for it. Guarded by `mu`.
+	bool ended = false;
 	int credits = DEFAULT_BATCH_CREDITS;
-	// The worker's own DuckDB context, published once it has one so shutdown can interrupt a query
-	// that is not going to notice `cancel` on its own. Guarded by `mu`.
+	// The response while it waits for credit, on no thread; whoever calls QueueParked takes it and queues
+	// it. Guarded by `mu`, as is when it parked.
+	std::unique_ptr<ParkedStream> parked;
+	std::chrono::steady_clock::time_point parked_at;
+	// The request's own Connection's context, published once it has one so another thread can interrupt a
+	// query that will not notice `cancel` on its own. Guarded by `mu`.
 	shared_ptr<ClientContext> context;
-	// Set before the slot is published; never changes.
+	// Immutable, as `ns` and `req_id`.
 	std::string catalog;
 	// Other catalogs the request's plan names, as AdmitPlanCatalog spelled them. Guarded by the
 	// reactor's map_mu_.
@@ -80,11 +94,22 @@ struct InflightKeyHash {
 	}
 };
 
+inline int64_t SteadyNowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
 struct PinnedTxn {
+	// A worker holds it for as long as its statement runs. ExpireIdle only try_locks it; DropAllTxns blocks on
+	// it after the workers drain.
 	std::mutex mu;
+	// When a request last let go of it (or it began), for idle_txn_timeout_ms.
+	std::atomic<int64_t> last_used_ms {SteadyNowMs()};
+	void Touch() {
+		last_used_ms.store(SteadyNowMs());
+	}
 	std::unique_ptr<Connection> conn;
-	// Set when its session closes. The reader takes `mu` only after workers drain (a worker can hold it
-	// across a credit wait); until then the last holder destroys `conn`.
+	// Set when its session closes; `conn` is then interrupted without `mu` and destroyed by the last holder.
 	std::atomic<bool> dropped {false};
 };
 
@@ -148,62 +173,37 @@ struct UpstreamStatus {
 	std::string reason;
 };
 
-// Serve engine: reader routes frames, a writer serializes output, each REQ gets its own worker thread.
+// One connection's traffic since it started. Frames and payload bytes as the transport delivers them (no WebSocket
+// framing); frames_in excludes the HELLO.
+struct SessionStats {
+	int64_t frames_in;
+	int64_t bytes_in;
+	int64_t frames_out;
+	int64_t bytes_out;
+	int64_t requests_handled;
+	int64_t duration_ms;
+	int64_t authenticate_ms;
+	// Worker threads started.
+	int64_t peak_workers;
+};
+
+// Serve engine: reader routes frames, a writer serializes output, worker threads run admitted REQs.
 class ServeReactor {
 public:
+	// `session_id` is what every host callback receives first, or 0 for a session the host cannot address.
 	ServeReactor(ServeTransport &conn, DatabaseInstance &db, ClientContext &context, std::vector<std::string> catalogs,
-	             bool hello_already_read, std::vector<PendingCatalogSpec> pending = {}, int serve_fd = -1);
+	             ServeOptions options = {}, hugeint_t session_id = hugeint_t(0));
 	~ServeReactor();
 
 	ServeReactor(const ServeReactor &) = delete;
 	ServeReactor &operator=(const ServeReactor &) = delete;
 
-	// Run the reader loop until EOF, interrupt, a write failure, a read or parse error, or a second HELLO;
-	// returns the number of REQs admitted to local workers, or 0 if the handshake fails.
+	// Read HELLO, authenticate, then serve until the connection ends; returns the number of REQs admitted to
+	// local workers, or 0 if the handshake fails.
 	int64_t Run();
 
-	// Overrides the interval the ctor read from PING_INTERVAL_ENV (the ctor throws if that is invalid);
-	// <= 0 disables pinging. Must be called before Run().
-	void SetPingIntervalMs(int ms) {
-		ping_interval_ms_ = ms;
-	}
-
-	// The FT_HELLO capabilities when the host already read HELLO (hello_already_read); must be called
-	// before Run(). Unset means the client offered none.
-	void SetHelloCapabilities(std::vector<std::string> offered) {
-		hello_offered_caps_ = std::move(offered);
-	}
-
-	// The APP_HELLO_CAPS the host serves on this socket. Must be called before Run().
-	void SetAppCapabilities(std::vector<std::string> granted) {
-		app_caps_ = std::move(granted);
-	}
-
-	// The host already sent HELLO_ACK (n6k_hello_ack), so Run() does not. Must be called before Run().
-	void SetHelloAcked(bool acked) {
-		hello_acked_ = acked;
-	}
-
-	// Must be called before Run(); defaults to OPEN_PENDING_INTERVAL_MS.
-	void SetOpenPendingIntervalMs(int ms) {
-		open_pending_interval_ms_ = ms;
-	}
-
-	// An OPEN for a catalog that is not served, pending, upstream or failed parks instead of failing, and the
-	// host gets a StreamFrameType::HOST {"resolve": catalog} (pump.py `_Resolver.receive`) to settle it with
-	// Resolved. Must be called before Run().
-	void SetResolveUnknown(bool on) {
-		resolve_unknown_ = on;
-	}
-
-	// Names listed before anything serves them, each with its rank (see AddLazyCatalog); opening one
-	// resolves it like any unknown name. Must be called before Run(); needs resolve on (checked only by the
-	// n6k_serve_fd bind).
-	void SetLazyCatalogs(const std::vector<std::pair<std::string, int64_t>> &names);
-
-	// The socket fd this reactor serves, or -1. The registry addresses a reactor by it.
-	int ServeFd() const {
-		return serve_fd_;
+	hugeint_t SessionId() const {
+		return session_id_;
 	}
 
 	// Settle a pending catalog: ok ACKs every parked OPEN (the catalog must be attached by now), !ok
@@ -222,10 +222,19 @@ public:
 	// served, pending or lazy. Safe to call from any thread; the reader applies it.
 	void AddLazyCatalog(const std::string &catalog, int64_t rank);
 
-	// The host finished resolving `catalog`: the reader OPEN_ERRs every OPEN still parked on it (an ADD or an
+	// The resolve callback returned for `catalog`: the reader OPEN_ERRs every OPEN still parked on it (an ADD or an
 	// upstream may already have taken them) with `error`, or "not found" when empty. Throws if `catalog` is
 	// not being resolved. Safe to call from any thread; the reader applies it.
 	void Resolved(const std::string &catalog, const std::string &error);
+
+	// A JSON-RPC message to the client, after anything already queued; dropped once the out queue has overflowed.
+	// Throws unless the client offered one of APP_HELLO_CAPS and the host's app capabilities, if it gave any,
+	// include it. Safe to call from any thread.
+	void SendText(std::string text);
+
+	// Send the client a close with `code` and `reason` after what is already queued, and end the connection.
+	// Safe to call from any thread.
+	void Close(int code, std::string reason);
 
 	// Forward to the n6k server on `up_fd`, whose HELLO is done (see n6k_upstream_hello), the `catalogs` it
 	// reports and any it reports later, each one it wins. A local catalog always wins; against lazy names and
@@ -271,12 +280,21 @@ public:
 
 	void SendFrame(std::string frame);
 	void SendJsonRpc(std::string message);
-	void SendHost(std::string message);
 
-	// Consume one credit; false if cancelled or shutting down (caller stops streaming).
-	bool AcquireCredit(RequestSlot &slot);
+	// Every frame of an admitted request goes through these, so it gets at most one terminal frame and
+	// nothing after it. EndRequest also sets `cancel`. Never called with `slot.mu` held.
+	void SendForRequest(RequestSlot &slot, std::string frame);
+	void EndRequest(RequestSlot &slot, std::string terminal);
 
-	void AddCredits(RequestSlot &slot, int n);
+	enum class CreditResult { TAKEN, EMPTY, STOPPED };
+	// Consume one credit without waiting. EMPTY: return PARKED. STOPPED: cancelled or shutting down, so end
+	// the stream.
+	CreditResult TryAcquireCredit(RequestSlot &slot);
+
+	// Reader thread only. Queues the response again if it was parked for credit.
+	void AddCredits(const std::shared_ptr<RequestSlot> &slot, int n);
+
+	bool HasWaitingRequests();
 
 	// Push OP_CATALOG_INVALIDATED to every session on this connection bound to `catalog`, each
 	// stamped with its own ns. Returns how many were notified; empty `schemas` returns 0 and pushes
@@ -288,8 +306,9 @@ public:
 	void AdmitPlanCatalog(RequestSlot &slot, const std::string &catalog);
 
 	// A transaction pinned to its own Connection for the life of (ns, txn). Every request that names
-	// the txn runs on that Connection under its mutex.
-	int64_t BeginTxn(int64_t ns);
+	// the txn runs on that Connection under its mutex. Throws once `slot` is cancelled, so a session's
+	// transactions cannot outlive its close.
+	int64_t BeginTxn(RequestSlot &slot);
 	std::shared_ptr<PinnedTxn> FindTxn(int64_t ns, int64_t txn);
 	std::shared_ptr<PinnedTxn> TakeTxn(int64_t ns, int64_t txn);
 
@@ -304,14 +323,35 @@ public:
 	int64_t RequestsHandled() const {
 		return reqs_handled_.load();
 	}
+	SessionStats Stats() const;
 
 private:
+	// CLOSE carries the reason as its payload and is the last thing written.
+	struct OutFrame {
+		StreamFrameType type;
+		std::string payload;
+		int close_code;
+	};
+
+	// Reader thread, writer running. Runs authenticate, beating HELLO_PENDING after hello_pending_first_ms and then
+	// every open_pending_interval_ms while it does, then HELLO_ACK, or HELLO_ERR and Close and false.
+	bool Authenticate(const HelloRequest &hello);
+	void ApplyAuthResult(const AuthResult &result);
+	void Reject(const std::string &reason, int code);
+	void SetLazyCatalogs(const std::vector<std::pair<std::string, int64_t>> &names);
+	void TextWorkerLoop();
+	// Reader thread only. Queues `catalog` for the resolver thread, which calls resolve, then Resolved.
+	void StartResolve(const std::string &catalog);
+	void ResolverLoop();
+	void StopCallbackThreads();
+	void StopWriter();
+	// Also the keepalive: once StartPinging, at most one FT_PING per ping_interval_ms, sent when the queue is empty
+	// at or after the due time. No PONG is awaited and no deadline is enforced, so a briefly stalled client is never
+	// dropped for a late reply.
 	void WriterLoop();
-	// Emits an FT_PING every ping_interval_ms until shutdown. Keepalive only: no PONG is awaited and
-	// no deadline is enforced, so a briefly stalled client is never dropped for a late reply.
-	void PingLoop();
-	// Signal the pinger to stop and join it. Idempotent, so Run() and ~ServeReactor may both call it.
-	void StopPinger();
+	void StartPinging();
+	// Under out_mu_. False, and the frame dropped, once the client has stopped reading.
+	bool EnqueueOut(OutFrame frame);
 	// Reader thread only.
 	void HandleOpen(const msgpack::object &header, const std::string &frame);
 	// Reader thread only.
@@ -330,6 +370,8 @@ private:
 	void EvictSession(int64_t ns, const std::string &reason);
 	// Reader thread only.
 	void SendDuePendingBeats();
+	// Reader thread only. Applies idle_stream_timeout_ms and idle_txn_timeout_ms.
+	void ExpireIdle();
 	// Reader thread only.
 	bool IsParked(int64_t ns) const;
 	// Reader thread only.
@@ -349,14 +391,36 @@ private:
 	void UpstreamWriterLoop(Upstream &up);
 	static void StopUpstream(Upstream &up);
 
-	void AdmitAndSpawnRequestWorker(const SessionRef &sess, uint32_t req_id, uint8_t op, std::string body);
-	// Spawned on its own thread. std::thread decay-copies these, so `sess` stays valid even when the
-	// reader closes that session mid-request — the worker must never reach back into sessions_.
-	void WorkerMain(const SessionRef &sess, uint32_t req_id, const std::shared_ptr<RequestSlot> &slot, uint8_t op,
-	                const std::string &body);
+	// The task owns copies, so `sess` stays valid even when the reader closes that session mid-request — the
+	// worker must never reach back into sessions_.
+	struct RequestTask {
+		enum class Kind { START, RESUME, CANCEL };
+		Kind kind;
+		SessionRef sess;
+		uint32_t req_id;
+		std::shared_ptr<RequestSlot> slot;
+		uint8_t op;
+		std::string body;
+		// RESUME and CANCEL: the response taken off the slot.
+		std::unique_ptr<ParkedStream> stream;
+	};
+	void AdmitAndQueueRequest(const SessionRef &sess, uint32_t req_id, uint8_t op, std::string body);
+	void QueueTask(RequestTask task);
+	void QueueParked(const std::shared_ptr<RequestSlot> &slot, RequestTask::Kind kind);
+	void WorkerLoop();
+	// Once stopping_, a START is retired without running or sending a terminal frame, and a RESUME is
+	// cancelled instead.
+	void RunRequest(RequestTask &task);
+	// A stream that did not finish: parked on its slot, or queued again if it yielded or if credit, a cancel
+	// or a shutdown already arrived.
+	void ParkOrQueue(RequestTask task, PumpResult result);
+	// Joins every worker. Idempotent, so Run() and ~ServeReactor may both call it.
+	void StopWorkers();
 	std::shared_ptr<RequestSlot> FindSlot(int64_t ns, uint32_t req_id);
-	// Interrupt every in-flight worker's DuckDB context. Called only from the shutdown path. A worker
-	// that has not yet published its context has nothing to interrupt and will see `stopping_` instead.
+	// Interrupt every in-flight request's own Connection. Does not reach a request in a pinned transaction,
+	// which runs on PinnedTxn::conn. A request that has not yet published its context has nothing to interrupt;
+	// only a streamed response sees `stopping_` later, so a non-streamed op already past RunRequest's check runs
+	// to completion.
 	void InterruptWorkers();
 	// Reader thread only.
 	void TrackSession(int64_t ns, const std::string &catalog);
@@ -368,11 +432,23 @@ private:
 	// Catalogs this connection serves: bind order, then appended/removed as changed. Reader thread only.
 	std::vector<std::string> served_;
 	std::unordered_set<std::string> served_set_;
-	bool hello_already_read_;
-	std::vector<std::string> hello_offered_caps_;
+	ServeOptions options_;
+	// Set by Authenticate before the reactor registers; read-only after.
 	std::vector<std::string> app_caps_;
-	bool hello_acked_ = false;
-	int serve_fd_;
+	bool accepts_text_ = false;
+	hugeint_t session_id_;
+
+	std::mutex text_mu_;
+	std::condition_variable text_cv_;
+	std::deque<std::string> text_q_;
+	bool text_stop_ = false;
+	std::thread text_worker_;
+
+	std::mutex resolve_q_mu_;
+	std::condition_variable resolve_q_cv_;
+	std::deque<std::string> resolve_q_;
+	bool resolve_stop_ = false;
+	std::thread resolver_;
 
 	struct ParkedOpen {
 		int64_t ns;
@@ -500,16 +576,13 @@ private:
 
 	std::mutex out_mu_;
 	std::condition_variable out_cv_;
-	std::deque<std::pair<StreamFrameType, std::string>> out_q_;
+	std::deque<OutFrame> out_q_;
+	// Payload bytes in `out_q_`.
+	size_t out_q_bytes_ = 0;
+	bool out_overflowed_ = false;
 	bool writer_stop_ = false;
+	bool pinging_ = false;
 	std::thread writer_;
-
-	// Keepalive. Its own mutex/cv rather than the writer's, so that a connection under load does not
-	// wake the pinger on every enqueued frame.
-	std::mutex ping_mu_;
-	std::condition_variable ping_cv_;
-	bool ping_stop_ = false;
-	std::thread pinger_;
 	int ping_interval_ms_ = 0;
 
 	std::mutex map_mu_;
@@ -521,12 +594,26 @@ private:
 	void DropTxnsOf(int64_t ns);
 	void DropAllTxns();
 
-	// Detached workers; counter lets Run() wait for drain at shutdown.
+	// Workers start only while the queue outgrows the idle ones, up to options_.workers. active_workers_
+	// counts admitted requests not yet retired (queued, running or parked); Run() waits on it to drain.
 	std::mutex workers_mu_;
 	std::condition_variable workers_cv_;
+	std::condition_variable tasks_cv_;
+	std::deque<RequestTask> tasks_;
+	std::vector<std::thread> worker_threads_;
+	int idle_workers_ = 0;
+	bool workers_stop_ = false;
 	int active_workers_ = 0;
+	std::atomic<int64_t> peak_workers_ {0};
 
 	std::atomic<int64_t> reqs_handled_ {0};
+	std::atomic<int64_t> frames_in_ {0};
+	std::atomic<int64_t> bytes_in_ {0};
+	std::atomic<int64_t> frames_out_ {0};
+	std::atomic<int64_t> bytes_out_ {0};
+	std::chrono::steady_clock::time_point started_;
+	// Set before the reactor registers; read-only after.
+	int64_t authenticate_ms_ = 0;
 	std::atomic<int64_t> credit_pauses_ {0};
 	std::atomic<int64_t> cancels_ {0};
 	std::atomic<bool> stopping_ {false};
@@ -561,32 +648,58 @@ private:
 	ServeReactor *reactor_;
 };
 
+// A session for the host to serve `fd` under; returns the UUID every control function and host callback
+// addresses it by. Unlike an fd number, an id is never reused.
+hugeint_t CreateServeSession(DatabaseInstance &db, int fd);
+
+// Held by the serve of one session for its whole lifetime; on release the id addresses nothing.
+class ServeSessionClaim {
+public:
+	// Throws if `id` was not created on `db`, or another serve already holds it.
+	ServeSessionClaim(DatabaseInstance &db, hugeint_t id);
+	~ServeSessionClaim();
+
+	ServeSessionClaim(const ServeSessionClaim &) = delete;
+	ServeSessionClaim &operator=(const ServeSessionClaim &) = delete;
+
+	int Fd() const {
+		return fd_;
+	}
+
+private:
+	hugeint_t id_;
+	int fd_;
+};
+
 // Push an invalidation to every reactor on `db` serving `catalog`. Returns the number of sessions
 // notified across all of them, which is what makes a no-op distinguishable from a delivery.
 int BroadcastInvalidate(DatabaseInstance &db, const std::string &catalog, const std::vector<std::string> &schemas);
 
-// Settle `catalog` pending on the reactor serving `fd` on `db`. Waits briefly for that reactor to
-// register, since the host may finish its ATTACH before the serve CALL reaches Run().
-void ResolvePendingOpen(DatabaseInstance &db, int fd, const std::string &catalog, bool ok, const std::string &message);
+// Each function below that takes `session_id`, except ServedSessionStats, acts on the reactor serving that
+// session on `db`, first waiting for it to register (see AwaitServe), since the host may finish its ATTACH
+// before the serve CALL reaches Run().
 
-// Add or remove a served catalog on the reactor serving `fd` on `db`; same registration wait as
-// ResolvePendingOpen.
-void AddServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog);
-void RemoveServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog);
-void AddServedLazyCatalog(DatabaseInstance &db, int fd, const std::string &catalog, int64_t rank);
+// Settle `catalog` pending on that reactor.
+void ResolvePendingOpen(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog, bool ok,
+                        const std::string &message);
 
-void ResolveUnknownOpen(DatabaseInstance &db, int fd, const std::string &catalog, const std::string &error);
+void AddServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog);
+void RemoveServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog);
+void AddServedLazyCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog, int64_t rank);
 
-std::vector<std::string> AddServedUpstream(DatabaseInstance &db, int fd, int up_fd,
+void SendServedText(DatabaseInstance &db, hugeint_t session_id, const std::string &text);
+void CloseServed(DatabaseInstance &db, hugeint_t session_id, int code, const std::string &reason);
+
+std::vector<std::string> AddServedUpstream(DatabaseInstance &db, hugeint_t session_id, int up_fd,
                                            const std::vector<std::string> &catalogs, int64_t rank);
-std::vector<std::string> SetServedUpstreamRank(DatabaseInstance &db, int fd, int up_fd, int64_t rank);
-void RemoveServedUpstream(DatabaseInstance &db, int fd, int up_fd);
-UpstreamStatus ServedUpstreamStatus(DatabaseInstance &db, int fd, int up_fd);
+std::vector<std::string> SetServedUpstreamRank(DatabaseInstance &db, hugeint_t session_id, int up_fd, int64_t rank);
+void RemoveServedUpstream(DatabaseInstance &db, hugeint_t session_id, int up_fd);
+UpstreamStatus ServedUpstreamStatus(DatabaseInstance &db, hugeint_t session_id, int up_fd);
 
-void PauseServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog);
-void ResumeServedCatalog(DatabaseInstance &db, int fd, const std::string &catalog);
-InflightState ServedCatalogInflight(DatabaseInstance &db, int fd, const std::string &catalog);
-int64_t CancelServedCatalogInflight(DatabaseInstance &db, int fd, const std::string &catalog);
+void PauseServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog);
+void ResumeServedCatalog(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog);
+InflightState ServedCatalogInflight(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog);
+int64_t CancelServedCatalogInflight(DatabaseInstance &db, hugeint_t session_id, const std::string &catalog);
 
 // Aggregate counters over every reactor currently serving `db`.
 struct ServeStats {
@@ -596,6 +709,10 @@ struct ServeStats {
 	int64_t cancels = 0;
 };
 ServeStats CollectServeStats(DatabaseInstance &db);
+
+// The connection serving `session_id` on `db`. Throws at once if none is registered; unlike the functions
+// above, it does not wait.
+SessionStats ServedSessionStats(DatabaseInstance &db, hugeint_t session_id);
 
 } // namespace n6k
 } // namespace duckdb

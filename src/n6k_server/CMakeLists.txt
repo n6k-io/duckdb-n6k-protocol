@@ -53,6 +53,8 @@ list(
   frame_codec.cpp
   uds_transport.cpp
   serve_handshake.cpp
+  serve_options.cpp
+  host_callbacks.cpp
   serve_reactor.cpp
   request_handlers.cpp
   insert_scan.cpp)
@@ -75,7 +77,8 @@ if(NOT WASM_LOADABLE_EXTENSIONS)
   include_directories(${N6K_THIRD_PARTY}/ixwebsockets)
   add_definitions(-DN6K_SERVER_WITH_WS)
   list(APPEND EXTENSION_SOURCES n6k_serve_http_function.cpp
-       ws_serve_transport.cpp $<TARGET_OBJECTS:ixwebsocket>)
+       ws_serve_transport.cpp ws_serve_connection.cpp
+       $<TARGET_OBJECTS:ixwebsocket>)
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

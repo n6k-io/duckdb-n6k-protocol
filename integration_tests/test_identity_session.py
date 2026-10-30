@@ -41,6 +41,7 @@ from n6k_protocol.protocol import (
 pytestmark = pytest.mark.skipif(not server_is_up(), reason="test server not running on :8099")
 
 IDENT = Target(id="ident", mount="/ident")
+SESSION_ID = "'00000000-0000-4000-8000-000000000000'::UUID"
 
 
 def _debug(path: str, params: dict[str, str] | None = None, method: str = "GET") -> dict[str, Any]:
@@ -84,11 +85,10 @@ async def test_the_startup_memory_catalog_is_not_served() -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT * FROM n6k_handshake(0)",
-        "SELECT * FROM n6k_reject('x')",
-        "SELECT * FROM n6k_hello_pending('x')",
-        "SELECT * FROM n6k_hello_ack()",
-        "CALL n6k_serve_fd(0)",
+        f"SELECT * FROM n6k_serve_send_text({SESSION_ID}, 'x')",
+        f"SELECT * FROM n6k_serve_close({SESSION_ID}, 1000, 'x')",
+        f"CALL n6k_serve_ws({SESSION_ID}, '{{}}')",
+        f"CALL n6k_serve_fd({SESSION_ID})",
         "CALL n6k_serve_socket()",
         "CALL n6k_serve_http('127.0.0.1', 1)",
         "SELECT * FROM n6k_connect(wsFd => 1000000)",
@@ -97,7 +97,7 @@ async def test_the_startup_memory_catalog_is_not_served() -> None:
         "SELECT * FROM n6k_serve_stats()",
     ],
 )
-async def test_a_served_client_cannot_reach_the_handshake_functions(sql: str) -> None:
+async def test_a_served_client_cannot_reach_the_serve_functions(sql: str) -> None:
     async with websockets.connect(IDENT.ws_url(catalog=None)) as ws:
         assert (await hello(ws, "tok-a"))["t"] == FT_HELLO_ACK
         assert (await open_session(ws, 1, "a"))["t"] == FT_OPEN_ACK
@@ -110,11 +110,11 @@ async def test_a_served_client_cannot_reach_the_handshake_functions(sql: str) ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pinned", [False, True])
-async def test_a_plan_cannot_reach_the_handshake_functions(pinned: bool) -> None:
+async def test_a_plan_cannot_reach_the_serve_functions(pinned: bool) -> None:
     async with websockets.connect(IDENT.ws_url(catalog=None)) as ws:
         assert (await hello(ws, "tok-a"))["t"] == FT_HELLO_ACK
         assert (await open_session(ws, 1, "a"))["t"] == FT_OPEN_ACK
-        sql = "CREATE OR REPLACE VIEW a.main.handshake_view AS SELECT * FROM n6k_handshake(0)"
+        sql = f"CREATE OR REPLACE VIEW a.main.send_text_view AS SELECT * FROM n6k_serve_send_text({SESSION_ID}, 'x')"
         assert (await asyncio.to_thread(_debug, "server_exec", {"catalog": "a", "sql": sql}, "POST"))["handlers"] >= 1
         client = WireClient(ws)
         args: dict[str, Any] = {}
@@ -122,7 +122,7 @@ async def test_a_plan_cannot_reach_the_handshake_functions(pinned: bool) -> None
             begin = await client.request(OP_TXN_BEGIN)
             assert begin[-1][0]["t"] == FT_RESP_END, begin
             args["txn"] = begin[-1][0]["txn"]
-        plan = substrait_plan(substrait_read("main", "handshake_view", [("token", "string")]), ["token"])
+        plan = substrait_plan(substrait_read("main", "send_text_view", [("sent", "bool")]), ["sent"])
         err = await client.error(OP_READ_PLAN, plan=plan, **args)
         assert "not callable from a served connection" in err["exception_message"]
 

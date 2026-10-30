@@ -72,10 +72,10 @@ source.sql("CREATE TABLE users(id INTEGER PRIMARY KEY, name VARCHAR, tenant_id I
 
 target = duckdb.connect(config=cfg)
 bridge(source, target, "app", source_catalog="memory", policies=[
-    Policy("main.users", "select", "true"),
-    Policy("main.users", "insert", "true"),
-    Policy("main.users", "update", "true"),
-    Policy("main.users", "delete", "true"),
+    Policy("main.users", "select", True),
+    Policy("main.users", "insert", True),
+    Policy("main.users", "update", True),
+    Policy("main.users", "delete", True),
 ])
 
 target.sql("SELECT * FROM app.main.users")
@@ -578,6 +578,8 @@ register(
     mcp: ForwardRef('MCPServer') | None = None,
     max_text_inflight: int | None = None,
     max_mcp_inflight: int | None = 8,
+    workers: int | None = None,
+    max_connections: int | None = None,
 ) -> fastapi.APIRouter
 ```
 
@@ -588,7 +590,9 @@ does not end with `/`. Path params it captures are passed to `connect` and
 `authenticate` as keyword arguments. `ping_interval_ms`: None leaves the keepalive to
 `$N6K_PING_INTERVAL` (seconds), 0 disables it. `max_text_inflight`: None sets no limit on text
 handlers running at once. `max_mcp_inflight`: MCP requests running at once per connection; past
-it a request is answered "server busy". None sets no limit.
+it a request is answered "server busy". None sets no limit. `workers`: as in
+`serve_and_close_connection`. `max_connections`: WebSockets served at once
+on this route; past it one is closed 1013 (try again later). None sets no limit.
 
 
 ### `serve_ws`
@@ -609,6 +613,7 @@ serve_ws(
     mcp: ForwardRef('MCPServer') | None = None,
     max_text_inflight: int | None = None,
     max_mcp_inflight: int | None = 8,
+    workers: int | None = None,
 ) -> None
 ```
 
@@ -631,24 +636,26 @@ serve_and_close_connection(
     text_app: 'Optional[TextApp]' = None,
     resolve: 'Optional[Resolve]' = None,
     max_text_inflight: 'Optional[int]' = None,
+    workers: 'Optional[int]' = None,
 ) -> 'None'
 ```
 
 Handshake, authenticate, then serve `ws` from `con` until either side drops; then close `con`.
 
-`con` arrives empty. `n6k_handshake` reads the client's FT_HELLO token on it, and only then
+`con` arrives empty. The extension reads the client's FT_HELLO and calls back, and only then
 does `authenticate(ws, con, token, **params)` attach what that identity may see and return the
 catalogs to serve: names already attached, `PendingCatalog`s attached while serving, and, with
-`resolve`, `LazyCatalog`s. While it runs past `HELLO_PENDING_FIRST_S`, the client gets
+`resolve`, `LazyCatalog`s. While it runs past the extension's `hello_pending_first_ms`, the client gets
 FT_HELLO_PENDING carrying `hello_pending_message`. A `WsReject` or any other exception sends
-FT_HELLO_ERR (built by `n6k_reject`) and nothing is served; an empty list logs the client in with
-no catalogs. Returning `Authorized(catalogs, identity)` hands `identity` to text handlers.
+FT_HELLO_ERR and nothing is served; an empty list logs the client in with no catalogs. Returning
+`Authorized(catalogs, identity)` hands `identity` to text handlers.
 
-Ownership passes here: the serving CALL holds `con` for the connection's life. A caller that
-needs to reach the data meanwhile must take a `con.cursor()` inside `authenticate`.
+Ownership passes here: the serving CALL runs on a cursor of `con` for the connection's life.
 
-Once serving starts, `on_serve(ws, handle, **params)` (sync or async) gets a `LiveServe` for
-adding and removing catalogs; it is cancelled when the connection ends.
+Once `authenticate` returns, `on_serve(ws, handle, **params)` (sync or async) gets a `LiveServe` for
+adding and removing catalogs; it is cancelled when the connection ends. It starts before the
+extension validates that result and sends HELLO_ACK, so it also runs on a connection the extension
+then rejects.
 
 With `resolve`, a client's OPEN for a catalog that is not served waits (FT_OPEN_PENDING) while
 `resolve(handle, name)` (sync or async) runs on that same `LiveServe`, once per name however many
@@ -667,6 +674,8 @@ more handlers than that running at once closes the socket (1008) unless the sess
 answers it; None (the default) sets no limit. Handlers are cancelled when the
 connection ends. `n6k_server.context.current()` inside a handler is the connection's params and
 identity.
+
+`workers`: `n6k_serve_fd`'s `workers` option; None keeps its default.
 
 `con` is closed off the event loop and only after every query on it returns; this returns without
 waiting for them, so a query that never returns leaves `con` open.

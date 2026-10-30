@@ -1,10 +1,10 @@
 #pragma once
 
 #include "n6k_protocol_generated.hpp"
+#include "n6k_yyjson_util.hpp"
 #include "ws_json.hpp"
 
 #include <cstdint>
-#include <cstdlib>
 #include <string>
 
 namespace duckdb {
@@ -37,7 +37,8 @@ inline StreamFrameType StreamFrameTypeOf(const char *header, const char *who) {
 	return static_cast<StreamFrameType>(raw);
 }
 
-inline std::string JsonRpcMethodNotFoundReply(const std::string &message) {
+// The error answering `message`, or empty when it is a notification or not a request at all.
+inline std::string JsonRpcErrorReply(const std::string &message, int code, const char *error) {
 	JsonDoc doc(message);
 	auto *root = doc.Root();
 	if (!root || !duckdb_yyjson::yyjson_is_obj(root) || !duckdb_yyjson::yyjson_obj_get(root, "method")) {
@@ -47,15 +48,19 @@ inline std::string JsonRpcMethodNotFoundReply(const std::string &message) {
 	if (!id) {
 		return {};
 	}
-	char *id_json = duckdb_yyjson::yyjson_val_write(id, 0, nullptr);
-	if (!id_json) {
-		return {};
-	}
-	std::string reply = R"({"jsonrpc":"2.0","id":)";
-	reply += id_json;
-	std::free(id_json);
-	reply += R"(,"error":{"code":-32601,"message":"Method not found"}})";
-	return reply;
+	auto *out = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
+	auto *reply = duckdb_yyjson::yyjson_mut_obj(out);
+	duckdb_yyjson::yyjson_mut_doc_set_root(out, reply);
+	duckdb_yyjson::yyjson_mut_obj_add_str(out, reply, "jsonrpc", "2.0");
+	duckdb_yyjson::yyjson_mut_obj_add_val(out, reply, "id", duckdb_yyjson::yyjson_val_mut_copy(out, id));
+	auto *err = duckdb_yyjson::yyjson_mut_obj_add_obj(out, reply, "error");
+	duckdb_yyjson::yyjson_mut_obj_add_int(out, err, "code", code);
+	duckdb_yyjson::yyjson_mut_obj_add_strcpy(out, err, "message", error);
+	return SerializeJsonDocAndFree(out);
+}
+
+inline std::string JsonRpcMethodNotFoundReply(const std::string &message) {
+	return JsonRpcErrorReply(message, -32601, "Method not found");
 }
 
 } // namespace n6k

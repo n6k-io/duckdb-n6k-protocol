@@ -5,12 +5,14 @@
 #include "n6k_frame_source.hpp"
 #include "crossing_substrait.hpp"
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -20,10 +22,12 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 
 #include <algorithm>
+#include <mutex>
 
 namespace duckdb {
 
@@ -179,124 +183,194 @@ struct N6kWriteState {
 	}
 };
 
-struct N6kReadState : public N6kFrameSourceState {
-	explicit N6kReadState(ClientContext &ctx) : N6kFrameSourceState(ctx) {
-	}
+// One request shared by every partition of a scan. Each reader converts the batch it took to
+// DuckDB vectors without `lock`. Fields set by ResolveReadSchema are written once under `lock` before
+// any batch is taken, then read unlocked.
+struct N6kReadShared : public N6kFrameSourceState {
+	std::mutex lock;
+	idx_t next_batch = 0;
+	vector<CrossingWaker> parked;
 
-	ArrowTableSchema arrow_table;
 	bool schema_ready = false;
-	bool any_cast = false;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> wire_types;
 	vector<bool> needs_cast;
-	unique_ptr<DataChunk> scratch;
-	ArmedWaker waker;
-};
+	bool any_cast = false;
 
-void ResolveReadSchema(ClientContext &context, N6kReadState &state, const vector<LogicalType> &types,
-                       const string &catalog) {
-	ArrowTableFunction::PopulateArrowTableSchema(context, state.arrow_table, *state.decoder.GetSchema());
-	auto wire_types = state.arrow_table.GetTypes();
-	if (wire_types.size() != types.size()) {
-		throw IOException("n6k[" + catalog + "] read: server returned " + std::to_string(wire_types.size()) +
-		                  " columns, plan expects " + std::to_string(types.size()));
-	}
-	state.needs_cast.resize(types.size(), false);
-	for (idx_t i = 0; i < types.size(); i++) {
-		if (wire_types[i] != types[i]) {
-			state.needs_cast[i] = true;
-			state.any_cast = true;
+	void WakeAll() {
+		vector<CrossingWaker> to_wake;
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			to_wake.swap(parked);
+		}
+		for (auto &waker : to_wake) {
+			waker.Wake();
 		}
 	}
-	if (state.any_cast) {
-		state.scratch = make_uniq<DataChunk>();
-		state.scratch->Initialize(context, wire_types);
+};
+
+struct N6kReader {
+	explicit N6kReader(ClientContext &ctx) : scan_state(make_uniq<ArrowArrayWrapper>(), ctx) {
 	}
-	vector<column_t> ids;
+
+	ArrowScanLocalState scan_state; // reused across batches; holds the current batch + chunk_offset
+	bool has_batch = false;
+	idx_t batch_index = 0;
+	unique_ptr<DataChunk> scratch;
+};
+
+void ResolveReadSchema(N6kReadShared &shared, ClientContext &context, const vector<LogicalType> &types,
+                       const string &catalog) {
+	ArrowTableFunction::PopulateArrowTableSchema(context, shared.arrow_table, *shared.decoder.GetSchema());
+	shared.wire_types = shared.arrow_table.GetTypes();
+	if (shared.wire_types.size() != types.size()) {
+		throw IOException("n6k[" + catalog + "] read: server returned " + std::to_string(shared.wire_types.size()) +
+		                  " columns, plan expects " + std::to_string(types.size()));
+	}
+	shared.needs_cast.resize(types.size(), false);
 	for (idx_t i = 0; i < types.size(); i++) {
-		ids.push_back(i);
+		if (shared.wire_types[i] != types[i]) {
+			shared.needs_cast[i] = true;
+			shared.any_cast = true;
+		}
 	}
-	state.scan_state.column_ids = std::move(ids);
-	state.schema_ready = true;
+	shared.schema_ready = true;
 }
 
-void EmitReadChunk(ClientContext &context, N6kReadState &state, DataChunk &chunk, idx_t count,
-                   const vector<LogicalType> &types) {
-	if (!state.any_cast) {
+void EmitReadChunk(ClientContext &context, const N6kReadShared &shared, N6kReader &reader, DataChunk &chunk,
+                   idx_t count, const vector<LogicalType> &types) {
+	auto &columns = shared.arrow_table.GetColumns();
+	if (!shared.any_cast) {
 		chunk.SetCardinality(count);
-		ArrowTableFunction::ArrowToDuckDB(state.scan_state, state.arrow_table.GetColumns(), chunk);
+		ArrowTableFunction::ArrowToDuckDB(reader.scan_state, columns, chunk);
 		chunk.Verify();
 		return;
 	}
-	state.scratch->Reset();
-	state.scratch->SetCardinality(count);
-	ArrowTableFunction::ArrowToDuckDB(state.scan_state, state.arrow_table.GetColumns(), *state.scratch);
-	chunk.SetCardinality(state.scratch->size());
+	if (!reader.scratch) {
+		reader.scratch = make_uniq<DataChunk>();
+		reader.scratch->Initialize(context, shared.wire_types);
+	}
+	reader.scratch->Reset();
+	reader.scratch->SetCardinality(count);
+	ArrowTableFunction::ArrowToDuckDB(reader.scan_state, columns, *reader.scratch);
+	chunk.SetCardinality(reader.scratch->size());
 	for (idx_t i = 0; i < types.size(); i++) {
-		if (state.needs_cast[i]) {
-			VectorOperations::Cast(context, state.scratch->data[i], chunk.data[i], state.scratch->size());
+		if (shared.needs_cast[i]) {
+			VectorOperations::Cast(context, reader.scratch->data[i], chunk.data[i], reader.scratch->size());
 		} else {
-			chunk.data[i].Reference(state.scratch->data[i]);
+			chunk.data[i].Reference(reader.scratch->data[i]);
 		}
 	}
 	chunk.Verify();
 }
 
-bool DrainAndResolve(ClientContext &context, N6kReadState &state, const vector<LogicalType> &types,
-                     const string &catalog) {
-	N6kDrainFrames(state);
-	if (!state.schema_ready && state.decoder.HasSchema()) {
-		ResolveReadSchema(context, state, types, catalog);
+enum class ReadStep : uint8_t { BATCH, PARKED, FINISHED };
+
+// Take the next batch, park the reader, or report the stream finished. A batch is taken and numbered in one
+// step, so batch indexes follow stream order and only ever grow for each reader.
+ReadStep TakeBatch(ClientContext &context, N6kReadShared &shared, N6kReader &reader, const CrossingWaker &waker,
+                   const vector<LogicalType> &types, const string &catalog, uint32_t &consumed) {
+	std::lock_guard<std::mutex> guard(shared.lock);
+	if (!shared.decoder.HasBatch() && !shared.stream_done) {
+		consumed = N6kDrainFrames(shared);
 	}
-	return state.decoder.HasBatch() || state.stream_done || state.saw_error;
+	if (!shared.schema_ready && shared.decoder.HasSchema()) {
+		ResolveReadSchema(shared, context, types, catalog);
+	}
+	if (shared.decoder.HasBatch()) {
+		if (!shared.schema_ready) {
+			throw IOException("n6k[" + catalog + "] read: a batch arrived before the schema");
+		}
+		auto wrapper = make_shared_ptr<ArrowArrayWrapper>();
+		shared.decoder.TryPopBatch(&wrapper->arrow_array);
+		reader.batch_index = shared.next_batch++;
+		reader.scan_state.Reset();
+		reader.scan_state.chunk = std::move(wrapper);
+		reader.scan_state.chunk_offset = 0;
+		reader.has_batch = true;
+		return ReadStep::BATCH;
+	}
+	if (shared.stream_done || shared.saw_error) {
+		return ReadStep::FINISHED;
+	}
+	shared.parked.push_back(waker);
+	return ReadStep::PARKED;
 }
 
-CrossingReader OpenReader(ClientContext &context, const std::shared_ptr<CatalogSession> &session, const string &catalog,
-                          const string &body, const vector<LogicalType> &types) {
-	auto state = std::make_shared<N6kReadState>(context);
-	state->req = session->StartOpRequest(n6k::OP_READ_PLAN, body, [&context]() { return context.IsInterrupted(); });
-	WakeOnFrame(state);
-
-	return [state, catalog, types](ClientContext &ctx, DataChunk &chunk,
-	                               const CrossingWaker &waker) -> CrossingReadResult {
-		for (;;) {
-			if (state->has_batch) {
-				auto len = static_cast<idx_t>(state->scan_state.chunk->arrow_array.length);
-				if (state->scan_state.chunk_offset >= len) {
-					state->has_batch = false;
-				} else {
-					idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, len - state->scan_state.chunk_offset);
-					EmitReadChunk(ctx, *state, chunk, count, types);
-					state->scan_state.chunk_offset += chunk.size();
-					return CrossingReadResult::Rows();
+CrossingReadResult PullRead(ClientContext &context, N6kReadShared &shared, N6kReader &reader, DataChunk &chunk,
+                            const CrossingWaker &waker, const vector<LogicalType> &types, const string &catalog) {
+	for (;;) {
+		if (reader.has_batch) {
+			auto len = static_cast<idx_t>(reader.scan_state.chunk->arrow_array.length);
+			if (reader.scan_state.chunk_offset < len) {
+				idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, len - reader.scan_state.chunk_offset);
+				EmitReadChunk(context, shared, reader, chunk, count, types);
+				reader.scan_state.chunk_offset += chunk.size();
+				return CrossingReadResult::Rows(reader.batch_index);
+			}
+			reader.has_batch = false;
+		}
+		uint32_t consumed = 0;
+		auto step = TakeBatch(context, shared, reader, waker, types, catalog, consumed);
+		if (consumed > 0) {
+			shared.req->Credit(consumed);
+		}
+		if (step == ReadStep::BATCH) {
+			if (reader.scan_state.column_ids.empty()) {
+				for (idx_t i = 0; i < types.size(); i++) {
+					reader.scan_state.column_ids.push_back(i);
 				}
 			}
-			if (state->decoder.HasBatch()) {
-				if (!state->schema_ready) {
-					throw IOException("n6k[" + catalog + "] read: a batch arrived before the schema");
-				}
-				state->scan_state.Reset();
-				auto wrapper = make_shared_ptr<ArrowArrayWrapper>();
-				state->decoder.TryPopBatch(&wrapper->arrow_array);
-				state->scan_state.chunk = std::move(wrapper);
-				state->scan_state.chunk_offset = 0;
-				state->has_batch = true;
-				continue;
-			}
-			if (state->saw_error) {
-				N6kThrowSourceError(*state, catalog, n6k::OP_READ_PLAN, "read");
-			}
-			if (state->stream_done) {
-				return CrossingReadResult::Done();
-			}
-			if (DrainAndResolve(ctx, *state, types, catalog)) {
-				continue;
-			}
-			state->waker.Arm(waker);
-			if (DrainAndResolve(ctx, *state, types, catalog)) {
-				continue;
-			}
+			continue;
+		}
+		if (step == ReadStep::PARKED) {
+			// Not a blocking wait: on wasm that freezes everything for the whole round trip.
 			return CrossingReadResult::Wait();
 		}
+		// Readers parked before SetOnFrame was installed missed the frames that ended the stream.
+		shared.WakeAll();
+		if (shared.saw_error) {
+			N6kThrowSourceError(shared, catalog, n6k::OP_READ_PLAN, "read");
+		}
+		return CrossingReadResult::Done();
+	}
+}
+
+CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const string &catalog, const string &body,
+                      const vector<LogicalType> &types, idx_t partitions) {
+	auto shared = std::make_shared<N6kReadShared>();
+	CrossingScan scan;
+	scan.partitions = partitions;
+	scan.batch_indexed = true;
+	scan.open = [shared, session, catalog, body, types, partitions](ClientContext &context, idx_t) -> CrossingReader {
+		bool started = false;
+		{
+			std::lock_guard<std::mutex> guard(shared->lock);
+			if (!shared->req) {
+				shared->req =
+				    session->StartOpRequest(n6k::OP_READ_PLAN, body, [&context]() { return context.IsInterrupted(); });
+				started = true;
+			}
+		}
+		if (started) {
+			std::weak_ptr<N6kReadShared> weak = shared;
+			shared->req->SetOnFrame([weak]() {
+				if (auto held = weak.lock()) {
+					held->WakeAll();
+				}
+			});
+			if (partitions > static_cast<idx_t>(n6k::DEFAULT_BATCH_CREDITS)) {
+				// Widen the server's starting window so `partitions` batches can be in flight at once.
+				shared->req->Credit(NumericCast<uint32_t>(partitions - n6k::DEFAULT_BATCH_CREDITS));
+			}
+		}
+		auto reader = std::make_shared<N6kReader>(context);
+		return [shared, reader, catalog, types](ClientContext &ctx, DataChunk &chunk,
+		                                        const CrossingWaker &waker) -> CrossingReadResult {
+			return PullRead(ctx, *shared, *reader, chunk, waker, types, catalog);
+		};
 	};
+	return scan;
 }
 
 } // namespace
@@ -609,15 +683,8 @@ void N6kSession::Rollback() {
 
 CrossingScan N6kSession::Read(ClientContext &context, const CrossingQuery &query) {
 	auto body = n6k_body::ReadPlan(RenderCrossingPlan(query.plan), Txn());
-	CrossingScan scan;
-	scan.partitions = 1;
-	auto session_copy = session;
-	auto catalog = catalog_name;
-	auto types = query.types;
-	scan.open = [session_copy, catalog, body, types](ClientContext &ctx, idx_t) {
-		return OpenReader(ctx, session_copy, catalog, body, types);
-	};
-	return scan;
+	auto partitions = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	return OpenScan(session, catalog_name, body, query.types, MaxValue<idx_t>(partitions, 1));
 }
 
 CrossingWriter N6kSession::Write(ClientContext &context, const CrossingQuery &query) {
