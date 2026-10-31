@@ -13,10 +13,10 @@ constexpr LogLevel WsLogType::LEVEL;
 namespace {
 
 string WsLogMessage(const char *direction, const char *frame_type, const string &req_id, const string &ns,
-                    size_t bytes) {
+                    idx_t bytes) {
 	const string type_json = frame_type ? StringUtil::Format("\"%s\"", frame_type) : "null";
-	return StringUtil::Format("{\"direction\":\"%s\",\"frame_type\":%s,\"req_id\":%s,\"ns\":%s,\"bytes\":%llu}",
-	                          direction, type_json, req_id, ns, static_cast<unsigned long long>(bytes));
+	return StringUtil::Format("{\"direction\":\"%s\",\"frame_type\":%s,\"req_id\":%s,\"ns\":%s,\"bytes\":%d}",
+	                          direction, type_json, req_id, ns, bytes);
 }
 
 } // namespace
