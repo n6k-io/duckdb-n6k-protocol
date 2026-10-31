@@ -1,6 +1,6 @@
 [project]
 name = "n6k-duckdb"
-version = "0.12.0"
+version = "0.12.1"
 description = "In-process bridge between DuckDB connections with policy-based access control"
 readme = "README.md"
 authors = [
