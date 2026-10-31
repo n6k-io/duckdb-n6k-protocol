@@ -54,6 +54,7 @@ list(
     src/n6k_client/n6k_rpc_function.cpp
     src/n6k_client/n6k_version_function.cpp
     src/n6k_client/n6k_capabilities_function.cpp
+    src/n6k_client/n6k_client_settings_function.cpp
     src/n6k_client/n6k_thread_selftest.cpp
     src/n6k_client/n6k_io_thread_selftest.cpp
     src/n6k_client/ws_send_after_start_selftest.cpp

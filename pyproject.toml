@@ -4,7 +4,7 @@ version = "0"
 description = "Dev harness for the n6k DuckDB driver (workspace root). Not published."
 requires-python = ">=3.11"
 dependencies = [
-    "n6k-duckdb[test-server,mcp]",
+    "n6k-duckdb[duckdb,test-server,mcp]",
     # Must match the built C++ extension's DuckDB version.
     "duckdb==1.5.6",
 ]

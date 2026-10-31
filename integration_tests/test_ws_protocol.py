@@ -440,7 +440,7 @@ async def test_streaming_rpc_unbounded_backpressure_and_cancel(server):
 # ── Host-backed RPC (a Python generator, not a macro) ─────────────────────────
 #
 # These call the `py_*` targets the test server registers through
-# `n6k_server.rpc_stream`. The point of each is that no catalog entry exists for
+# `virtual_catalog.rpc_stream`. The point of each is that no catalog entry exists for
 # the name — the reactor resolves it to a generator in the server process.
 
 

@@ -15,7 +15,7 @@ with the binary frames.
 
 In-process rather than a spawned `duckdb`, because the reactor's workers open
 connections on *this* `DatabaseInstance`. That is what lets a table backed by
-`n6k_server.provider` — whose rows come from Python callbacks marshalled to this
+`virtual_catalog.provider` — whose rows come from Python callbacks marshalled to this
 event loop — be served at all. A subprocess would have its own database and no
 interpreter to call back into. `duckdb` releases the GIL for the whole of
 `execute()`, so the blocking `CALL` parks a thread without starving the loop.
@@ -54,7 +54,7 @@ from duckdb.func import FunctionNullHandling
 
 from n6k_protocol.protocol import APP_HELLO_CAPS, STREAM_FRAME_CLOSE, STREAM_FRAME_JSONRPC, STREAM_FRAME_N6K
 from n6k_server.context import _CURRENT, Connection
-from n6k_server.provider import release_providers
+from virtual_catalog.provider import release_providers
 
 logger = logging.getLogger("n6k_server.pump")
 

@@ -5,8 +5,8 @@ from typing import Optional
 
 import pyarrow as pa
 
-from n6k_protocol.filters import Filters
-from n6k_server.provider import Provider, TableNotFound
+from virtual_catalog.filters import Filters
+from virtual_catalog.provider import Provider, TableNotFound
 
 # Catalog name that routes to the providers below. A client that attaches
 # `n6k://host` AS slowdb (or with `catalog 'slowdb'`) lands on them.

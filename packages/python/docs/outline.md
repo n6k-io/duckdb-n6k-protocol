@@ -11,10 +11,11 @@ modules:
   collections.abc.Callable: Callable
   collections.abc.Awaitable: Awaitable
   collections.abc.AsyncIterator: AsyncIterator
+  collections.abc.Sequence: Sequence
   typing.Literal: Literal
   typing.Any: Any
-  n6k_server.provider.Provider: Provider
-  n6k_server.provider.AlterChange: AlterChange
+  virtual_catalog.provider.Provider: Provider
+  virtual_catalog.provider.AlterChange: AlterChange
   list[tuple[str, Literal['=', '!=', '<', '<=', '>', '>=', 'in', 'is_null', 'is_not_null'], Any]] | None: Filters
   list[tuple[str, Literal['=', '!=', '<', '<=', '>', '>=', 'in', 'is_null', 'is_not_null'], Any]]: list[FilterClause]
 ---
@@ -45,83 +46,83 @@ pip install "n6k-duckdb[test-server]"   # + FastAPI server framework
 
 ## Bridge
 
-::: n6k_server.bridge.bridge
+::: virtual_catalog.bridge.bridge
 
 ---
 
 ## Provider
 
-::: n6k_server.provider
+::: virtual_catalog.provider
 
 ### `Provider`
 
-::: n6k_server.provider.Provider
+::: virtual_catalog.provider.Provider
 
 #### `Provider.list_tables`
 
-::: n6k_server.provider.Provider.list_tables
+::: virtual_catalog.provider.Provider.list_tables
 
 #### `Provider.schema`
 
-::: n6k_server.provider.Provider.schema
+::: virtual_catalog.provider.Provider.schema
 
 #### `Provider.scan`
 
-::: n6k_server.provider.Provider.scan
+::: virtual_catalog.provider.Provider.scan
 
 #### `Provider.insert`
 
-::: n6k_server.provider.Provider.insert
+::: virtual_catalog.provider.Provider.insert
 
 #### `Provider.update`
 
-::: n6k_server.provider.Provider.update
+::: virtual_catalog.provider.Provider.update
 
 #### `Provider.delete`
 
-::: n6k_server.provider.Provider.delete
+::: virtual_catalog.provider.Provider.delete
 
 #### `Provider.alter`
 
-::: n6k_server.provider.Provider.alter
+::: virtual_catalog.provider.Provider.alter
 
 #### `Provider.invalidate`
 
-::: n6k_server.provider.Provider.invalidate
+::: virtual_catalog.provider.Provider.invalidate
 
 ### `register_provider`
 
-::: n6k_server.provider.register_provider
+::: virtual_catalog.provider.register_provider
 
 ### `invalidate_provider_tables`
 
-::: n6k_server.provider.invalidate_provider_tables
+::: virtual_catalog.provider.invalidate_provider_tables
 
 ### `TableNotFound`
 
-::: n6k_server.provider.TableNotFound
+::: virtual_catalog.provider.TableNotFound
 
 ### `AlterChange`
 
-::: n6k_server.provider.AlterChange
+::: virtual_catalog.provider.AlterChange
 
 ### `PK_METADATA_KEY`
 
-::: n6k_server.provider.PK_METADATA_KEY
+::: virtual_catalog.provider.PK_METADATA_KEY
 
 ---
 
 ## Filter helpers
 
-::: n6k_protocol.filters
+::: virtual_catalog.filters
 
 ### `filter_and_project`
 
-::: n6k_protocol.filters.filter_and_project
+::: virtual_catalog.filters.filter_and_project
 
 ### `split_pyarrow_filters`
 
-::: n6k_protocol.filters.split_pyarrow_filters
+::: virtual_catalog.filters.split_pyarrow_filters
 
 ---
 

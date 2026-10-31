@@ -12,7 +12,7 @@ pip install "n6k-duckdb[duckdb]"
 
 ```python
 import duckdb
-from n6k_server.bridge import Policy, bridge
+from virtual_catalog.bridge import Policy, bridge
 
 cfg = {"allow_unsigned_extensions": "true"}
 source = duckdb.connect(config=cfg)

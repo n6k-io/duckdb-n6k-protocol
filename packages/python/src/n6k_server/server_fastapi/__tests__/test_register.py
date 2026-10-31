@@ -42,9 +42,10 @@ from n6k_protocol.protocol import (
     OP_QUERY,
 )
 from n6k_server import pump
-from n6k_protocol.filters import Filters
-from n6k_server.extension import load_n6k_server, load_vcatprovider
-from n6k_server.provider import Provider, _catalogs, register_provider
+from virtual_catalog.filters import Filters
+from n6k_server.extension import load_n6k_server
+from virtual_catalog.extension import load_vcatprovider
+from virtual_catalog.provider import Provider, _catalogs, register_provider
 from n6k_server import context
 from n6k_server.jsonrpc import JsonRpc, JsonRpcApp
 from n6k_server.pump import Authorized, LazyCatalog, PendingCatalog, WsReject, build_serve_sql
