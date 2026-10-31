@@ -12,7 +12,7 @@ import os
 
 from dotenv import load_dotenv
 
-from n6k_server.extension import VIRTUAL_CATALOG_EXT_DIR_ENV
+from virtual_catalog.extension import VIRTUAL_CATALOG_EXT_DIR_ENV
 
 # this file: .../packages/python/src/n6k_server/test_server/_paths.py
 HERE = os.path.dirname(__file__)

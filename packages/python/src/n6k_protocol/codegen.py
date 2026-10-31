@@ -86,6 +86,17 @@ def render_hpp() -> str:
         lines.append(f"\t{name} = {value},")
     lines.append("};")
     lines.append("")
+    lines.append("// nullptr for a value outside FrameType.")
+    lines.append("inline const char *FrameTypeName(int type) {")
+    lines.append("\tswitch (type) {")
+    for name, value in P._FRAME_TYPES:
+        lines.append(f"\tcase {value}:")
+        lines.append(f'\t\treturn "{name}";')
+    lines.append("\tdefault:")
+    lines.append("\t\treturn nullptr;")
+    lines.append("\t}")
+    lines.append("}")
+    lines.append("")
     for name, value in P._FLAGS:
         lines.append(f"constexpr uint8_t FLAG_{name} = 0x{value:02x};")
     lines.append("")

@@ -1,6 +1,6 @@
 {
   "name": "@n6k.io/db",
-  "version": "0.11.4",
+  "version": "0.12.0",
   "description": "DuckDB-wasm driver for the n6k extension",
   "license": "MIT",
   "type": "module",

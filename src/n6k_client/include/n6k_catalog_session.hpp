@@ -13,6 +13,9 @@
 struct ArrowArrayStream;
 
 namespace duckdb {
+
+class Logger;
+
 namespace n6k {
 
 struct WsTableRow {
@@ -109,8 +112,8 @@ public:
 	// catalog_name = ATTACH alias; server_catalog defaults to it; ws_id/ws_fd ride a host socket.
 	static std::shared_ptr<CatalogSession> Create(const string &base_url, const string &token,
 	                                              const string &catalog_name, const string &server_catalog,
-	                                              const string &ws_id, int ws_fd,
-	                                              const StreamCancelCheck &should_abort);
+	                                              const string &ws_id, int ws_fd, const StreamCancelCheck &should_abort,
+	                                              shared_ptr<Logger> logger = nullptr);
 };
 
 } // namespace duckdb

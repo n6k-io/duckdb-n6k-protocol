@@ -21,8 +21,9 @@ from fastapi.responses import JSONResponse
 
 from n6k_server.context import current
 from n6k_server.jsonrpc import JsonRpc, JsonRpcError
-from n6k_server.extension import load_vcatprovider, load_n6k, load_n6k_server, load_n6k_testing
-from n6k_server.provider import register_provider
+from n6k_server.extension import load_n6k, load_n6k_server, load_n6k_testing
+from virtual_catalog.extension import load_vcatprovider
+from virtual_catalog.provider import register_provider
 from n6k_server.pump import LiveServe, PendingCatalog, ServedCatalog, WsReject
 from n6k_server.test_server.fixtures import fixture_statements, rpc_fixture_statements
 from n6k_server.test_server.host_rpc import register_host_rpcs

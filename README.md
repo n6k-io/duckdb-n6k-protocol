@@ -180,7 +180,7 @@ cd packages/python && uv pip install -e .
 ```
 
 ```python
-from n6k_server.bridge import Policy, bridge
+from virtual_catalog.bridge import Policy, bridge
 
 bridge(source, target, "my_bridge", source_catalog="memory", policies=[
     Policy("main.users", "select", "true"),

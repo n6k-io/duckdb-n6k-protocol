@@ -6,7 +6,7 @@ so tests can UPDATE/INSERT without seeing each other's writes.
 
 import duckdb
 
-from n6k_server.bridge import Policy, bridge
+from virtual_catalog.bridge import Policy, bridge
 from n6k_server.test_server.fixtures import fixture_statements
 
 # Clients that ATTACH with this alias get a bridge-backed catalog instead of the

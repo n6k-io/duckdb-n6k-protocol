@@ -42,6 +42,11 @@ public:
 
 	N6kTableInfo Info(const string &schema, const string &table);
 
+	//! In crossing's operator order.
+	vector<string> CrossingOperators();
+	//! `action` is set, add or remove.
+	vector<string> SetCrossingOperators(const string &action, const vector<string> &names);
+
 private:
 	void ListIfNeeded();
 
@@ -61,6 +66,8 @@ private:
 	case_insensitive_map_t<case_insensitive_map_t<N6kTableInfo>> tables;
 	case_insensitive_map_t<vector<string>> schema_verbs;
 	case_insensitive_map_t<case_insensitive_map_t<Columns>> described;
+	mutex crossing_lock;
+	case_insensitive_set_t crossing_operators;
 };
 
 class N6kSession {

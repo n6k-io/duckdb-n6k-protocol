@@ -390,10 +390,86 @@ string RenderCrossingPlan(const LogicalOperator &plan) {
 	return RenderSubstraitJson(plan);
 }
 
+//! The operators crossing can move (RuleKindFor in crossing's rules.cpp).
+static constexpr LogicalOperatorType CROSSING_OPERATOR_TYPES[] = {
+    LogicalOperatorType::LOGICAL_FILTER,
+    LogicalOperatorType::LOGICAL_PROJECTION,
+    LogicalOperatorType::LOGICAL_DISTINCT,
+    LogicalOperatorType::LOGICAL_SAMPLE,
+    LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY,
+    LogicalOperatorType::LOGICAL_WINDOW,
+    LogicalOperatorType::LOGICAL_UNNEST,
+    LogicalOperatorType::LOGICAL_PIVOT,
+    LogicalOperatorType::LOGICAL_JOIN,
+    LogicalOperatorType::LOGICAL_COMPARISON_JOIN,
+    LogicalOperatorType::LOGICAL_ANY_JOIN,
+    LogicalOperatorType::LOGICAL_ASOF_JOIN,
+    LogicalOperatorType::LOGICAL_POSITIONAL_JOIN,
+    LogicalOperatorType::LOGICAL_CROSS_PRODUCT,
+    LogicalOperatorType::LOGICAL_UNION,
+    LogicalOperatorType::LOGICAL_EXCEPT,
+    LogicalOperatorType::LOGICAL_INTERSECT,
+    LogicalOperatorType::LOGICAL_LIMIT,
+    LogicalOperatorType::LOGICAL_ORDER_BY,
+    LogicalOperatorType::LOGICAL_TOP_N,
+};
+
+static string CrossingOperatorName(LogicalOperatorType type) {
+	return StringUtil::Lower(LogicalOperatorToString(type));
+}
+
+static vector<string> AllCrossingOperators() {
+	vector<string> names;
+	for (auto type : CROSSING_OPERATOR_TYPES) {
+		names.push_back(CrossingOperatorName(type));
+	}
+	return names;
+}
+
 N6kSource::N6kSource(DatabaseInstance &db_p, std::shared_ptr<CatalogSession> session_p, string catalog_name_p)
     : db(db_p), session(std::move(session_p)), catalog_name(std::move(catalog_name_p)),
       group(session->HasCapability(n6k::CAP_CATALOG_PLANS) ? session->SocketGroup() : nullptr),
       floor_catalog(group ? session->ServerCatalog() : string()) {
+	for (auto &name : AllCrossingOperators()) {
+		crossing_operators.insert(name);
+	}
+}
+
+vector<string> N6kSource::CrossingOperators() {
+	lock_guard<mutex> guard(crossing_lock);
+	vector<string> names;
+	for (auto &name : AllCrossingOperators()) {
+		if (crossing_operators.count(name)) {
+			names.push_back(name);
+		}
+	}
+	return names;
+}
+
+vector<string> N6kSource::SetCrossingOperators(const string &action, const vector<string> &names) {
+	auto all = AllCrossingOperators();
+	case_insensitive_set_t known(all.begin(), all.end());
+	for (auto &name : names) {
+		if (!known.count(name)) {
+			throw InvalidInputException("n6k_client_set: unknown crossing operator \"%s\"; expected one of: %s", name,
+			                            StringUtil::Join(all, ", "));
+		}
+	}
+	{
+		lock_guard<mutex> guard(crossing_lock);
+		if (StringUtil::CIEquals(action, "set")) {
+			crossing_operators = case_insensitive_set_t(names.begin(), names.end());
+		} else if (StringUtil::CIEquals(action, "add")) {
+			crossing_operators.insert(names.begin(), names.end());
+		} else if (StringUtil::CIEquals(action, "remove")) {
+			for (auto &name : names) {
+				crossing_operators.erase(name);
+			}
+		} else {
+			throw InvalidInputException("n6k_client_set: unknown action \"%s\"; expected set, add or remove", action);
+		}
+	}
+	return CrossingOperators();
 }
 
 const void *N6kSource::Group() {
@@ -573,6 +649,13 @@ CrossingVerdict N6kSource::AcceptsType(const LogicalType &type) {
 }
 
 CrossingVerdict N6kSource::AcceptsOperator(const LogicalOperator &op) {
+	auto name = CrossingOperatorName(op.type);
+	{
+		lock_guard<mutex> guard(crossing_lock);
+		if (!crossing_operators.count(name)) {
+			return CrossingVerdict::No(name + " is not in the n6k_client_set crossing list");
+		}
+	}
 	std::string reason;
 	if (!SubstraitCanRenderOperator(op, reason)) {
 		return CrossingVerdict::No(reason);

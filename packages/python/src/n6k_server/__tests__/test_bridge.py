@@ -1,8 +1,9 @@
 import duckdb
 import pytest
 
-from n6k_server.bridge import Policy, bridge, unbridge
-from n6k_server.extension import load_n6k, load_vcatbridge
+from virtual_catalog.bridge import Policy, bridge, unbridge
+from n6k_server.extension import load_n6k
+from virtual_catalog.extension import load_vcatbridge
 
 CONN_CONFIG: dict[str, str | bool | int | float | list[str]] = {"allow_unsigned_extensions": "true"}
 

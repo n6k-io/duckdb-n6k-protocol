@@ -332,7 +332,8 @@ static constexpr size_t N6K_VSOCK_CHANNEL_BYTES = 2 * ((size_t(1) << 20) + 16);
 std::shared_ptr<CatalogSession> CatalogSession::Create(const string &base_url, const string &token,
                                                        const string &catalog_name, const string &server_catalog,
                                                        const string &ws_id, int ws_fd,
-                                                       const StreamCancelCheck &should_abort) {
+                                                       const StreamCancelCheck &should_abort,
+                                                       shared_ptr<Logger> logger) {
 	(void)ws_fd;
 	const string hello_catalog = server_catalog.empty() ? catalog_name : server_catalog;
 	// Per-attach session id lets ONE socket carry many catalogs.
@@ -381,6 +382,7 @@ std::shared_ptr<CatalogSession> CatalogSession::Create(const string &base_url, c
 
 	n6k::WsClientOptions opts;
 	opts.bearer_token = token;
+	opts.logger = std::move(logger);
 	opts.connect_timeout = std::chrono::seconds(5);
 	opts.catalog = hello_catalog;
 	opts.channel_key = catalog_name;
@@ -420,7 +422,8 @@ std::shared_ptr<CatalogSession> CatalogSession::Create(const string &base_url, c
 std::shared_ptr<CatalogSession> CatalogSession::Create(const string &base_url, const string &token,
                                                        const string &catalog_name, const string &server_catalog,
                                                        const string &ws_id, int ws_fd,
-                                                       const StreamCancelCheck &should_abort) {
+                                                       const StreamCancelCheck &should_abort,
+                                                       shared_ptr<Logger> logger) {
 	(void)ws_id;
 	const string hello_catalog = server_catalog.empty() ? catalog_name : server_catalog;
 
@@ -429,6 +432,7 @@ std::shared_ptr<CatalogSession> CatalogSession::Create(const string &base_url, c
 
 	n6k::WsClientOptions opts;
 	opts.bearer_token = token;
+	opts.logger = std::move(logger);
 	opts.connect_timeout = std::chrono::seconds(5);
 	opts.catalog = hello_catalog;
 	opts.ns = g_next_ns.fetch_add(1);

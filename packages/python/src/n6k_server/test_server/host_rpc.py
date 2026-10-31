@@ -1,7 +1,7 @@
 """Host-backed RPC targets for the test server.
 
 These are Python functions, not macros: they exercise the path in
-`n6k_server.rpc_stream` where an RPC name resolves to something living in this
+`virtual_catalog.rpc_stream` where an RPC name resolves to something living in this
 process rather than in the served DuckDB. `py_ticker` is the case that has no
 catalog form at all — it paces itself in wall-clock time and, given a count of
 zero, never ends.
@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator, List, Optional
 import duckdb
 import pyarrow as pa
 
-from n6k_server.rpc_stream import HostStreamUdfs, RpcRegistry, StreamingRpc, register_rpc_streams
+from virtual_catalog.rpc_stream import HostStreamUdfs, RpcRegistry, StreamingRpc, register_rpc_streams
 
 ECHO_SCHEMA = pa.schema([("arg0", pa.string())])
 TICK_SCHEMA = pa.schema([("seq", pa.int64())])

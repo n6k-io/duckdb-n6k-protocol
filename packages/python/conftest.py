@@ -21,7 +21,7 @@ from _pytest.config.argparsing import Parser
 from _pytest.fixtures import FixtureRequest
 from dotenv import load_dotenv
 
-from n6k_server.extension import VIRTUAL_CATALOG_EXT_DIR_ENV
+from virtual_catalog.extension import VIRTUAL_CATALOG_EXT_DIR_ENV
 
 HERE = os.path.dirname(__file__)
 # From this file: packages/python/conftest.py → repo root is 2 directories up.

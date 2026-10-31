@@ -32,7 +32,7 @@ bridge(
     name: str,
     *,
     source_catalog: str,
-    policies: Sequence[n6k_server.bridge.Policy],
+    policies: Sequence[virtual_catalog.bridge.Policy],
     context: dict[str, object] | None = None,
     lock: threading.Lock | None = None,
 ) -> str
@@ -64,7 +64,7 @@ Returns the bridge id. Raises `duckdb.Error` for an empty or invalid policy.
 
 ```python
 import duckdb
-from n6k_server.bridge import Policy, bridge
+from virtual_catalog.bridge import Policy, bridge
 
 cfg = {"allow_unsigned_extensions": "true"}
 source = duckdb.connect(config=cfg)
@@ -124,7 +124,7 @@ keyed by `PK_METADATA_KEY`, comma-separated.
 
 ```python
 import asyncio, duckdb, pyarrow as pa
-from n6k_server.provider import Provider, PK_METADATA_KEY, TableNotFound, register_provider
+from virtual_catalog.provider import Provider, PK_METADATA_KEY, TableNotFound, register_provider
 
 class Users(Provider):
     async def list_tables(self):
@@ -155,7 +155,7 @@ asyncio.run(main())
 `list_tables`, `schema`, and `scan` are required. `insert`, `update`, `delete`,
 and `alter` are **optional** — a provider supports an operation only by
 implementing the method. An unimplemented op is rejected at plan time and
-left out of the table's `verbs` reported by the `n6k_table_permissions` SQL
+left out of the table's `verbs` reported by the `vcatprovider_table_permissions` SQL
 function.
 
 ## Limitations
@@ -223,9 +223,9 @@ Read rows from `name`.
   if you can; a superset is also fine (the library projects down).
 - `filters` — list of `(col, op, value)` tuples or `None`. The
   provider **must** apply them; DuckDB does not re-filter. Operators
-  are in `n6k_protocol.filters.FilterOp`.
+  are in `virtual_catalog.filters.FilterOp`.
 
-Can't push down? Use `n6k_protocol.filters.filter_and_project()` on the
+Can't push down? Use `virtual_catalog.filters.filter_and_project()` on the
 full table. Parquet-backed? `split_pyarrow_filters()` partitions
 the clauses pyarrow understands from the `is_null` / `is_not_null`
 leftover.

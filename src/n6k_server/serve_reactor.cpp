@@ -4,6 +4,7 @@
 #include "host_callbacks.hpp"
 #include "n6k_exception_types.hpp"
 #include "n6k_served.hpp"
+#include "n6k_ws_log.hpp"
 #include "n6k_sql_builder.hpp"
 #include "n6k_stream_framing.hpp"
 #include "n6k_protocol_generated.hpp"
@@ -1433,6 +1434,11 @@ void ServeReactor::WriterLoop() {
 				return;
 			}
 			conn_.WriteFrame(frame.type, frame.payload);
+			if (frame.type == StreamFrameType::JSONRPC) {
+				DUCKDB_LOG(context_, WsLogType, "send", "JSONRPC", frame.payload);
+			} else {
+				DUCKDB_LOG(context_, WsLogType, "send", frame.payload);
+			}
 			frames_out_.fetch_add(1, std::memory_order_relaxed);
 			bytes_out_.fetch_add(static_cast<int64_t>(frame.payload.size()), std::memory_order_relaxed);
 		} catch (const std::exception &) {
@@ -1968,6 +1974,7 @@ int64_t ServeReactor::Run() {
 			frames_in_.fetch_add(1, std::memory_order_relaxed);
 			bytes_in_.fetch_add(static_cast<int64_t>(frame.size()), std::memory_order_relaxed);
 			if (frame_type == StreamFrameType::JSONRPC) {
+				DUCKDB_LOG(context_, WsLogType, "recv", "JSONRPC", frame);
 				if (options_.on_text.empty()) {
 					auto reply = JsonRpcMethodNotFoundReply(frame);
 					if (reply.empty()) {
@@ -1992,6 +1999,7 @@ int64_t ServeReactor::Run() {
 				}
 				continue;
 			}
+			DUCKDB_LOG(context_, WsLogType, "recv", frame);
 			msgpack::object_handle oh;
 			const char *raw_body;
 			size_t raw_body_len;

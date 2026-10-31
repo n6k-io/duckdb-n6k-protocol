@@ -20,9 +20,10 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from n6k_server.extension import load_n6k, load_vcatprovider
-from n6k_protocol.filters import Filters, filter_and_project
-from n6k_server.provider import (
+from n6k_server.extension import load_n6k
+from virtual_catalog.extension import load_vcatprovider
+from virtual_catalog.filters import Filters, filter_and_project
+from virtual_catalog.provider import (
     PK_METADATA_KEY,
     Provider,
     TableNotFound,
