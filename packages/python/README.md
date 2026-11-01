@@ -1,6 +1,10 @@
 # n6k-duckdb
 
-In-process bridge between DuckDB connections with policy-based access control.
+n6k protocol definitions (`n6k_protocol`) and the Python host for the
+`n6k_server` DuckDB extension (`n6k_server`).
+
+The in-process bridge and provider catalogs (`vcatbridge`, `vcatprovider`) are
+in [`duckdb-virtual-catalog`](https://pypi.org/project/duckdb-virtual-catalog/).
 
 ## Install
 
@@ -8,48 +12,10 @@ In-process bridge between DuckDB connections with policy-based access control.
 pip install "n6k-duckdb[duckdb]"
 ```
 
-## Usage
+## Server framework
 
-```python
-import duckdb
-from virtual_catalog.bridge import Policy, bridge
-
-cfg = {"allow_unsigned_extensions": "true"}
-source = duckdb.connect(config=cfg)
-source.sql("CREATE TABLE users(id INTEGER PRIMARY KEY, name VARCHAR)")
-source.sql("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')")
-
-target = duckdb.connect(config=cfg)
-bridge(source, target, "app", source_catalog="memory", policies=[
-    Policy("main.users", "select", "true"),
-    Policy("main.users", "insert", "true"),
-    Policy("main.users", "update", "true"),
-    Policy("main.users", "delete", "true"),
-])
-
-target.sql("SELECT * FROM app.main.users").show()
-target.sql("INSERT INTO app.main.users VALUES (3, 'charlie')")
-target.sql("UPDATE app.main.users SET name = 'Alice' WHERE id = 1")
-target.sql("DELETE FROM app.main.users WHERE id = 2")
-```
-
-## Policies
-
-One `Policy(table, setting, value)` per setting, passed to `vcatbridge_set_policy`.
-A verb (`select`, `insert`, `update`, `delete`) takes `True` or a predicate;
-`update` also takes `{"using": ..., "check": ...}`. `primary_key` takes a column
-list. Tables and verbs without a policy are inaccessible.
-
-## How it works
-
-`bridge()` loads the `vcatbridge` DuckDB extension — from `$VIRTUAL_CATALOG_EXT_DIR` when it holds a build, otherwise installed from the n6k extension repository. The extension creates an in-process bridge between two DuckDB database instances using a token-based handshake; one `bridge()` call is one attached catalog, and `unbridge()` detaches it.
-
-No network server is required — data flows directly between connections in the same process.
-
-## Server framework (optional extra)
-
-This package also ships a reusable FastAPI framework for serving the n6k
-protocol — install with `pip install "n6k-duckdb[test-server]"`.
+A reusable FastAPI framework for serving the n6k protocol — install with
+`pip install "n6k-duckdb[fastapi,duckdb]" uvicorn`.
 
 The protocol itself is **not implemented in Python**. It is served by the
 `n6k_server` DuckDB extension (C++); this package accepts the WebSocket, reads

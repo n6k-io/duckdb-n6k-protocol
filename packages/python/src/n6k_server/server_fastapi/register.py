@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Optio
 import duckdb
 from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 
-from n6k_server.pump import Authenticate, OnServe, OnText, Resolve, TextApp, WsReject, serve_and_close_connection
+from n6k_server.pump import Authenticate, OnClose, OnServe, OnText, Resolve, TextApp, WsReject, serve_and_close_connection
 from n6k_server.jsonrpc import JsonRpc, JsonRpcApp
 
 if TYPE_CHECKING:
@@ -82,6 +82,7 @@ def register(
     max_mcp_inflight: Optional[int] = 8,
     workers: Optional[int] = None,
     max_connections: Optional[int] = None,
+    on_close: Optional[OnClose] = None,
 ) -> APIRouter:
     """Mount `<prefix>/ws` on `app` and return the router.
 
@@ -90,7 +91,7 @@ def register(
     `authenticate` as keyword arguments. `ping_interval_ms`: None leaves the keepalive to
     `$N6K_PING_INTERVAL` (seconds), 0 disables it. `max_text_inflight`: None sets no limit on text
     handlers running at once. `max_mcp_inflight`: MCP requests running at once per connection; past
-    it a request is answered "server busy". None sets no limit. `workers`: as in
+    it a request is answered "server busy". None sets no limit. `workers`, `on_close`: as in
     `serve_and_close_connection`. `max_connections`: WebSockets served at once
     on this route; past it one is closed 1013 (try again later). None sets no limit.
     """
@@ -138,6 +139,7 @@ def register(
                 max_text_inflight=max_text_inflight,
                 max_mcp_inflight=max_mcp_inflight,
                 workers=workers,
+                on_close=on_close,
             )
         except WsReject as reject:
             await _close(ws, reject.code, reject.reason)
@@ -170,6 +172,7 @@ async def serve_ws(
     max_text_inflight: Optional[int] = None,
     max_mcp_inflight: Optional[int] = 8,
     workers: Optional[int] = None,
+    on_close: Optional[OnClose] = None,
 ) -> None:
     """Open the connection `connect` describes, authenticate and serve it, and let it clean up."""
     text_app = _text_app(on_text, jsonrpc, mcp, max_mcp_inflight)
@@ -191,6 +194,7 @@ async def serve_ws(
                 text_app=text_app,
                 max_text_inflight=max_text_inflight,
                 workers=workers,
+                on_close=on_close,
             )
         finally:
             # Resumes the generator past its `yield` so its `finally` runs. It must not
@@ -213,6 +217,7 @@ async def serve_ws(
         text_app=text_app,
         max_text_inflight=max_text_inflight,
         workers=workers,
+        on_close=on_close,
     )
 
 

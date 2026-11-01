@@ -17,6 +17,19 @@ import {
 } from "./virtual-socket/ws-demux";
 import { createCatalogRegistry } from "./workers/ws-registry";
 import { logger as log, isDebugEnabled } from "./logger";
+
+let liveWorkers = 0;
+const trackedWorkers = new WeakSet<Worker>();
+function trackWorker(w: Worker, label: string): void {
+  trackedWorkers.add(w);
+  liveWorkers++;
+  log.debug(`worker+ ${label} (live workers: ${liveWorkers})`);
+}
+function untrackWorker(w: Worker, label: string): void {
+  if (!trackedWorkers.delete(w)) return;
+  liveWorkers--;
+  log.debug(`worker- ${label} (live workers: ${liveWorkers})`);
+}
 import { CAP_JSONRPC } from "./protocol-generated";
 import {
   createJsonRpcClient,
@@ -34,6 +47,7 @@ export type CreateN6kWorkerOpts = {
   onCatalogsChanged?: (wsId: string, catalogs: string[]) => void;
   // The server invalidated `schemas` of an attached catalog (e.g. it swapped the catalog); cached reads are stale.
   onInvalidated?: (catalog: string, schemas: string[]) => void;
+  instanceId?: number;
 };
 
 export class HelloRefusedError extends Error {
@@ -87,6 +101,7 @@ export function createN6kWorker({
   onStatus,
   onCatalogsChanged,
   onInvalidated,
+  instanceId = 0,
 }: CreateN6kWorkerOpts): N6kWorkerHandle {
   if (typeof SharedArrayBuffer === "undefined") {
     throw new TypeError(
@@ -129,10 +144,10 @@ export function createN6kWorker({
     doorbellOffset: pp.doorbellOffset,
   });
 
-  // Catalogs pending a ring-region free, keyed by catalog → wasm-heap offset.
-  // Set on detach; the free fires only when that catalog's pump ws-worker acks it has
-  // released the ring ("pump-ring-released"), so we never free a region still in use.
-  const pendingRingFree = new Map<string, number>();
+  // Pump ws-worker → wasm-heap ring offset pending a free. Set on detach; the free fires only
+  // when that pump acks it has released the ring ("pump-ring-released"), so we never free a
+  // region still in use. Keyed by pump, not catalog: a re-ATTACH of the same name gets a new pump.
+  const pendingRingFree = new Map<Worker, number>();
 
   const LIST_TIMEOUT_MS = 10_000;
   type ConnectionRequest = {
@@ -178,6 +193,7 @@ export function createN6kWorker({
   const n6kChannel = new MessageChannel();
 
   const worker = new Worker(duckdbWorkerUrl, { type: "classic" });
+  trackWorker(worker, `#${instanceId} duckdb-worker`);
   worker.addEventListener("error", function (e) {
     log.error("duckdb-worker error:", e.message || e);
     log.error(
@@ -188,7 +204,13 @@ export function createN6kWorker({
     );
   });
   worker.postMessage(
-    { type: "n6k-init", mainWorkerUrl, n6kPort: n6kChannel.port2, debug },
+    {
+      type: "n6k-init",
+      mainWorkerUrl,
+      n6kPort: n6kChannel.port2,
+      debug,
+      instanceId,
+    },
     [n6kChannel.port2],
   );
 
@@ -196,8 +218,9 @@ export function createN6kWorker({
   const intentionalClose = new WeakSet<Worker>();
 
   // One ws-worker per catalog; dispose = graceful WS close then terminate backstop (avoids half-open server conns).
-  const wsWorkers = createCatalogRegistry<Worker>(undefined, function (w) {
+  const wsWorkers = createCatalogRegistry<Worker>(undefined, function (w, c) {
     intentionalClose.add(w);
+    untrackWorker(w, `#${instanceId} ws-worker catalog=${c}`);
     try {
       w.postMessage({ type: "close" });
     } catch {
@@ -217,9 +240,11 @@ export function createN6kWorker({
     const prev = wsWorkers.get(catalog);
     if (prev) {
       intentionalClose.add(prev);
+      untrackWorker(prev, `#${instanceId} ws-worker catalog=${catalog}`);
       prev.terminate();
     }
     const w = new Worker(wsWorkerUrl, { type: "classic" });
+    trackWorker(w, `#${instanceId} ws-worker catalog=${catalog}`);
     unref(w);
     w.addEventListener("error", function (ev) {
       log.error("ws-worker (pump) error:", ev.message || ev);
@@ -234,9 +259,9 @@ export function createN6kWorker({
       if (ev.data.type === "pump-ring-released") {
         // The pump finished with its ring; free the heap region iff a detach is pending
         // for this catalog (a plain socket drop leaves it for the reconnect to reuse).
-        const off = pendingRingFree.get(catalog);
+        const off = pendingRingFree.get(w);
         if (off !== undefined) {
-          pendingRingFree.delete(catalog);
+          pendingRingFree.delete(w);
           try {
             worker.postMessage({
               type: "n6k-vsock-free-ring",
@@ -763,8 +788,9 @@ export function createN6kWorker({
           // Schedule the ring-region free, honored once the pump acks release
           // (pump-ring-released). Set BEFORE closing the pump so the ack isn't missed.
           const pp = pumpParams.get(catalog);
-          if (pp) {
-            pendingRingFree.set(catalog, pp.ringOffset);
+          const pump = wsWorkers.get(catalog);
+          if (pp && pump) {
+            pendingRingFree.set(pump, pp.ringOffset);
           }
           detachExternalBinding(catalog);
           wsWorkers.remove(catalog);
@@ -778,11 +804,20 @@ export function createN6kWorker({
 
   function dispose(): void {
     wsWorkers.clear(); // graceful WS close + terminate backstop per ws-worker
+    for (const [wsId, client] of rpcClients) closeRegistration(wsId, client);
+    for (const state of externalSockets.values()) teardownExternalSocket(state);
+    externalSockets.clear();
+    externalBindings.clear();
+    catalogNs.clear();
+    wsIdToCatalogs.clear();
+    pumpParams.clear();
+    pendingRingFree.clear();
     try {
       n6kChannel.port1.close();
     } catch {
       /* ignore */
     }
+    untrackWorker(worker, `#${instanceId} duckdb-worker`);
   }
 
   return {

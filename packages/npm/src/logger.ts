@@ -39,20 +39,32 @@ const nativeLog = console.log.bind(console);
 const nativeWarn = console.warn.bind(console);
 const nativeError = console.error.bind(console);
 
+// One duckdb instance per worker, so a worker tags all its lines with that instance's id.
+let instanceTag = "";
+export function setLogInstance(id: number): void {
+  instanceTag = ` #${id}`;
+}
+
+export function stopwatch(): () => string {
+  const start = performance.now();
+  return () => `${(performance.now() - start).toFixed(0)}ms`;
+}
+
 export function createLogger(scope?: string): Logger {
-  const prefix = scope ? `[n6k:${scope}]` : "[n6k]";
+  const base = scope ? `[n6k:${scope}]` : "[n6k]";
+  const prefix = () => base + instanceTag;
   return {
     debug: (...args) => {
-      if (isDebugEnabled()) nativeLog(prefix, ...args);
+      if (isDebugEnabled()) nativeLog(prefix(), ...args);
     },
     log: (...args) => {
-      if (isDebugEnabled()) nativeLog(prefix, ...args);
+      if (isDebugEnabled()) nativeLog(prefix(), ...args);
     },
     warn: (...args) => {
-      nativeWarn(prefix, ...args);
+      nativeWarn(prefix(), ...args);
     },
     error: (...args) => {
-      nativeError(prefix, ...args);
+      nativeError(prefix(), ...args);
     },
   };
 }

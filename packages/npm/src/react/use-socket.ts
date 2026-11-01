@@ -1,6 +1,9 @@
 import type { RegisteredWebsocket } from "../create-n6k-worker";
-import { useDuckDB } from "./use-duckdb";
+import { useN6kSnapshot, type Subscribable } from "./use-n6k-snapshot";
 
-export function useSocket(name: string): RegisteredWebsocket | null {
-  return useDuckDB().registrations[name] ?? null;
+export function useSocket(
+  duckdb: Subscribable<{ registrations: Record<string, RegisteredWebsocket> }>,
+  name: string,
+): RegisteredWebsocket | null {
+  return useN6kSnapshot(duckdb).registrations[name] ?? null;
 }

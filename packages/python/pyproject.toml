@@ -1,7 +1,7 @@
 [project]
 name = "n6k-duckdb"
 version = "0.12.1"
-description = "In-process bridge between DuckDB connections with policy-based access control"
+description = "n6k protocol definitions and the Python host for the n6k_server DuckDB extension"
 readme = "README.md"
 authors = [
     { email = "srossross@gmail.com" }
@@ -16,13 +16,13 @@ requires-python = ">=3.9"
 dependencies = ["pyarrow", "numpy", "msgpack", "jsonschema", "typing_extensions"]
 
 [project.optional-dependencies]
-duckdb = ["duckdb>=1.5.6", "duckdb-virtual-catalog>=0.1.1"]
+duckdb = ["duckdb>=1.5.6"]
 fastapi = ["fastapi>=0.100", "starlette"]
+mcp = ["mcp>=2.3,<3; python_version >= '3.10'"]
 # watchfiles is not optional for the reload path: without it uvicorn falls back to
 # StatReload, which hardcodes rglob("*.py") and ignores reload_includes entirely —
 # so a rebuilt .duckdb_extension would never trigger a restart.
-mcp = ["mcp>=2.3,<3; python_version >= '3.10'"]
-test-server = ["fastapi>=0.100", "uvicorn>=0.27", "watchfiles>=0.21", "python-dotenv>=1"]
+test-server = ["fastapi>=0.100", "uvicorn>=0.27", "watchfiles>=0.21", "python-dotenv>=1", "duckdb>=1.5.6", "duckdb-virtual-catalog>=0.1.1"]
 
 [project.scripts]
 n6k-docs = "n6k_protocol.scripts.docgen:main"

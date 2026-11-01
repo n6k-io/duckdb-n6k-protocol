@@ -1,6 +1,6 @@
-export * from "./core";
-export { DuckDBProvider } from "./duckdb-provider";
-export type { DatabaseSpec } from "./duckdb-provider";
-export type { SocketSpec, SocketToken } from "./use-provider-sockets";
-export { createDuckDB } from "../create-duckdb";
-export type { CreateDuckDBOptions, WsStatus } from "../create-duckdb";
+export { useAttach } from "./use-attach";
+export type { Attach, AttachTarget } from "./use-attach";
+export { useSocket } from "./use-socket";
+export { useN6kSnapshot } from "./use-n6k-snapshot";
+export type { Subscribable } from "./use-n6k-snapshot";
+export { useDuckDBIframeHost } from "./use-duckdb-iframe-host";
