@@ -11,8 +11,7 @@
     "./native/*": "./src/native/*.ts",
     "./native-wasm-adapter/*": "./src/native-wasm-adapter/*.ts",
     "./react": "./src/react/index.ts",
-    "./react/core": "./src/react/core.ts",
-    "./react/iframe": "./src/react/iframe/index.ts",
+    "./iframe": "./src/iframe/index.ts",
     "./workers": "./src/workers/manifest.ts",
     "./workers/duckdb-worker": "./src/workers/duckdb-worker.ts",
     "./copy-wasm-extensions": "./src/copy-wasm-extensions.ts"
@@ -53,7 +52,6 @@
   "peerDependencies": {
     "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
     "@duckdb/node-api": "1.5.6-r.2",
-    "@tanstack/react-query": "^5",
     "@types/react": "^19.0.0",
     "react": "^19.2.4",
     "apache-arrow": "*"
@@ -66,6 +64,7 @@
   "devDependencies": {
     "@duckdb/node-api": "1.5.6-r.2",
     "@eslint/js": "^10.0.1",
+    "@types/bun": "^1.4.4",
     "@types/react-dom": "19.2.3",
     "eslint": "^10.0.3",
     "eslint-plugin-react": "^7.37.5",

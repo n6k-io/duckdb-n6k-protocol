@@ -1,6 +1,6 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { createN6kWorker, type RegisteredWebsocket } from "./create-n6k-worker";
-import { logger as log } from "./logger";
+import { logger as log, stopwatch } from "./logger";
 
 import type { WsStatus } from "./types";
 import { N6K_VERSION } from "./version";
@@ -9,9 +9,9 @@ import { N6K_DEFAULT_WORKER_URLS } from "./workers/manifest";
 export type CreateDuckDBOptions = {
   // Defaults to the jsDelivr CDN bundle; pass a local bundle for offline/hermetic use.
   bundle?: duckdb.DuckDBBundle;
-  // Task-scheduler thread cap at open() time. The threaded (coi) bundle deadlocks
-  // on LOAD/dlopen when scheduler pthreads are parked; open single-threaded, then
-  // raise threads after extensions are loaded.
+  // Task-scheduler thread cap at open() time; defaults to 1. The threaded (coi) bundle
+  // deadlocks on LOAD/dlopen when scheduler pthreads are parked, so `SET threads` above 1
+  // only after extensions are loaded. N6kDuckDB never raises it.
   maximumThreads?: number;
   duckdbWorkerUrl?: string;
   wsWorkerUrl?: string;
@@ -44,7 +44,10 @@ function jsDelivrBundlesWithCoi(): duckdb.DuckDBBundles {
   };
 }
 
-export async function createDuckDB(opts: CreateDuckDBOptions = {}): Promise<{
+let nextInstanceId = 1;
+
+export type DuckDBInstance = {
+  id: number;
   db: duckdb.AsyncDuckDB;
   conn: duckdb.AsyncDuckDBConnection;
   reconnect: (catalog: string) => void;
@@ -60,15 +63,23 @@ export async function createDuckDB(opts: CreateDuckDBOptions = {}): Promise<{
   ) => Promise<void>;
   // Catalog names the server serves on a registered wsId.
   listCatalogs: (wsId: string) => Promise<string[]>;
-}> {
+  // Terminates the duckdb worker, its pthreads and ws-workers. Idempotent.
+  dispose: () => Promise<void>;
+};
+
+export async function createDuckDB(
+  opts: CreateDuckDBOptions = {},
+): Promise<DuckDBInstance> {
+  const id = nextInstanceId++;
+  const sinceBoot = stopwatch();
   log.debug(
-    "(v" + N6K_VERSION + ") createDuckDB starting, crossOriginIsolated =",
+    `#${id} (v${N6K_VERSION}) createDuckDB starting, crossOriginIsolated =`,
     globalThis.crossOriginIsolated,
   );
 
   const bundle =
     opts.bundle ?? (await duckdb.selectBundle(jsDelivrBundlesWithCoi()));
-  log.debug("bundle selected:", {
+  log.debug(`#${id} bundle selected (${sinceBoot()}):`, {
     mainModule: bundle.mainModule,
     mainWorker: bundle.mainWorker,
     pthreadWorker: bundle.pthreadWorker,
@@ -95,7 +106,9 @@ export async function createDuckDB(opts: CreateDuckDBOptions = {}): Promise<{
     registerWebsocket,
     replaceWebsocket,
     listCatalogs,
+    dispose: disposeWorkers,
   } = createN6kWorker({
+    instanceId: id,
     mainWorkerUrl: bundle.mainWorker!,
     duckdbWorkerUrl:
       opts.duckdbWorkerUrl ?? N6K_DEFAULT_WORKER_URLS.duckdbWorkerUrl,
@@ -110,48 +123,68 @@ export async function createDuckDB(opts: CreateDuckDBOptions = {}): Promise<{
   };
   const db = new duckdb.AsyncDuckDB(duckdbLogger, worker);
 
-  log.debug("instantiating WASM...", {
-    mainModule: bundle.mainModule,
-    pthreadWorker: bundle.pthreadWorker,
-  });
+  let disposed: Promise<void> | undefined;
+  const dispose = () => {
+    disposed ??= (async () => {
+      log.debug(`#${id} disposing`);
+      disposeWorkers();
+      await db.terminate();
+    })();
+    return disposed;
+  };
+
   try {
-    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    return await boot();
   } catch (error) {
-    log.error("WASM instantiation failed:", error);
+    await dispose();
     throw error;
   }
-  log.debug("WASM instantiated");
 
-  // The threaded (coi) bundle deadlocks on LOAD/dlopen when scheduler pthreads are
-  // parked, so always open single-threaded; the caller raises `SET threads` after
-  // `LOAD n6k_client`. coi is the only supported bundle, so this is unconditional. An
-  // explicit opts.maximumThreads always wins.
-  const maximumThreads = opts.maximumThreads ?? 1;
-  log.debug("opening database with accessMode READ_WRITE...", {
-    maximumThreads,
-  });
-  await db.open({
-    accessMode: duckdb.DuckDBAccessMode.READ_WRITE,
-    allowUnsignedExtensions: true,
-    maximumThreads,
-  });
-  log.debug("database opened");
+  async function boot(): Promise<DuckDBInstance> {
+    const sinceInstantiate = stopwatch();
+    log.debug(`#${id} instantiating WASM...`, {
+      mainModule: bundle.mainModule,
+      pthreadWorker: bundle.pthreadWorker,
+    });
+    try {
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    } catch (error) {
+      log.error("WASM instantiation failed:", error);
+      throw error;
+    }
+    log.debug(`#${id} WASM instantiated (${sinceInstantiate()})`);
 
-  const conn = await db.connect();
-  log.debug("connection created");
+    const maximumThreads = opts.maximumThreads ?? 1;
+    const sinceOpen = stopwatch();
+    log.debug(`#${id} opening database with accessMode READ_WRITE...`, {
+      maximumThreads,
+    });
+    await db.open({
+      accessMode: duckdb.DuckDBAccessMode.READ_WRITE,
+      allowUnsignedExtensions: true,
+      maximumThreads,
+    });
+    log.debug(`#${id} database opened (${sinceOpen()})`);
 
-  const extensionRepo = opts.extensionRepository ?? globalThis.location.origin;
-  log.debug("setting extension repository:", extensionRepo);
-  await conn.query(`SET custom_extension_repository = '${extensionRepo}';`);
+    const conn = await db.connect();
+    log.debug(`#${id} connection created (boot so far ${sinceBoot()})`);
 
-  return {
-    db,
-    conn,
-    reconnect,
-    registerWebsocket,
-    replaceWebsocket,
-    listCatalogs,
-  };
+    const extensionRepo =
+      opts.extensionRepository ?? globalThis.location.origin;
+    log.debug("setting extension repository:", extensionRepo);
+    await conn.query(`SET custom_extension_repository = '${extensionRepo}';`);
+
+    return {
+      id,
+      db,
+      conn,
+      reconnect,
+      registerWebsocket,
+      replaceWebsocket,
+      listCatalogs,
+      dispose,
+    };
+  }
 }
 
 export { type WsStatus } from "./types";

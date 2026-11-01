@@ -45,7 +45,7 @@ from n6k_server import pump
 from virtual_catalog.filters import Filters
 from n6k_server.extension import load_n6k_server
 from virtual_catalog.extension import load_vcatprovider
-from virtual_catalog.provider import Provider, _catalogs, register_provider
+from virtual_catalog.provider import Provider, _catalogs, register_provider, release_providers
 from n6k_server import context
 from n6k_server.jsonrpc import JsonRpc, JsonRpcApp
 from n6k_server.pump import Authorized, LazyCatalog, PendingCatalog, WsReject, build_serve_sql
@@ -429,7 +429,7 @@ def test_closing_a_socket_releases_the_providers_it_registered():
     async def with_provider(con: duckdb.DuckDBPyConnection, token: str) -> list[str]:
         return _attach_provider(con, providers)
 
-    host = _Host(with_provider)
+    host = _Host(with_provider, on_close=release_providers)
     with TestClient(host.app()).websocket_connect("/ws") as ws:
         ws.send_bytes(pack_frame({"t": FT_HELLO, "token": "x", "protocol_version": N6K_PROTOCOL_VERSION}))
         assert _recv(ws)["t"] == FT_HELLO_ACK
@@ -450,7 +450,7 @@ def test_a_socket_closed_after_the_join_timeout_still_releases_its_providers(mon
         host.events.append("authenticate-done")
         return result
 
-    host = _Host(slow)
+    host = _Host(slow, on_close=release_providers)
     with TestClient(host.app()) as client:
         with client.websocket_connect("/ws") as ws:
             ws.send_bytes(pack_frame({"t": FT_HELLO, "token": "x", "protocol_version": N6K_PROTOCOL_VERSION}))
@@ -490,7 +490,7 @@ def test_closing_a_socket_while_a_provider_query_waits_on_the_loop_does_not_dead
             asyncio.to_thread(lambda: cur.execute("SELECT schema_name FROM duckdb_schemas()").fetchall())
         )
 
-    host = _Host(with_provider, on_serve)
+    host = _Host(with_provider, on_serve, on_close=release_providers)
 
     def run() -> None:
         with TestClient(host.app()).websocket_connect("/ws") as ws:

@@ -7,7 +7,7 @@ import {
   makeConfig,
   renderAttachSql,
   type AttachOptions,
-} from "../react/attachment";
+} from "../attach/attachment";
 import { logger as log } from "../logger";
 
 export type NativeDatabaseSpec =

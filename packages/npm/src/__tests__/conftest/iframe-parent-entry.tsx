@@ -1,23 +1,36 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { createRoot } from "react-dom/client";
 import { createDuckDB } from "../../create-duckdb";
 import type { ConnectionLike } from "../../connection-shape";
+import type { IframeHostTarget } from "../../iframe/host";
+import type { N6kDuckDBSnapshot } from "../../n6k-duckdb";
+import { useDuckDBIframeHost } from "../../react/use-duckdb-iframe-host";
 import { createWasmConnect, type WasmDatabase } from "../../wasm-lease";
-import {
-  DuckDBContext,
-  type DuckDBContextValue,
-} from "../../react/duckdb-context";
-import { useDuckDBIframeHost } from "../../react/iframe/use-duckdb-iframe-host";
 import "./iframe-e2e-types";
+
+const SNAPSHOT: N6kDuckDBSnapshot = {
+  status: "ready",
+  error: null,
+  connStatus: {},
+  invalidations: {},
+  desired: {},
+  attached: {},
+  errors: {},
+  registrations: {},
+};
+const unsubscribe = () => {};
+const ignore = () => {};
 
 function Host({
   iframeRef,
+  target,
   allowedOrigins,
 }: {
   iframeRef: RefObject<HTMLIFrameElement | null>;
+  target: IframeHostTarget;
   allowedOrigins: string[];
 }) {
-  useDuckDBIframeHost(iframeRef, { allowedOrigins });
+  useDuckDBIframeHost(iframeRef, target, { allowedOrigins });
   return null;
 }
 
@@ -31,48 +44,21 @@ function opaqueChildSrcdoc(parentOrigin: string): string {
   );
 }
 
-function ParentApp({
-  conn,
-  connect,
-}: {
-  conn: ConnectionLike;
-  connect: () => Promise<ConnectionLike>;
-}) {
+function ParentApp({ target }: { target: IframeHostTarget }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const opaqueRef = useRef<HTMLIFrameElement>(null);
   const [, setBump] = useState(0);
   const origin = globalThis.location.origin;
-
-  const value = useMemo<DuckDBContextValue>(
-    () => ({
-      conn,
-      status: "ready",
-      error: null,
-      connStatus: {},
-      invalidations: {},
-      desired: {},
-      attached: {},
-      errors: {},
-      setDesired: () => {},
-      removeDesired: () => {},
-      reconnect: () => {},
-      registerWebsocket: async () => "",
-      replaceWebsocket: async () => {},
-      listCatalogs: async () => [],
-      connect,
-    }),
-    [conn, connect],
-  );
 
   useEffect(() => {
     globalThis.__bumpParent = () => setBump((b) => b + 1);
   }, []);
 
   return (
-    <DuckDBContext.Provider value={value}>
-      <Host iframeRef={iframeRef} allowedOrigins={[origin]} />
+    <>
+      <Host iframeRef={iframeRef} target={target} allowedOrigins={[origin]} />
       <iframe ref={iframeRef} src="/child" title="child" />
-      <Host iframeRef={opaqueRef} allowedOrigins={["null"]} />
+      <Host iframeRef={opaqueRef} target={target} allowedOrigins={["null"]} />
       <iframe
         ref={opaqueRef}
         name="opaque"
@@ -80,7 +66,7 @@ function ParentApp({
         sandbox="allow-scripts"
         srcDoc={opaqueChildSrcdoc(origin)}
       />
-    </DuckDBContext.Provider>
+    </>
   );
 }
 
@@ -102,8 +88,18 @@ async function boot(): Promise<void> {
 
   const el = document.querySelector("#root");
   if (!el) throw new Error("missing #root");
-  const connect = createWasmConnect(db as unknown as WasmDatabase);
-  createRoot(el).render(<ParentApp conn={conn} connect={connect} />);
+  const connect: () => Promise<ConnectionLike> = createWasmConnect(
+    db as unknown as WasmDatabase,
+  );
+  const target: IframeHostTarget = {
+    subscribe: () => unsubscribe,
+    getSnapshot: () => SNAPSHOT,
+    connect,
+    setDesired: ignore,
+    removeDesired: ignore,
+    reconnect: ignore,
+  };
+  createRoot(el).render(<ParentApp target={target} />);
   globalThis.__parentReady = true;
 }
 

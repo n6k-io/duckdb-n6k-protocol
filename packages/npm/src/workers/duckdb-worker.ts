@@ -2,7 +2,7 @@
 
 declare function importScripts(...urls: string[]): void;
 
-import { applyHostDebugFlag, createLogger } from "../logger";
+import { applyHostDebugFlag, createLogger, setLogInstance } from "../logger";
 import { N6K_VERSION } from "../version";
 import { createVsockRegistry } from "../virtual-socket/duckdb-glue";
 
@@ -16,6 +16,7 @@ interface N6kInitMessage {
   n6kPort: MessagePort;
   // Page debug snapshot; workers can't read localStorage.
   debug?: boolean;
+  instanceId?: number;
 }
 
 // Per-catalog vsock channels for the shared-WsClient path.
@@ -142,7 +143,7 @@ type VsockCarrier = {
   ringOffset: number;
   doorbellOffset: number;
 };
-// Ring offset per attached catalog, for the n6k-vsock-selftest probe.
+// Ring offset per attached catalog; identifies which endpoint a ring free belongs to.
 const vsockAttachInfo = new Map<string, number>();
 // wsId -> HELLO_ACK capabilities, posted by the host after it handshakes an app socket.
 const helloCapsByWsId = new Map<string, string[]>();
@@ -174,8 +175,10 @@ globalThis.addEventListener(
   "message",
   function _n6kInitHandler(e: MessageEvent) {
     if (!(e.data && e.data.type === "n6k-init")) return;
-    const { mainWorkerUrl, n6kPort, debug } = e.data as N6kInitMessage;
+    const { mainWorkerUrl, n6kPort, debug, instanceId } =
+      e.data as N6kInitMessage;
     applyHostDebugFlag(debug);
+    if (instanceId !== undefined) setLogInstance(instanceId);
 
     const api: N6kApiWithVersion = {
       version: N6K_PROTOCOL_VERSION,
@@ -259,8 +262,15 @@ globalThis.addEventListener(
       if (m.type === "n6k-vsock-free-ring") {
         // Drop the (now-closed) endpoint first so its stale ring views can't be reused,
         // then return the region to duckdb's allocator.
-        if (typeof m.catalog === "string") vsock.unregister(m.catalog);
         const off = m.ringOffset;
+        // Skip if the catalog was re-attached meanwhile: the registered endpoint is the new one.
+        if (
+          typeof m.catalog === "string" &&
+          vsockAttachInfo.get(m.catalog) === off
+        ) {
+          vsock.unregister(m.catalog);
+          vsockAttachInfo.delete(m.catalog);
+        }
         if (capturedWasmFree && typeof off === "number") capturedWasmFree(off);
         return;
       }

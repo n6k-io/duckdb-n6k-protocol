@@ -29,7 +29,6 @@ import inspect
 import json
 import logging
 import socket
-import struct
 import threading
 import uuid
 from concurrent.futures import Future
@@ -54,11 +53,10 @@ from duckdb.func import FunctionNullHandling
 
 from n6k_protocol.protocol import APP_HELLO_CAPS, STREAM_FRAME_CLOSE, STREAM_FRAME_JSONRPC, STREAM_FRAME_N6K
 from n6k_server.context import _CURRENT, Connection
-from virtual_catalog.provider import release_providers
+from n6k_server.stream import FrameTooLarge, read_frame, write_frame
 
 logger = logging.getLogger("n6k_server.pump")
 
-STREAM_HEADER = struct.Struct(">IB")
 # Bounds a corrupt length prefix from the extension; far above any real frame.
 MAX_FRAME_BYTES = 1 << 30
 # How long to wait for the serving thread to unwind after the socket drops.
@@ -215,7 +213,7 @@ class Upstream:
                 await self._text(message)
                 continue
             try:
-                writer.write(STREAM_HEADER.pack(len(message), STREAM_FRAME_N6K) + message)
+                write_frame(writer, STREAM_FRAME_N6K, message)
                 await writer.drain()
             except Exception as exc:  # noqa: BLE001
                 return f"the extension closed the upstream: {exc or type(exc).__name__}"
@@ -223,16 +221,14 @@ class Upstream:
     async def _sock_to_ws(self, reader: asyncio.StreamReader) -> str:
         while True:
             try:
-                header = await reader.readexactly(STREAM_HEADER.size)
-            except (asyncio.IncompleteReadError, ConnectionError):
+                frame = await read_frame(reader, MAX_FRAME_BYTES)
+            except ConnectionError:
                 return "the extension closed the upstream"
-            n, frame_type = STREAM_HEADER.unpack(header)
-            if n > MAX_FRAME_BYTES:
-                return f"frame of {n} bytes from the extension exceeds {MAX_FRAME_BYTES}"
-            try:
-                data = await reader.readexactly(n)
-            except (asyncio.IncompleteReadError, ConnectionError):
+            except FrameTooLarge as exc:
+                return f"{exc} (from the extension)"
+            if frame is None:
                 return "the extension closed the upstream"
+            frame_type, data = frame
             if frame_type != STREAM_FRAME_N6K:
                 logger.error("dropping stream frame type 0x%02x from the extension for an upstream", frame_type)
                 continue
@@ -517,6 +513,7 @@ class LiveServe:
 OnServe = Callable[..., Optional[Awaitable[None]]]
 Resolve = Callable[[LiveServe, str], Optional[Awaitable[None]]]
 OnText = Callable[..., Optional[Awaitable[None]]]
+OnClose = Callable[[duckdb.DuckDBPyConnection], None]
 SendText = Callable[[str], Awaitable[None]]
 
 
@@ -1085,23 +1082,22 @@ def _start_directions(
             if data is None:
                 data = (message.get("text") or "").encode()
                 frame_type = STREAM_FRAME_JSONRPC
-            writer.write(STREAM_HEADER.pack(len(data), frame_type) + data)
+            write_frame(writer, frame_type, data)
             await writer.drain()
 
     async def sock_to_ws() -> None:
         while True:
             try:
-                header = await reader.readexactly(STREAM_HEADER.size)
-            except asyncio.IncompleteReadError:
+                frame = await read_frame(reader, MAX_FRAME_BYTES)
+            except FrameTooLarge as exc:
+                logger.error("closing: %s (from the extension)", exc)
+                return
+            if frame is None:
                 return  # the extension closed
-            n, frame_type = STREAM_HEADER.unpack(header)
+            frame_type, data = frame
             if frame_type not in (STREAM_FRAME_N6K, STREAM_FRAME_JSONRPC, STREAM_FRAME_CLOSE):
                 logger.error("closing: stream frame type 0x%02x from the extension", frame_type)
                 return
-            if n > MAX_FRAME_BYTES:
-                logger.error("closing: frame of %d bytes from the extension exceeds %d", n, MAX_FRAME_BYTES)
-                return
-            data = await reader.readexactly(n)
             if frame_type == STREAM_FRAME_CLOSE:
                 close = msgpack.unpackb(data)
                 async with send_lock:
@@ -1134,11 +1130,12 @@ async def _exited_within(task: "Optional[asyncio.Future[Any]]", timeout: float) 
     return True
 
 
-def _close_con(con: duckdb.DuckDBPyConnection) -> None:
-    try:
-        release_providers(con)
-    except Exception:  # noqa: BLE001 - the connection is closed regardless
-        logger.exception("releasing providers failed")
+def _close_con(con: duckdb.DuckDBPyConnection, on_close: Optional[OnClose]) -> None:
+    if on_close is not None:
+        try:
+            on_close(con)
+        except Exception:  # noqa: BLE001 - the connection is closed regardless
+            logger.exception("on_close failed")
     con.close()
 
 
@@ -1150,9 +1147,11 @@ def _close_cursors(cursors: Sequence[duckdb.DuckDBPyConnection]) -> None:
             pass
 
 
-def _close_all(cursors: Sequence[duckdb.DuckDBPyConnection], con: duckdb.DuckDBPyConnection) -> None:
+def _close_all(
+    cursors: Sequence[duckdb.DuckDBPyConnection], con: duckdb.DuckDBPyConnection, on_close: Optional[OnClose]
+) -> None:
     _close_cursors(cursors)
-    _close_con(con)
+    _close_con(con, on_close)
 
 
 def _on_own_thread(fn: Callable[..., Any], *args: Any) -> "asyncio.Future[Any]":
@@ -1205,6 +1204,7 @@ async def serve_and_close_connection(
     resolve: Optional[Resolve] = None,
     max_text_inflight: Optional[int] = None,
     workers: Optional[int] = None,
+    on_close: Optional[OnClose] = None,
 ) -> None:
     """Handshake, authenticate, then serve `ws` from `con` until either side drops; then close `con`.
 
@@ -1244,7 +1244,9 @@ async def serve_and_close_connection(
     `workers`: `n6k_serve_fd`'s `workers` option; None keeps its default.
 
     `con` is closed off the event loop and only after every query on it returns; this returns without
-    waiting for them, so a query that never returns leaves `con` open.
+    waiting for them, so a query that never returns leaves `con` open. `on_close(con)` runs on that
+    thread after the cursors close and before `con.close()`, with nothing else using `con`; if it raises, the error is logged and `con` is
+    closed anyway.
     """
     if on_text is not None and text_app is not None:
         raise ValueError("pass on_text or text_app, not both")
@@ -1340,8 +1342,8 @@ async def serve_and_close_connection(
         if busy:
 
             def close_late(_: "asyncio.Future[Any]") -> None:
-                loop.run_in_executor(None, _close_all, [*cursors, *late_cursors], con)
+                loop.run_in_executor(None, _close_all, [*cursors, *late_cursors], con, on_close)
 
             asyncio.gather(*busy, return_exceptions=True).add_done_callback(close_late)
         else:
-            await loop.run_in_executor(None, _close_all, cursors, con)
+            await loop.run_in_executor(None, _close_all, cursors, con, on_close)

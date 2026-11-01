@@ -7,7 +7,7 @@ import {
   configFingerprint,
   renderAttachSql,
   type AttachState,
-} from "../react/attachment";
+} from "../attach/attachment";
 
 const empty = (): AttachState => ({ desired: {}, attached: {}, errors: {} });
 

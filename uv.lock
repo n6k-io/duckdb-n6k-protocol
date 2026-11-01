@@ -763,7 +763,7 @@ wheels = [
 
 [[package]]
 name = "n6k-duckdb"
-version = "0.12.0"
+version = "0.12.1"
 source = { editable = "packages/python" }
 dependencies = [
     { name = "jsonschema" },
@@ -776,7 +776,6 @@ dependencies = [
 [package.optional-dependencies]
 duckdb = [
     { name = "duckdb" },
-    { name = "duckdb-virtual-catalog" },
 ]
 fastapi = [
     { name = "fastapi" },
@@ -786,6 +785,8 @@ mcp = [
     { name = "mcp" },
 ]
 test-server = [
+    { name = "duckdb" },
+    { name = "duckdb-virtual-catalog" },
     { name = "fastapi" },
     { name = "python-dotenv" },
     { name = "uvicorn" },
@@ -814,7 +815,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.5.6" },
-    { name = "duckdb-virtual-catalog", marker = "extra == 'duckdb'", specifier = ">=0.1.1" },
+    { name = "duckdb", marker = "extra == 'test-server'", specifier = ">=1.5.6" },
+    { name = "duckdb-virtual-catalog", marker = "extra == 'test-server'", specifier = ">=0.1.1" },
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.100" },
     { name = "fastapi", marker = "extra == 'test-server'", specifier = ">=0.100" },
     { name = "jsonschema" },

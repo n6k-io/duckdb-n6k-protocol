@@ -1,37 +1,49 @@
 // Lease a wasm connection per read; concurrent send()s on one connection silently split rows — lease, use, close.
 // We never build an apache-arrow Table: duckdb-wasm bundles v17, this package v21; batches carry schema+toArray().
 
-import type { ArrowLikeResult, ConnectionLike } from "./connection-shape";
+import type { AsyncDuckDB } from "@duckdb/duckdb-wasm";
+import type {
+  ArrowLikeBatch,
+  ArrowLikeResult,
+  ConnectionLike,
+  StreamReader,
+} from "./connection-shape";
 
 const EMPTY_SCHEMA: ArrowLikeResult["schema"] = { fields: [] };
 
-type RawBatch = {
-  schema: ArrowLikeResult["schema"];
-  toArray(): Array<{ toJSON(): Record<string, unknown> }>;
-};
+type RawBatch = ArrowLikeBatch;
 
 // The surface of duckdb-wasm's AsyncDuckDBConnection that we rely on.
 export type RawWasmConnection = {
   send(
     sql: string,
     allowStreamResult?: boolean,
-  ): Promise<AsyncIterable<RawBatch> | undefined>;
+  ): Promise<StreamReader | undefined>;
   close(): Promise<void>;
-  useUnsafe<R>(callback: (bindings: never, connId: number) => R): R;
+  useUnsafe<R>(callback: (bindings: AsyncDuckDB, connId: number) => R): R;
 };
 
 export type WasmDatabase = { connect(): Promise<RawWasmConnection> };
+
+// send() answers `undefined` (not a rejection) once the worker is detached.
+async function sendOrThrow(
+  raw: RawWasmConnection,
+  sql: string,
+  allowStreamResult?: boolean,
+): Promise<StreamReader> {
+  const reader = await raw.send(sql, allowStreamResult);
+  if (!reader) {
+    throw new Error(`duckdb worker detached while running: ${sql}`);
+  }
+  return reader;
+}
 
 export async function queryViaSend(
   raw: RawWasmConnection,
   sql: string,
 ): Promise<ArrowLikeResult> {
   // allowStreamResult=true delivers batches incrementally, which is what makes a read cancellable (close mid-drain).
-  // send() answers `undefined` (not a rejection) once the worker is detached.
-  const reader = await raw.send(sql, true);
-  if (!reader) {
-    throw new Error(`duckdb worker detached while running: ${sql}`);
-  }
+  const reader = await sendOrThrow(raw, sql, true);
 
   const batches: RawBatch[] = [];
   for await (const batch of reader) batches.push(batch);
@@ -55,8 +67,8 @@ export function createWasmConnect(
       query: (sql: string) => queryViaSend(raw, sql),
       close: () => raw.close(),
       send: (sql: string, allowStreamResult?: boolean) =>
-        raw.send(sql, allowStreamResult),
+        sendOrThrow(raw, sql, allowStreamResult),
       useUnsafe: raw.useUnsafe.bind(raw),
-    } as unknown as ConnectionLike;
+    };
   };
 }

@@ -1,11 +1,20 @@
 import { useCallback, useEffect } from "react";
-import { useDuckDB } from "./use-duckdb";
 import {
   configFingerprint,
   makeConfig,
+  type AttachConfig,
   type AttachOptions,
-} from "./attachment";
+} from "../attach/attachment";
 import type { WsStatus } from "../types";
+import { useN6kSnapshot, type Subscribable } from "./use-n6k-snapshot";
+
+export type AttachTarget = Subscribable<{
+  connStatus: Record<string, WsStatus>;
+}> & {
+  setDesired: (catalog: string, config: AttachConfig) => void;
+  removeDesired: (catalog: string) => void;
+  reconnect: (catalog: string) => void;
+};
 
 export type Attach = {
   status: WsStatus | undefined;
@@ -13,22 +22,23 @@ export type Attach = {
 };
 
 export function useAttach(
+  duckdb: AttachTarget,
   catalog: string,
   path: string,
   options?: AttachOptions,
 ): Attach {
-  const { setDesired, removeDesired, connStatus, reconnect } = useDuckDB();
+  const { connStatus } = useN6kSnapshot(duckdb);
   const config = makeConfig(path, options);
   const fingerprint = configFingerprint(config);
   useEffect(() => {
-    setDesired(catalog, config);
-    return () => removeDesired(catalog);
+    duckdb.setDesired(catalog, config);
+    return () => duckdb.removeDesired(catalog);
     // `config` is recreated each render; `fingerprint` is its stable identity — depending on `config` would oscillate desired state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catalog, fingerprint, setDesired, removeDesired]);
+  }, [duckdb, catalog, fingerprint]);
 
   return {
     status: connStatus[catalog],
-    reconnect: useCallback(() => reconnect(catalog), [reconnect, catalog]),
+    reconnect: useCallback(() => duckdb.reconnect(catalog), [duckdb, catalog]),
   };
 }

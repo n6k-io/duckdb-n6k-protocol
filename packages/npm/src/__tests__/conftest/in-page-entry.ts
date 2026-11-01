@@ -1,7 +1,7 @@
 import { createDuckDB } from "../../create-duckdb";
 import type { RegisteredWebsocket } from "../../create-n6k-worker";
 import { createWasmConnect, queryViaSend } from "../../wasm-lease";
-import { parseSqlTables } from "../../react/parse-sql-tables";
+import { parseSqlTables } from "../../metadata/parse-sql-tables";
 import { withLease, type ConnectionLike } from "../../connection-shape";
 import { unpackFrame } from "../../ws-framing";
 import type * as duckdb from "@duckdb/duckdb-wasm";
