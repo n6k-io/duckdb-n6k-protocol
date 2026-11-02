@@ -155,9 +155,9 @@ await replaceWebsocket(wsId, newWs, token); // re-HELLOs, then re-OPENs every at
 One registered socket can back several catalogs: each `ATTACH` opens its own
 `ns`-scoped session on it.
 
-`N6kDuckDB`'s `setSockets`/`setDatabases` do the register → ATTACH →
-`replaceWebsocket` steps for you, and its catalogs are `pending` until they
-attach. See the [npm README](../packages/npm/README.md#setdatabasesdatabases--setsocketssockets).
+`N6kDuckDB`'s `sockets`/`databases` options do the register → ATTACH →
+`replaceWebsocket` steps for you, and its `connect()` resolves once they
+attach. See the [npm README](../packages/npm/README.md#databases--sockets).
 
 ## Attaching an existing socket fd (native)
 

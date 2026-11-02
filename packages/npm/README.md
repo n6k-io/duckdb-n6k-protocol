@@ -108,16 +108,17 @@ Absolute path to the `wasm/` directory shipped with the package. Use this to con
 
 ## `N6kDuckDB`
 
-`new N6kDuckDB(opts?)` boots DuckDB-WASM and loads the `n6k` extension. It takes `CreateDuckDBOptions` without the callbacks. Create it once, at module scope (boot is deferred to the first `subscribe`/`ready`/`connect`, so this is SSR-safe); it lives until `dispose()`.
+`new N6kDuckDB(opts?)` boots DuckDB-WASM, loads the `n6k` extension, opens its sockets and ATTACHes its databases. It takes `CreateDuckDBOptions` without the callbacks, plus `sockets` and `databases`, which are fixed for the instance's lifetime. Boot is deferred to the first `subscribe`/`ready`/`connect`, so constructing one at module scope is SSR-safe; it lives until `dispose()`.
 
-It owns the page's sockets and attached catalogs, and exposes them in the shape `@n6k.io/ui`'s `DuckDBProvider` takes:
+It exposes the shape `@n6k.io/ui`'s `DuckDBProvider` takes:
 
 ```tsx
 import { N6kDuckDB } from "@n6k.io/db";
 import { DuckDBProvider, QueryProvider } from "@n6k.io/ui/duckdb";
 
-const duckdb = new N6kDuckDB();
-duckdb.setDatabases({ page_db: { path: "n6k://api.example.com/p/123", options: { token: "…" } } });
+const duckdb = new N6kDuckDB({
+  databases: { page_db: { path: "n6k://api.example.com/p/123", options: { token: "…" } } },
+});
 
 export function Root({ children }) {
   return (
@@ -130,43 +131,31 @@ export function Root({ children }) {
 }
 ```
 
-- `connect(): Promise<ConnectionLike>` — waits for boot, then leases a fresh connection. Close it when done.
-- `metadataFns` — `tablesOf` (`n6k_parse_sql_get_tables`), `tableMeta` (`n6k_table_describe`) and `catalogs`, a subscribable per-catalog `{ status, version }` store. `status` and `version` are defined by `CatalogState` / `catalogStatesOf`.
-- `subscribe`/`getSnapshot` — `N6kDuckDBSnapshot` as an external store.
-- `onInvalidated(fn)` / `onCatalogsChanged(fn)` — server pushes.
+- `connect(): Promise<ConnectionLike>` — waits for boot, socket registration and every ATTACH, then leases a fresh connection. Close it when done. A failed ATTACH does not fail `connect()`; it is reported per catalog.
+- `metadataFns` — `tablesOf` (`n6k_parse_sql_get_tables`), `tableMeta` (`n6k_table_describe`) and `catalogs`, a subscribable per-catalog `{ version, error? }` store (`CatalogState`). `version` moves on a server invalidation and on a reconnect; `error` is the catalog's ATTACH failure or its socket's.
+- `subscribe`/`getSnapshot` — `N6kDuckDBSnapshot` (`status`, `connStatus`, `invalidations`, `errors`, `registrations`) as an external store.
 
-### `setDatabases(databases)` / `setSockets(sockets)`
-
-`setDatabases` replaces the catalogs set by its previous call (catalogs set through `setDesired` are untouched); the reconciler DETACHes, ATTACHes or re-ATTACHes to match. `setSockets` replaces the socket set; see `SocketSet.apply` for which sockets keep their registration.
+### `databases` / `sockets`
 
 - `databases: Record<string, DatabaseSpec>` — catalog name → a bare path string (uses `TYPE n6k` by default), `{ path, options? }`, or `{ socket, catalog?, options? }`. Each becomes `ATTACH '<path>' AS <name> (<options>);`; `options` shallow-merges over `{ TYPE: "n6k" }`. `TYPE` is emitted unquoted; other values are single-quoted with `'` escaped to `''`.
-- `sockets: Record<string, SocketSpec>` (browser only). A `{ socket: "<name>", catalog? }` database rides that socket: `ATTACH '' AS <alias> (TYPE n6k, wsId '<id>'[, catalog '<catalog>'])` once it registers. The catalog is `pending` until then. A spec is one of:
-  - `{ connect: () => WebSocket, token }` — `N6kDuckDB` opens the socket, and on a drop reopens it with exponential backoff (`MIN_BACKOFF_MS`/`MAX_BACKOFF_MS` in `src/sockets/sockets.ts`) and calls `replaceWebsocket`. It closes the socket when the spec is removed.
-  - `{ socket: WebSocket | null, token }` — the app opens the socket. While `null` before its first registration, its catalogs wait. A new socket after registration calls `replaceWebsocket`. It is never closed by `N6kDuckDB`.
+- `sockets: Record<string, SocketSpec>` (browser only). A `{ socket: "<name>", catalog? }` database rides that socket: `ATTACH '' AS <alias> (TYPE n6k, wsId '<id>'[, catalog '<catalog>'])` once it registers. A spec is `{ connect: () => WebSocket, token }`: `N6kDuckDB` opens the socket, and on a drop reopens it with exponential backoff (`MIN_BACKOFF_MS`/`MAX_BACKOFF_MS` in `src/sockets/sockets.ts`) and calls `replaceWebsocket`. It closes the socket on `dispose()`.
 
   `token` is a string or a `() => string | Promise<string>`, called on every (re)register. A socket that fails to register, or whose reconnect the server refuses (HELLO_ERR), errors its catalogs (`Attach <alias> failed: …`). A `token` or `wsId` option on a socket-backed entry throws.
 
 ```ts
-duckdb.setSockets({ main: { connect: () => new WebSocket("wss://api.example.com/ws"), token } });
-duckdb.setDatabases({
-  db: { socket: "main" },
-  sales: { socket: "main", catalog: "warehouse" },
-  pg: { path: "host=… dbname=…", options: { TYPE: "postgres" } },
+const duckdb = new N6kDuckDB({
+  sockets: { main: { connect: () => new WebSocket("wss://api.example.com/ws"), token } },
+  databases: {
+    db: { socket: "main" },
+    sales: { socket: "main", catalog: "warehouse" },
+    pg: { path: "host=… dbname=…", options: { TYPE: "postgres" } },
+  },
 });
 ```
 
-`setDesired(catalog, config, setup?)` / `removeDesired(catalog)` add or drop a single catalog; `setup` statements run before its ATTACH and are kept out of the snapshot. `reconnect(catalog)` reopens a dropped driver-owned socket.
-
-### React helpers (`@n6k.io/db/react`)
-
-- `useAttach(duckdb, catalog, path, options?)` — `setDesired` while mounted, `removeDesired` on unmount; returns `{ status, reconnect }`.
-- `useSocket(duckdb, name)` — the `RegisteredWebsocket` for a socket once registered, else `null`. It stays the same object across reconnects; `rpc` rebinds to the new socket.
-- `useN6kSnapshot(duckdb)` — the snapshot, re-rendering on change.
-- `useDuckDBIframeHost(iframeRef, duckdb, { allowedOrigins })` — see the iframe section.
-
 ### Attaching an existing WebSocket
 
-`registerWebsocket(socket, token): Promise<RegisteredWebsocket>` and `replaceWebsocket(wsId, socket, token): Promise<void>` let you attach n6k onto a WebSocket your app already opened, instead of having the driver open its own. They are returned from `createDuckDB()` and are also methods on `N6kDuckDB`. Browser-only.
+`registerWebsocket(socket, token): Promise<RegisteredWebsocket>` and `replaceWebsocket(wsId, socket, token): Promise<void>` let you attach n6k onto a WebSocket your app already opened, instead of having the driver open its own. They are returned from `createDuckDB()`. Browser-only.
 
 ```ts
 const { conn, registerWebsocket, replaceWebsocket } = await createDuckDB();
@@ -179,7 +168,7 @@ await conn.query(`ATTACH '' AS page_db (TYPE n6k, wsId '${wsId}')`); // sends FT
 await replaceWebsocket(wsId, newWs, token); // re-HELLOs, then re-OPENs page_db without a DETACH/ATTACH
 ```
 
-The driver rides the socket: **binary** frames are n6k, **text** frames are JSON-RPC (see below). It listens with `addEventListener`, so your app can still observe the socket; it never closes a socket it doesn't own. The token rides the HELLO frame, not the socket's upgrade; an inline `token` ATTACH option alongside `wsId` is a bind error. Each ATTACH sends an `FT_OPEN` naming its catalog (the ATTACH alias, or the `catalog` option); an unserved catalog fails that ATTACH with the server's `OPEN_ERR`. On a drop, the catalog's `connStatus` becomes `"disconnected"`; open a fresh socket and call `replaceWebsocket`. With `N6kDuckDB`, declare the socket through `setSockets` (above) so its catalogs stay `pending` until it registers. See [n6k-network.md](../../docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser) for the full contract.
+The driver rides the socket: **binary** frames are n6k, **text** frames are JSON-RPC (see below). It listens with `addEventListener`, so your app can still observe the socket; it never closes a socket it doesn't own. The token rides the HELLO frame, not the socket's upgrade; an inline `token` ATTACH option alongside `wsId` is a bind error. Each ATTACH sends an `FT_OPEN` naming its catalog (the ATTACH alias, or the `catalog` option); an unserved catalog fails that ATTACH with the server's `OPEN_ERR`. On a drop, the catalog's `connStatus` becomes `"disconnected"`; open a fresh socket and call `replaceWebsocket`. With `N6kDuckDB`, declare the socket through `sockets` (above) and `connect()` waits for it to register. See [n6k-network.md](../../docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser) for the full contract.
 
 #### JSON-RPC
 
@@ -292,65 +281,6 @@ export async function handle(_req: Request) {
   }
 }
 ```
-
-## DuckDB in the parent, queries in an iframe (`@n6k.io/db/iframe`)
-
-Share one parent-window DuckDB-wasm instance with a child **iframe**, so `@n6k.io/ui`'s hooks work in the iframe **without it loading DuckDB at all**. The parent owns the single real engine (WASM, workers, the n6k extension, all sockets); the iframe is a thin reactive *view* — every query is a `postMessage` RPC to the parent that returns Arrow IPC bytes, rebuilt with `apache-arrow`'s `tableFromIPC`.
-
-The `@n6k.io/db/iframe` entry pulls in only `apache-arrow` — no `.wasm`, no worker, no n6k extension, no `SharedArrayBuffer`/COOP-COEP headers, no WebSocket.
-
-```tsx
-// PARENT — point the host at your iframe.
-import { useRef } from "react";
-import { N6kDuckDB } from "@n6k.io/db";
-import { useDuckDBIframeHost } from "@n6k.io/db/react";
-
-const duckdb = new N6kDuckDB();
-duckdb.setDatabases({ db: "n6k://api.example.com/p/123" });
-
-export function Shell() {
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  useDuckDBIframeHost(iframeRef, duckdb, { allowedOrigins: [window.location.origin] });
-  return <iframe ref={iframeRef} src="/widget" title="widget" />;
-}
-```
-
-Without React, `bindIframeHost(() => iframe, duckdb, { allowedOrigins })` from `@n6k.io/db/iframe` does the same and returns a dispose function.
-
-```tsx
-// IFRAME app — no DuckDB engine here.
-import { createIframeN6k } from "@n6k.io/db/iframe";
-import { DuckDBProvider, QueryProvider, useQuery } from "@n6k.io/ui/duckdb";
-
-const n6k = createIframeN6k({ parentOrigin: window.location.origin });
-
-function Widget() {
-  const { rows } = useQuery("SELECT id, name FROM db.main.users");
-  return <ul>{rows.map((r) => <li key={String(r.id)}>{String(r.name)}</li>)}</ul>;
-}
-
-export function Embedded() {
-  return (
-    <QueryProvider>
-      <DuckDBProvider connect={n6k.connect} metadataFns={n6k.metadataFns}>
-        <Widget />
-      </DuckDBProvider>
-    </QueryProvider>
-  );
-}
-```
-
-Handshake: the iframe posts `hello` (with a fresh per-mount `clientId`) to `parentOrigin`; the host validates the origin against `allowedOrigins` **and** that the message came from its own iframe element, then transfers a `MessageChannel` port. A new `clientId` (e.g. after an iframe reload) triggers a fresh port — `WindowProxy` identity is stable across reloads, so `clientId` is what distinguishes a reloaded frame from a duplicate hello. The host pushes the parent's attach state (`status`, `desired`, `attached`, …), which backs the iframe's `metadataFns.catalogs` store, so the iframe's reads wait for and refetch with the parent's catalogs.
-
-**Security — the server is the control level, not this bridge.** The iframe holds no token and no socket; it can only send SQL. It cannot exfiltrate a credential (n6k secrets are redacted in `duckdb_secrets()` and live in the parent's worker, unreachable from SQL) and cannot attach a private catalog (no credential to present). So there is no SQL-gating layer here. The only rule is a deployment one:
-
-> The iframe can do exactly what the parent's already-attached catalogs allow — **including writes** (`INSERT`/`UPDATE`/`DELETE`) where the catalog's token grants them — and nothing more. Do not attach into an engine you share with an untrusted iframe anything you would not hand that iframe directly. (DuckDB `ATTACH` is global to the instance, so a shared engine cannot isolate the iframe from any attached catalog.)
-
-Notes:
-
-- Sockets live with the parent's worker and can't cross frames; the iframe has no socket API.
-- Each `metadataFns.tablesOf` call is one extra round-trip to the parent.
-- Same-origin parent/iframe is the supported configuration. `parentOrigin` and `allowedOrigins` take exact origins; see `IframeN6kOptions` / `IframeHostOptions` for what `"*"` does.
 
 ## Debug logging
 

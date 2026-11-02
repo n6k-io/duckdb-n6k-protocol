@@ -43,12 +43,12 @@ describeCoi("catalog store on server invalidate [browser coi]", () => {
     h.page.evaluate((s) => globalThis.__n6kRead!(s), sql);
 
   test(
-    "an attached catalog turns ready, and its version moves when the server invalidates it",
+    "an attached catalog is readable once connect resolves, and its version moves when the server invalidates it",
     async () => {
       const cat = `cinv_${Date.now()}`;
       await h.page.evaluate((c) => globalThis.__n6kAttachCatalog!(c), cat);
-      const ready = await stateUntil(cat, (s) => s.status === "ready");
-      expect(ready?.status).toBe("ready");
+      const ready = await stateUntil(cat, () => true);
+      expect(ready).toEqual({ version: "0" });
       expect(
         await read(`SELECT name FROM ${cat}.main.users WHERE id = 1`),
       ).toEqual([{ name: "Alice" }]);

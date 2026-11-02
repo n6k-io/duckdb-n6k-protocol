@@ -1,16 +1,11 @@
 import { N6kDuckDB } from "../../n6k-duckdb";
-import type { SocketSpec } from "../../sockets/sockets";
 import type { SocketsMount } from "./sockets-types";
 
-const duckdb = new N6kDuckDB({
-  bundle: {
-    mainModule: "/duckdb/duckdb-coi.wasm",
-    mainWorker: "/duckdb/duckdb-browser-coi.worker.js",
-    pthreadWorker: "/duckdb/duckdb-browser-coi.pthread.worker.js",
-  },
-  maximumThreads: 1,
-  extensionRepository: globalThis.location.origin,
-});
+const bundle = {
+  mainModule: "/duckdb/duckdb-coi.wasm",
+  mainWorker: "/duckdb/duckdb-browser-coi.worker.js",
+  pthreadWorker: "/duckdb/duckdb-browser-coi.pthread.worker.js",
+};
 
 function wsBase(): string {
   const serverUrl = globalThis.__n6kServerUrl ?? "n6k://localhost:8099";
@@ -21,52 +16,52 @@ function wsBase(): string {
   }
 }
 
-const catalogs = duckdb.metadataFns.catalogs;
-catalogs.subscribe(() => {
-  const history = (globalThis.__n6kHistory ??= {});
-  for (const [c, s] of Object.entries(catalogs.getSnapshot())) {
-    const seen = (history[c] ??= []);
-    if (seen.at(-1) !== s.status) seen.push(s.status);
-  }
-});
+let duckdb: N6kDuckDB | null = null;
 
-globalThis.__n6kConfigure = (m: SocketsMount) => {
+function current(): N6kDuckDB {
+  if (!duckdb) throw new Error("not configured");
+  return duckdb;
+}
+
+globalThis.__n6kConfigure = async (m: SocketsMount) => {
   globalThis.__n6kOpenedSockets = [];
-  globalThis.__n6kHistory = {};
   const url = `${wsBase()}${m.path}`;
-  const main: SocketSpec =
-    m.mode === "connect"
-      ? {
-          connect: () => {
-            const s = new WebSocket(url);
-            globalThis.__n6kOpenedSockets!.push(s);
-            return s;
-          },
-          token: m.token,
-        }
-      : { socket: null, token: m.token };
-  globalThis.__n6kSetSocket = () =>
-    duckdb.setSockets({ main: { socket: new WebSocket(url), token: m.token } });
-  duckdb.setSockets({ main });
-  duckdb.setDatabases(
-    Object.fromEntries(
+  duckdb = new N6kDuckDB({
+    bundle,
+    maximumThreads: 1,
+    extensionRepository: globalThis.location.origin,
+    sockets: {
+      main: {
+        connect: () => {
+          const s = new WebSocket(url);
+          globalThis.__n6kOpenedSockets!.push(s);
+          return s;
+        },
+        token: m.token,
+      },
+    },
+    databases: Object.fromEntries(
       m.catalogs.map((c) => [
         c,
         { socket: "main", catalog: m.serverCatalogs?.[c] },
       ]),
     ),
-  );
+  });
+  const c = await duckdb.connect();
+  await c.close();
 };
 
-globalThis.__n6kReset = () => {
-  duckdb.setDatabases({});
-  duckdb.setSockets({});
+globalThis.__n6kReset = async () => {
+  await duckdb?.dispose();
+  duckdb = null;
 };
 
-globalThis.__n6kStates = () => ({ ...catalogs.getSnapshot() });
+globalThis.__n6kStates = () => ({
+  ...current().metadataFns.catalogs.getSnapshot(),
+});
 
 globalThis.__n6kRead = async (sql) => {
-  const c = await duckdb.connect();
+  const c = await current().connect();
   try {
     const r = await c.query(sql);
     return r.toArray().map((row) => row.toJSON());
@@ -76,7 +71,7 @@ globalThis.__n6kRead = async (sql) => {
 };
 
 globalThis.__n6kEcho = (x) => {
-  const reg = duckdb.getSnapshot().registrations.main;
+  const reg = current().getSnapshot().registrations.main;
   if (!reg) throw new Error("socket 'main' is not registered");
   return reg.rpc.call("echo", { x });
 };

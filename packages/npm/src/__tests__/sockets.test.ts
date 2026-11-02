@@ -38,8 +38,11 @@ describeCoi("N6kDuckDB sockets [browser coi]", () => {
     h.page.evaluate((m) => globalThis.__n6kConfigure!(m), m);
   const read = (sql: string) =>
     h.page.evaluate((s) => globalThis.__n6kRead!(s), sql);
-  const history = (cat: string) =>
-    h.page.evaluate((c) => globalThis.__n6kHistory?.[c] ?? [], cat);
+  const states = () => h.page.evaluate(() => globalThis.__n6kStates!());
+  const stateOf = async (cat: string) => {
+    const all = await states();
+    return all[cat];
+  };
   const opened = () =>
     h.page.evaluate(() => globalThis.__n6kOpenedSockets!.length);
 
@@ -51,34 +54,23 @@ describeCoi("N6kDuckDB sockets [browser coi]", () => {
     const deadline = Date.now() + timeoutMs;
     let s: CatalogState | undefined;
     while (Date.now() < deadline) {
-      const states = await h.page.evaluate(() => globalThis.__n6kStates!());
-      s = states[cat];
+      s = await stateOf(cat);
       if (s && done(s)) return s;
       await new Promise((r) => setTimeout(r, 50));
     }
     return s;
   }
-  const ready = (cat: string) => stateUntil(cat, (s) => s.status === "ready");
-  const statusAfter = async (
-    cat: string,
-    done: (s: CatalogState) => boolean,
-  ) => {
-    const s = await stateUntil(cat, done);
-    return s?.status;
-  };
 
   test(
-    "a socket-backed catalog is pending until its attach lands",
+    "a socket-backed catalog is attached once connect resolves",
     async () => {
       const cat = name("sockrace");
       await configure({
-        mode: "connect",
         path: `/ws?catalog=${cat}`,
         token: "",
         catalogs: [cat],
       });
-      expect(await statusAfter(cat, (s) => s.status === "ready")).toBe("ready");
-      expect(await history(cat)).toEqual(["pending", "ready"]);
+      expect(await stateOf(cat)).toEqual({ version: "0" });
       expect(await read(usersSql(cat))).toEqual(USERS);
     },
     TIMEOUT,
@@ -90,13 +82,10 @@ describeCoi("N6kDuckDB sockets [browser coi]", () => {
       const a = name("sockmuxa");
       const b = name("sockmuxb");
       await configure({
-        mode: "connect",
         path: `/tuned/ws?catalogs=${a},${b}`,
         token: "",
         catalogs: [a, b],
       });
-      await ready(a);
-      await ready(b);
       expect(
         await read(
           `SELECT x.catalog AS a, y.catalog AS b FROM ${a}.main.marker x, ${b}.main.marker y`,
@@ -115,14 +104,11 @@ describeCoi("N6kDuckDB sockets [browser coi]", () => {
       const x = name("sockjoinx");
       const y = name("sockjoiny");
       await configure({
-        mode: "connect",
         path: `/tuned/ws?catalogs=${a},${b}`,
         token: "",
         catalogs: [x, y],
         serverCatalogs: { [x]: a, [y]: b },
       });
-      await ready(x);
-      await ready(y);
       expect(
         await read(
           `SELECT x.catalog AS a, y.catalog AS b FROM ${x}.main.marker x JOIN ${y}.main.marker y ON x.catalog <> y.catalog`,
@@ -133,48 +119,20 @@ describeCoi("N6kDuckDB sockets [browser coi]", () => {
   );
 
   test(
-    "connect: a dropped socket is reopened and the catalog recovers",
+    "a dropped socket is reopened and the catalog's version moves",
     async () => {
       const cat = name("sockdrop");
       await configure({
-        mode: "connect",
         path: `/ws?catalog=${cat}`,
         token: "",
         catalogs: [cat],
       });
-      await ready(cat);
       await h.page.evaluate(() => globalThis.__n6kOpenedSockets![0]!.close());
-      await stateUntil(cat, (s) => s.status !== "ready");
-      expect(await statusAfter(cat, (s) => s.status === "ready")).toBe("ready");
-      expect(await history(cat)).toContain("disconnected");
+      const after = await stateUntil(cat, (s) => s.version !== "0");
+      expect(after?.version).not.toBe("0");
+      expect(after?.error).toBeUndefined();
       expect(await read(usersSql(cat))).toEqual(USERS);
       expect(await opened()).toBe(2);
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "socket: a catalog waits for the app's socket, and survives a swap",
-    async () => {
-      const cat = name("sockapp");
-      await configure({
-        mode: "socket",
-        path: `/ws?catalog=${cat}`,
-        token: "",
-        catalogs: [cat],
-      });
-      await new Promise((r) => setTimeout(r, 1000));
-      expect(await statusAfter(cat, () => true)).toBe("pending");
-
-      await h.page.evaluate(() => globalThis.__n6kSetSocket!());
-      await ready(cat);
-      expect(await read(usersSql(cat))).toEqual(USERS);
-
-      await h.page.evaluate(() => globalThis.__n6kSetSocket!());
-      await new Promise((r) => setTimeout(r, 1000));
-      expect(await statusAfter(cat, (s) => s.status === "ready")).toBe("ready");
-      expect(await history(cat)).not.toContain("error");
-      expect(await read(usersSql(cat))).toEqual(USERS);
     },
     TIMEOUT,
   );
@@ -184,13 +142,12 @@ describeCoi("N6kDuckDB sockets [browser coi]", () => {
     async () => {
       const cat = name("sockbad");
       await configure({
-        mode: "connect",
         path: `/auth/ws?catalog=${cat}`,
         token: "wrong-token",
         catalogs: [cat],
       });
-      const s = await stateUntil(cat, (s) => s.status === "error");
-      expect(s?.status === "error" && s.message).toContain("unauthorized");
+      const s = await stateOf(cat);
+      expect(s?.error).toContain("unauthorized");
     },
     TIMEOUT,
   );
@@ -200,12 +157,10 @@ describeCoi("N6kDuckDB sockets [browser coi]", () => {
     async () => {
       const cat = name("sockrpc");
       await configure({
-        mode: "connect",
         path: `/rpc/ws?catalog=${cat}`,
         token: "",
         catalogs: [cat],
       });
-      await ready(cat);
       expect(await h.page.evaluate(() => globalThis.__n6kEcho!(1))).toBe(1);
     },
     TIMEOUT,

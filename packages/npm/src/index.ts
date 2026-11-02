@@ -22,21 +22,8 @@ export type { WsStatus } from "./types";
 export { serverN6k } from "./server-n6k";
 export type { SocketSpec, SocketToken } from "./sockets/sockets";
 export type { DatabaseSpec } from "./attach/database-spec";
-export {
-  configEqual,
-  configFingerprint,
-  errorOf,
-  makeConfig,
-  renderAttachSql,
-  statusOf,
-} from "./attach/attachment";
-export type {
-  AttachConfig,
-  AttachError,
-  AttachOptions,
-  AttachState,
-  AttachStatus,
-} from "./attach/attachment";
+export { makeConfig, renderAttachSql } from "./attach/attachment";
+export type { AttachConfig, AttachOptions } from "./attach/attachment";
 export type { CatalogState, CatalogStore } from "./attach/catalog-states";
 export { parseSqlTables } from "./metadata/parse-sql-tables";
 export type {

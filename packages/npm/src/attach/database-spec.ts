@@ -10,7 +10,7 @@ export type DatabaseSpec =
   | { path: string; options?: AttachOptions }
   | { socket: string; catalog?: string; options?: AttachOptions };
 
-// Socket-backed entries carry no wsId here; the reconciler adds it at ATTACH time.
+// Socket-backed entries carry no wsId here; N6kDuckDB adds it at ATTACH time.
 export function specToConfig(spec: DatabaseSpec): AttachConfig {
   if (typeof spec === "string") return makeConfig(spec);
   if ("socket" in spec) {

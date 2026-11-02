@@ -1,51 +1,25 @@
-import type { WsStatus } from "../types";
-import {
-  configFingerprint,
-  errorOf,
-  statusOf,
-  type AttachState,
-} from "./attachment";
-
-export type CatalogState =
-  | {
-      status: "ready" | "pending" | "disconnected" | "reconnecting";
-      version: string;
-    }
-  | { status: "error"; message: string; version: string };
+// `version` moves on a server invalidation or a reconnect, so reads keyed on it refetch.
+export type CatalogState = { version: string; error?: string };
 
 export type CatalogStore = {
   subscribe(onChange: () => void): () => void;
   getSnapshot(): Readonly<Record<string, CatalogState>>;
 };
 
-export type CatalogInputs = AttachState & {
-  connStatus: Record<string, WsStatus>;
+export type CatalogInputs = {
   invalidations: Record<string, number>;
+  errors: Record<string, string>;
 };
 
-// `version` changes on a server invalidation, a re-attach with a different config, or a socket status change.
 export function catalogStatesOf(
+  aliases: readonly string[],
   s: CatalogInputs,
 ): Record<string, CatalogState> {
   const out: Record<string, CatalogState> = {};
-  for (const c of Object.keys(s.desired)) {
-    const have = s.attached[c];
-    const conn = s.connStatus[c];
-    const version = `${s.invalidations[c] ?? 0}|${have ? configFingerprint(have) : ""}|${conn ?? ""}`;
-    const attach = statusOf(s, c);
-    if (attach === "error") {
-      out[c] = {
-        status: "error",
-        message: errorOf(s, c) ?? "unknown error",
-        version,
-      };
-    } else if (attach === "pending") {
-      out[c] = { status: "pending", version };
-    } else if (conn === "disconnected" || conn === "reconnecting") {
-      out[c] = { status: conn, version };
-    } else {
-      out[c] = { status: "ready", version };
-    }
+  for (const c of aliases) {
+    const version = String(s.invalidations[c] ?? 0);
+    const error = s.errors[c];
+    out[c] = error === undefined ? { version } : { version, error };
   }
   return out;
 }
@@ -53,6 +27,7 @@ export function catalogStatesOf(
 // Memoized on input identity so getSnapshot is stable between changes, as useSyncExternalStore requires.
 export function createCatalogStore(
   subscribe: (fn: () => void) => () => void,
+  aliases: readonly string[],
   inputs: () => CatalogInputs,
 ): CatalogStore {
   let last: CatalogInputs | null = null;
@@ -63,7 +38,7 @@ export function createCatalogStore(
       const now = inputs();
       if (now !== last) {
         last = now;
-        states = catalogStatesOf(now);
+        states = catalogStatesOf(aliases, now);
       }
       return states;
     },
