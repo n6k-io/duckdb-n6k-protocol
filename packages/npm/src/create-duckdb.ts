@@ -11,7 +11,7 @@ export type CreateDuckDBOptions = {
   bundle?: duckdb.DuckDBBundle;
   // Task-scheduler thread cap at open() time; defaults to 1. Above 1, the threaded (coi) bundle
   // can deadlock on LOAD/dlopen when scheduler pthreads are parked, so `SET threads` above 1
-  // only after extensions are loaded. N6kDuckDB never raises it.
+  // only after extensions are loaded.
   maximumThreads?: number;
   duckdbWorkerUrl?: string;
   wsWorkerUrl?: string;

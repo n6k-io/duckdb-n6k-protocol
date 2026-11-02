@@ -24,6 +24,7 @@ import { logger as log, stopwatch } from "./logger";
 import type { WsStatus } from "./types";
 import { createWasmConnect, type WasmDatabase } from "./wasm-lease";
 
+// maximumThreads above 1 can deadlock boot(): it LOADs n6k_client after open() (see CreateDuckDBOptions).
 export type N6kDuckDBOptions = Omit<
   CreateDuckDBOptions,
   "onStatus" | "onCatalogsChanged" | "onInvalidated"
