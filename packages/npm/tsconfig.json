@@ -9,12 +9,11 @@
     "noEmit": true,
     "allowJs": true,
     "checkJs": true,
-    "jsx": "react-jsx",
     "skipLibCheck": true,
     "esModuleInterop": true,
     "noUncheckedIndexedAccess": true,
     "types": ["bun"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.js"],
+  "include": ["src/**/*.ts", "src/**/*.js"],
   "exclude": ["src/**/__tests__/**"]
 }

@@ -23,7 +23,7 @@ from n6k_server.context import current
 from n6k_server.jsonrpc import JsonRpc, JsonRpcError
 from n6k_server.extension import load_n6k, load_n6k_server, load_n6k_testing
 from virtual_catalog.extension import load_vcatprovider
-from virtual_catalog.provider import register_provider
+from virtual_catalog.provider import register_provider, release_providers
 from n6k_server.pump import LiveServe, PendingCatalog, ServedCatalog, WsReject
 from n6k_server.test_server.fixtures import fixture_statements, rpc_fixture_statements
 from n6k_server.test_server.host_rpc import register_host_rpcs
@@ -409,13 +409,14 @@ async def _authenticate(
     return list(_record_bridge(ws, con, [catalog]))
 
 
-register(app, prefix="", connect=_open_db, authenticate=_authenticate)
+register(app, prefix="", connect=_open_db, authenticate=_authenticate, on_close=release_providers)
 
 register(
     app,
     prefix="/auth",
     connect=_open_db,
     authenticate=lambda ws, con, token, **p: _authenticate(ws, con, token, "token", **p),
+    on_close=release_providers,
 )
 
 register(
@@ -423,6 +424,7 @@ register(
     prefix="/oauth",
     connect=_open_db,
     authenticate=lambda ws, con, token, **p: _authenticate(ws, con, token, "jwt", **p),
+    on_close=release_providers,
 )
 
 
@@ -441,7 +443,7 @@ def _authenticate_ident(ws: WebSocket, con: duckdb.DuckDBPyConnection, token: st
     return _record_bridge(ws, con, [catalog])
 
 
-register(app, prefix="/ident", connect=_open_ident_db, authenticate=_authenticate_ident)
+register(app, prefix="/ident", connect=_open_ident_db, authenticate=_authenticate_ident, on_close=release_providers)
 
 
 rpc_api = JsonRpc()
@@ -466,7 +468,7 @@ async def _welcome(ws: WebSocket, handle: LiveServe, **_: str) -> None:
     await handle.connection.notify("welcome", {"ok": True})
 
 
-register(app, prefix="/rpc", connect=_open_db, authenticate=_authenticate, on_serve=_welcome, jsonrpc=rpc_api)
+register(app, prefix="/rpc", connect=_open_db, authenticate=_authenticate, on_serve=_welcome, jsonrpc=rpc_api, on_close=release_providers)
 
 
 # ── /tuned: the same reactor, with per-connection knobs ─────────────────────
@@ -558,7 +560,7 @@ async def _tuned_ws(ws: WebSocket) -> None:
             live.handle = handle
 
     try:
-        await serve_ws(ws, connect, authenticate, {}, ping_interval_ms=ping_interval_ms, on_serve=on_serve)
+        await serve_ws(ws, connect, authenticate, {}, ping_interval_ms=ping_interval_ms, on_serve=on_serve, on_close=release_providers)
     except WebSocketDisconnect:
         pass
     except Exception as exc:  # noqa: BLE001 - surface the reason, don't hang the client

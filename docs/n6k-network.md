@@ -155,9 +155,9 @@ await replaceWebsocket(wsId, newWs, token); // re-HELLOs, then re-OPENs every at
 One registered socket can back several catalogs: each `ATTACH` opens its own
 `ns`-scoped session on it.
 
-In React, `DuckDBProvider`'s `sockets` prop does the register → ATTACH →
-`replaceWebsocket` steps for you, and its catalogs are known from the first
-render. See the [npm README](../packages/npm/README.md#duckdbprovider).
+`N6kDuckDB`'s `sockets`/`databases` options do the register → ATTACH →
+`replaceWebsocket` steps for you, and its `connect()` resolves once they
+attach or fail. See the [npm README](../packages/npm/README.md#databases--sockets).
 
 ## Attaching an existing socket fd (native)
 

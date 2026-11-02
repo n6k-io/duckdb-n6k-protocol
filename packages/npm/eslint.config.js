@@ -1,24 +1,12 @@
 import js from '@eslint/js'
 import tseslint from 'typescript-eslint'
 import unicorn from 'eslint-plugin-unicorn'
-import react from 'eslint-plugin-react'
-import reactHooks from 'eslint-plugin-react-hooks'
 import globals from 'globals'
 
 export default [
   js.configs.recommended,
   ...tseslint.configs.recommended,
   unicorn.configs['flat/recommended'],
-  {
-    files: ['src/**/*.tsx'],
-    ...react.configs.flat.recommended,
-    ...react.configs.flat['jsx-runtime'],
-    settings: { react: { version: '19' } },
-  },
-  {
-    plugins: { 'react-hooks': reactHooks },
-    rules: reactHooks.configs.recommended.rules,
-  },
   {
     rules: {
       'unicorn/no-null': 'off',
@@ -30,7 +18,7 @@ export default [
     },
   },
   {
-    files: ['src/**/*.js', 'src/**/*.ts', 'src/**/*.tsx'],
+    files: ['src/**/*.js', 'src/**/*.ts'],
     languageOptions: {
       globals: globals.browser,
     },

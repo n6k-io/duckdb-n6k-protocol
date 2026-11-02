@@ -1,7 +1,7 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { backend, backendName, backendDescribe } from "./conftest/backend";
 import { SERVER, serverUp } from "./conftest/server";
-import { tableMetaFromDescribeRow } from "../react/use-table-meta";
+import { tableMetaFromDescribeRow } from "../metadata/table-describe";
 import type { BackendHandle } from "./conftest/types";
 
 const TIMEOUT = 30_000;

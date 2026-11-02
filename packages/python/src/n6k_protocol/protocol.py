@@ -18,6 +18,7 @@ consume the generated mirror files.
 
 from __future__ import annotations
 
+import struct
 from typing import Any, Final, Union
 
 # The major version: bump only on incompatible changes (frame layout, op semantics, etc.).
@@ -449,6 +450,7 @@ def header_variant_schema(variant: dict[str, Any]) -> dict[str, Any]:
 STREAM_FRAME_JSONRPC: Final = 0x01
 STREAM_FRAME_N6K: Final = 0x02
 STREAM_FRAME_CLOSE: Final = 0x04
+STREAM_HEADER: Final = struct.Struct(">IB")
 
 # ── Server tunables (advertised via OPEN_ACK) ────────────────────────────────
 DEFAULT_BATCH_CREDITS = 8

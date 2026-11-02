@@ -3,8 +3,7 @@
 ``n6k_client`` is the client driver for ``ATTACH 'n6k://…'``; its storage type,
 secret type and URL scheme are ``n6k``.
 ``n6k_server`` serves attached catalogs over the n6k protocol. ``n6k_testing``
-is test-only and never published. ``vcatbridge`` and ``vcatprovider`` load via
-``virtual_catalog.extension``.
+is test-only and never published.
 
 Local builds resolve by name from ``$N6K_EXTENSION_DIR`` (this repo's
 ``build/release/extension``); unset, they install from the GCS bucket.
@@ -12,17 +11,27 @@ Connections must allow unsigned extensions.
 """
 
 import logging
+import os
+from typing import Optional
 
 import duckdb
-from virtual_catalog.extension import EXTENSION_REPO, local_extension_path
 
 log = logging.getLogger(__name__)
 
 EXTENSION_DIR_ENV = "N6K_EXTENSION_DIR"
+EXTENSION_REPO = "https://storage.googleapis.com/n6k-duckdb-release"
+
+
+def _local_extension_path(name: str) -> Optional[str]:
+    base = os.environ.get(EXTENSION_DIR_ENV)
+    if not base:
+        return None
+    path = os.path.join(base, name, f"{name}.duckdb_extension")
+    return path if os.path.exists(path) else None
 
 
 def _load_local_or_install(conn: duckdb.DuckDBPyConnection, name: str) -> None:
-    local = local_extension_path(name, EXTENSION_DIR_ENV)
+    local = _local_extension_path(name)
     if local:
         log.debug("loading duckdb extension %r from local build %s", name, local)
         conn.load_extension(local)

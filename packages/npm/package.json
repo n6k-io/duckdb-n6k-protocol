@@ -1,6 +1,6 @@
 {
   "name": "@n6k.io/db",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "description": "DuckDB-wasm driver for the n6k extension",
   "license": "MIT",
   "type": "module",
@@ -10,9 +10,6 @@
     "./node": "./src/node.ts",
     "./native/*": "./src/native/*.ts",
     "./native-wasm-adapter/*": "./src/native-wasm-adapter/*.ts",
-    "./react": "./src/react/index.ts",
-    "./react/core": "./src/react/core.ts",
-    "./react/iframe": "./src/react/iframe/index.ts",
     "./workers": "./src/workers/manifest.ts",
     "./workers/duckdb-worker": "./src/workers/duckdb-worker.ts",
     "./copy-wasm-extensions": "./src/copy-wasm-extensions.ts"
@@ -53,9 +50,6 @@
   "peerDependencies": {
     "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
     "@duckdb/node-api": "1.5.6-r.2",
-    "@tanstack/react-query": "^5",
-    "@types/react": "^19.0.0",
-    "react": "^19.2.4",
     "apache-arrow": "*"
   },
   "peerDependenciesMeta": {
@@ -66,15 +60,12 @@
   "devDependencies": {
     "@duckdb/node-api": "1.5.6-r.2",
     "@eslint/js": "^10.0.1",
-    "@types/react-dom": "19.2.3",
+    "@types/bun": "^1.4.4",
     "eslint": "^10.0.3",
-    "eslint-plugin-react": "^7.37.5",
-    "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-unicorn": "^63.0.0",
     "globals": "^17.4.0",
     "playwright-core": "1.60.0",
     "prettier": "^3.8.1",
-    "react-dom": "19.2.4",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.57.0"
   },
