@@ -143,7 +143,8 @@ type VsockCarrier = {
   ringOffset: number;
   doorbellOffset: number;
 };
-// Ring offset per attached catalog; identifies which endpoint a ring free belongs to.
+// Ring offset per attached catalog: read by the n6k-vsock-selftest probe, and tells whether a
+// ring free belongs to the currently registered endpoint.
 const vsockAttachInfo = new Map<string, number>();
 // wsId -> HELLO_ACK capabilities, posted by the host after it handshakes an app socket.
 const helloCapsByWsId = new Map<string, string[]>();

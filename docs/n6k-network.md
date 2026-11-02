@@ -157,7 +157,7 @@ One registered socket can back several catalogs: each `ATTACH` opens its own
 
 `N6kDuckDB`'s `sockets`/`databases` options do the register → ATTACH →
 `replaceWebsocket` steps for you, and its `connect()` resolves once they
-attach. See the [npm README](../packages/npm/README.md#databases--sockets).
+attach or fail. See the [npm README](../packages/npm/README.md#databases--sockets).
 
 ## Attaching an existing socket fd (native)
 

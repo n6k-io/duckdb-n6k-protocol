@@ -258,7 +258,7 @@ export function createN6kWorker({
       if (!ev.data) return;
       if (ev.data.type === "pump-ring-released") {
         // The pump finished with its ring; free the heap region iff a detach is pending
-        // for this catalog (a plain socket drop leaves it for the reconnect to reuse).
+        // for this pump (a plain socket drop leaves it for the reconnect to reuse).
         const off = pendingRingFree.get(w);
         if (off !== undefined) {
           pendingRingFree.delete(w);

@@ -30,7 +30,6 @@ function sqlQuoteEscape(s: string): string {
   return s.replaceAll("'", "''");
 }
 
-// This and the to* helpers below normalize wasm/native Arrow values (row proxies, Vectors, MapRows) into plain JS.
 export function toPlainObject(v: unknown): Record<string, unknown> {
   if (v && typeof (v as { toJSON?: unknown }).toJSON === "function") {
     return (v as { toJSON: () => Record<string, unknown> }).toJSON();

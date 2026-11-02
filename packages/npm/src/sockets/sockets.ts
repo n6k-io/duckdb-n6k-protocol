@@ -118,7 +118,6 @@ export function runConnectSocket(
   };
 }
 
-// One reconnecting socket per spec; the returned function tears them all down.
 export function startSockets(
   sockets: Record<string, SocketSpec>,
   register: Register,

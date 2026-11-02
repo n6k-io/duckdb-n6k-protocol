@@ -47,7 +47,7 @@ export type N6kDuckDBSnapshot = {
   invalidations: Record<string, number>;
   // Per alias: its ATTACH failure, or the failure of the socket it rides.
   errors: Record<string, string>;
-  // Registered sockets by name; a name is absent until it registers.
+  // Registered sockets by name; a name is present from its first registration until dispose().
   registrations: Record<string, RegisteredWebsocket>;
 };
 

@@ -140,7 +140,7 @@ export function Root({ children }) {
 - `databases: Record<string, DatabaseSpec>` — catalog name → a bare path string (uses `TYPE n6k` by default), `{ path, options? }`, or `{ socket, catalog?, options? }`. Each becomes `ATTACH '<path>' AS <name> (<options>);`; `options` shallow-merges over `{ TYPE: "n6k" }`. `TYPE` is emitted unquoted; other values are single-quoted with `'` escaped to `''`.
 - `sockets: Record<string, SocketSpec>` (browser only). A `{ socket: "<name>", catalog? }` database rides that socket: `ATTACH '' AS <alias> (TYPE n6k, wsId '<id>'[, catalog '<catalog>'])` once it registers. A spec is `{ connect: () => WebSocket, token }`: `N6kDuckDB` opens the socket, and on a drop reopens it with exponential backoff (`MIN_BACKOFF_MS`/`MAX_BACKOFF_MS` in `src/sockets/sockets.ts`) and calls `replaceWebsocket`. It closes the socket on `dispose()`.
 
-  `token` is a string or a `() => string | Promise<string>`, called on every (re)register. A socket that fails to register, or whose reconnect the server refuses (HELLO_ERR), errors its catalogs (`Attach <alias> failed: …`). A `token` or `wsId` option on a socket-backed entry throws.
+  `token` is a string or a `() => string | Promise<string>`, called on every (re)register. A socket that fails to register, or whose reconnect the server refuses (HELLO_ERR), errors its catalogs (`Attach <alias> failed: …`). If a socket first registers after boot, its catalogs' error clears but they are never ATTACHed. A `token` or `wsId` option on a socket-backed entry throws.
 
 ```ts
 const duckdb = new N6kDuckDB({
@@ -168,7 +168,7 @@ await conn.query(`ATTACH '' AS page_db (TYPE n6k, wsId '${wsId}')`); // sends FT
 await replaceWebsocket(wsId, newWs, token); // re-HELLOs, then re-OPENs page_db without a DETACH/ATTACH
 ```
 
-The driver rides the socket: **binary** frames are n6k, **text** frames are JSON-RPC (see below). It listens with `addEventListener`, so your app can still observe the socket; it never closes a socket it doesn't own. The token rides the HELLO frame, not the socket's upgrade; an inline `token` ATTACH option alongside `wsId` is a bind error. Each ATTACH sends an `FT_OPEN` naming its catalog (the ATTACH alias, or the `catalog` option); an unserved catalog fails that ATTACH with the server's `OPEN_ERR`. On a drop, the catalog's `connStatus` becomes `"disconnected"`; open a fresh socket and call `replaceWebsocket`. With `N6kDuckDB`, declare the socket through `sockets` (above) and `connect()` waits for it to register. See [n6k-network.md](../../docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser) for the full contract.
+The driver rides the socket: **binary** frames are n6k, **text** frames are JSON-RPC (see below). It listens with `addEventListener`, so your app can still observe the socket; it never closes a socket it doesn't own. The token rides the HELLO frame, not the socket's upgrade; an inline `token` ATTACH option alongside `wsId` is a bind error. Each ATTACH sends an `FT_OPEN` naming its catalog (the ATTACH alias, or the `catalog` option); an unserved catalog fails that ATTACH with the server's `OPEN_ERR`. On a drop, the catalog's `connStatus` becomes `"disconnected"`; open a fresh socket and call `replaceWebsocket`. With `N6kDuckDB`, declare the socket through `sockets` (above) and `connect()` waits for it to register or fail. See [n6k-network.md](../../docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser) for the full contract.
 
 #### JSON-RPC
 
@@ -217,7 +217,7 @@ These pieces ship for running DuckDB on the server in addition to (or instead of
 
 - `@n6k.io/db/native/*` — thin wrapper around `@duckdb/node-api`. Opens DuckDB in-process, loads the n6k extension, runs ATTACH, returns the raw `DuckDBConnection`. Useful on its own for Node scripts and request handlers; does not depend on React.
 - `serverN6k(conn)` (from `@n6k.io/db`) — see [below](#servern6kconn).
-- `@n6k.io/db/native-wasm-adapter/*` — `toWasmShape(conn)` translates a native `DuckDBConnection` into the `ConnectionLike` result shape (`{ schema, toArray() }`).
+- `@n6k.io/db/native-wasm-adapter/*` — `toWasmShape(conn)` translates a native `DuckDBConnection` into a `ConnectionLike` whose `query` returns an `ArrowLikeResult` (`{ schema, toArray() }`).
 
 `@duckdb/node-api` is an **optional** peer dependency; install it only if you import the `./native` subpath.
 
@@ -243,7 +243,7 @@ try {
 
 ### `serverN6k(conn)`
 
-`{ connect, metadataFns }` over one connection you own, for `@n6k.io/ui`'s `DuckDBProvider` during SSR. `connect` hands out `conn` itself (its `close` is a no-op), and `metadataFns` has no catalog store (see `serverN6k`). `createNativeDuckDB`'s `databases` option does the ATTACHes.
+`{ connect, metadataFns }` over one connection you own, for `@n6k.io/ui`'s `DuckDBProvider` during SSR. `connect` hands out a wrapper over `conn` whose `close` is a no-op, and `metadataFns` has no catalog store. `createNativeDuckDB`'s `databases` option does the ATTACHes.
 
 ```tsx
 import { renderToReadableStream } from "react-dom/server";
@@ -286,8 +286,8 @@ export async function handle(_req: Request) {
 
 The driver is quiet by default. Info/debug logs are gated behind a runtime
 flag; warnings and errors always print. All output is prefixed `[n6k]` on the
-main thread and `[n6k:<name>-worker]` from workers (`duckdb-worker`,
-`ws-worker`).
+main thread, `[n6k:duckdb-worker] #<instance id>` from the duckdb worker and
+`[n6k:ws-worker]` from ws-workers.
 
 Enable:
 

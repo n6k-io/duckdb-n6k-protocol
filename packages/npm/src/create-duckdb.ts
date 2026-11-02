@@ -9,8 +9,8 @@ import { N6K_DEFAULT_WORKER_URLS } from "./workers/manifest";
 export type CreateDuckDBOptions = {
   // Defaults to the jsDelivr CDN bundle; pass a local bundle for offline/hermetic use.
   bundle?: duckdb.DuckDBBundle;
-  // Task-scheduler thread cap at open() time; defaults to 1. The threaded (coi) bundle
-  // deadlocks on LOAD/dlopen when scheduler pthreads are parked, so `SET threads` above 1
+  // Task-scheduler thread cap at open() time; defaults to 1. Above 1, the threaded (coi) bundle
+  // can deadlock on LOAD/dlopen when scheduler pthreads are parked, so `SET threads` above 1
   // only after extensions are loaded. N6kDuckDB never raises it.
   maximumThreads?: number;
   duckdbWorkerUrl?: string;

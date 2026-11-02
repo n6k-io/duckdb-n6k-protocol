@@ -39,7 +39,7 @@ const nativeLog = console.log.bind(console);
 const nativeWarn = console.warn.bind(console);
 const nativeError = console.error.bind(console);
 
-// One duckdb instance per worker, so a worker tags all its lines with that instance's id.
+// Set only by duckdb-worker, which hosts one duckdb instance; lines from other threads are untagged.
 let instanceTag = "";
 export function setLogInstance(id: number): void {
   instanceTag = ` #${id}`;

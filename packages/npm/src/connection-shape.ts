@@ -18,7 +18,7 @@ export type StreamReader = AsyncIterable<ArrowLikeBatch> & {
 
 export interface ConnectionLike {
   query(sql: string): Promise<ArrowLikeResult>;
-  // Release the leased connection; borrowed handles (native) close() to a no-op.
+  // Release the leased connection; borrowed handles close() to a no-op.
   close(): Promise<void>;
   // duckdb-wasm only.
   send?(sql: string, allowStreamResult?: boolean): Promise<StreamReader>;
