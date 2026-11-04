@@ -209,7 +209,8 @@ void ConnectionHub::EnsureConnected(const AbortCheck &should_abort) {
 		hello_pending_message_.clear();
 	}
 	try {
-		// Raw `this`: every path that drops the hub stops this transport first, which joins its callbacks.
+		// Raw `this` and `raw_transport`: every path that drops either stops this transport first, which joins its
+		// callbacks.
 		auto *raw_transport = transport.get();
 		transport->Start(
 		    [this, gen, raw_transport](const std::string &bytes, bool binary) {

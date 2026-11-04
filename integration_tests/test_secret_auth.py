@@ -1,8 +1,8 @@
 """End-to-end: a `TYPE n6k` secret supplies the bearer token to a
-token-protected mount, so ATTACH needs no inline token. Also covers back-compat
-(inline token), rejection without a credential, rotation via CREATE OR REPLACE,
-and SCOPE matching. Phase 2/3 cover the OAuth refresh-secret mint
-(discovery + RFC 8693 exchange) and the n6k_login device flow.
+token-protected mount, so ATTACH needs no inline token. Also covers an inline
+token, rejection without a credential, rotation via CREATE OR REPLACE, SCOPE
+matching, the OAuth refresh-secret mint (discovery + RFC 8693 exchange) and the
+n6k_login device flow.
 
 Targets the always-on auth mounts on the running :8099 test server (see
 test_server/app.py): the `/auth` prefix requires the static AUTH_TOKEN and the
@@ -114,8 +114,6 @@ def test_create_or_replace_rotates():
 
 def test_bare_host_scope_option_form():
     c = _connect()
-    # Bare-host SCOPE matches any port and scheme even when ATTACH supplies host/port
-    # via options (no n6k:// path). The `prefix` option targets the token-gated /auth mount.
     c.execute(f"CREATE SECRET s3 (TYPE n6k, TOKEN '{AUTH_TOKEN}', SCOPE 'localhost')")
     c.execute(f"ATTACH '' AS db (TYPE n6k, host 'localhost', port '{SERVER_PORT}', prefix '/auth')")
     assert c.execute("SELECT count(*) FROM db.main.users").fetchone()[0] == 3

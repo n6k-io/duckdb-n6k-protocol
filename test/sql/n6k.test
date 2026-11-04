@@ -19,8 +19,7 @@ nope
 
 # --- TYPE n6k secret -------------------------------------------------------
 # Credentials may be supplied via CREATE SECRET instead of an inline ATTACH
-# token. The token is redacted in duckdb_secrets() and the SCOPE is stored so that a
-# prefix match against the lookup key can only end on a host or port boundary.
+# token. The token is redacted in duckdb_secrets().
 
 statement ok
 CREATE SECRET n6k_test (TYPE n6k, TOKEN 'supersecret', SCOPE 'n6k://localhost:8099');

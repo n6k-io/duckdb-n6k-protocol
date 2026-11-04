@@ -37,7 +37,7 @@ public:
 	virtual void Stop() = 0;
 
 	// Ends the connection without waiting for the transport's threads, so it is safe inside a callback. Stop() is
-	// still required. A transport with no such close (VsockTransport) keeps delivering until Stop().
+	// still required. The default does nothing, so delivery continues until Stop().
 	virtual void Shutdown() {
 	}
 };

@@ -22,8 +22,6 @@ ERROR = "external access is disabled"
 
 
 class Listener:
-    """Counts every TCP connection it accepts."""
-
     def __init__(self) -> None:
         self.accepted = 0
         self._sock = socket.socket()

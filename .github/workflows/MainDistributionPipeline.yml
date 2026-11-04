@@ -84,12 +84,10 @@ jobs:
 
   # Windows (windows_amd64 and windows_amd64_mingw) is not built or shipped.
   # One build per arch compiles EVERY extension declared in
-  # extension_config.cmake (n6k_client and — on non-Windows — n6k_server;
-  # plus n6k_testing on native, which the deploy step below skips) — the
-  # build command is a blanket `make`, the extension set is driven entirely by
-  # that config, not by extension_name. upload_all_extensions:true packages every
-  # built *.duckdb_extension from build/<type>/repository/** into a single
-  # artifact (named n6k-<ver>-extension-<arch>), so the deploy step ships all of
+  # extension_config.cmake — the build command is a blanket `make`, the extension
+  # set is driven entirely by that config, not by extension_name.
+  # upload_all_extensions:true packages every built *.duckdb_extension from
+  # build/<type>/repository/** into a single artifact, so the deploy step ships
   # them from one compile instead of rebuilding the whole tree once per extension.
   duckdb-stable-build:
     name: Build n6k extension binaries
@@ -147,9 +145,8 @@ jobs:
           cd duckdb
           git checkout v1.5.6
 
-      # One artifact per arch holds every extension built for it (n6k_client,
-      # and n6k_server on non-Windows), nested under the repository/
-      # tree — staged here, then flattened + uploaded one extension at a time.
+      # One artifact per arch holds every extension built for it, nested under the
+      # repository/ tree — staged here, then flattened + uploaded one extension at a time.
       - uses: actions/download-artifact@v4
         with:
           name: n6k_client-v1.5.6-extension-${{ matrix.duckdb_arch }}
