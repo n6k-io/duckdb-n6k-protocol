@@ -1,38 +1,38 @@
-// duckdb-worker half of the vsock: tracks each catalog's duckdb-side endpoint so detach can close it.
+// duckdb-worker half of the vsock: tracks each transport's duckdb-side endpoint so close can close it.
 
 import { duckdbEndpoint, type ChannelLayout, type Endpoint } from "./channel";
 
 export type VsockRegistry = {
-  // Register the duckdb-side endpoint for a catalog's channel (on attach). `buf` is duckdb's
+  // Register the duckdb-side endpoint for a transport's channel. `buf` is duckdb's
   // shared wasm heap; `baseOffset` locates the channel within it (the C++ malloc pointer).
   register(
-    catalog: string,
+    key: string,
     buf: ArrayBufferLike,
     layout?: ChannelLayout,
     baseOffset?: number,
   ): void;
-  // Drop and close a catalog's channel (on detach).
-  unregister(catalog: string): void;
-  // n6k.vsockClose: close the channel (from the reactor's Stop).
-  close(catalog: string): void;
+  // Close and drop a transport's channel. Before its ring is freed: closing writes to the ring.
+  unregister(key: string): void;
+  // n6k.vsockClose: close the channel (from the transport's Stop).
+  close(key: string): void;
 };
 
 export function createVsockRegistry(): VsockRegistry {
   const channels = new Map<string, Endpoint>();
 
   return {
-    register(catalog, buf, layout, baseOffset = 0) {
-      channels.set(catalog, duckdbEndpoint(buf, layout, baseOffset));
+    register(key, buf, layout, baseOffset = 0) {
+      channels.set(key, duckdbEndpoint(buf, layout, baseOffset));
     },
 
-    unregister(catalog) {
-      const ep = channels.get(catalog);
+    unregister(key) {
+      const ep = channels.get(key);
       if (ep) ep.close();
-      channels.delete(catalog);
+      channels.delete(key);
     },
 
-    close(catalog) {
-      const ep = channels.get(catalog);
+    close(key) {
+      const ep = channels.get(key);
       if (ep) ep.close();
     },
   };

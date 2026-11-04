@@ -1,8 +1,13 @@
 # name: test/sql/n6k_open_ns.test
-# description: A native dial ATTACH sends one FT_HELLO without `ns`, then an FT_OPEN with a nonzero `ns`, distinct per attach
+# description: Two ATTACHes of one URL share a connection: one FT_HELLO without `ns`, then an FT_OPEN per attach with a nonzero `ns`, distinct per attach
 # group: [sql]
 
 require n6k_client
+
+query I
+SELECT hellos_seen FROM n6k_selftest_open_ns_distinct();
+----
+1
 
 query I
 SELECT hello_has_no_ns FROM n6k_selftest_open_ns_distinct();

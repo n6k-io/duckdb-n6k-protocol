@@ -6,8 +6,9 @@
 #include <string>
 
 #ifndef WASM_LOADABLE_EXTENSIONS
-#include "ws_client.hpp"
-#include "ws_reactor.hpp"
+#include "connection_hub.hpp"
+#include "n6k_msgpack.hpp"
+#include "n6k_protocol_generated.hpp"
 
 #include <atomic>
 #include <ixwebsocket/IXWebSocket.h>
@@ -35,6 +36,19 @@ struct SendAfterStartResult {
 
 // Payload chosen so a stray n6k frame can never be mistaken for the probe.
 const char *const kProbe = "N6K-SEND-AFTER-START-PROBE";
+
+std::string PackHelloAck() {
+	msgpack::sbuffer sbuf;
+	msgpack::packer<msgpack::sbuffer> pk(&sbuf);
+	pk.pack_map(3);
+	n6k::PackString(pk, "t");
+	pk.pack(static_cast<int>(n6k::FrameType::HELLO_ACK));
+	n6k::PackString(pk, "protocol_version");
+	pk.pack(n6k::N6K_PROTOCOL_VERSION);
+	n6k::PackString(pk, "capabilities");
+	pk.pack_array(0);
+	return std::string(sbuf.data(), sbuf.size());
+}
 
 // How long the probe gets to land. Generously above a loopback connect+handshake (sub-millisecond
 // in practice) so a slow CI box can't produce a false failure; a dropped frame never arrives at all,
@@ -69,9 +83,14 @@ SendAfterStartResult RunSendAfterStartSelftest() {
 		// Match the client, which disables deflate in IxWebSocketTransport::Start.
 		candidate->disablePerMessageDeflate();
 		candidate->setOnClientMessageCallback([&saw_probe](const std::shared_ptr<ix::ConnectionState> &,
-		                                                   ix::WebSocket &, const ix::WebSocketMessagePtr &msg) {
-			if (msg->type == ix::WebSocketMessageType::Message && msg->str == kProbe) {
+		                                                   ix::WebSocket &ws, const ix::WebSocketMessagePtr &msg) {
+			if (msg->type != ix::WebSocketMessageType::Message) {
+				return;
+			}
+			if (msg->str == kProbe) {
 				saw_probe.store(true, std::memory_order_release);
+			} else {
+				ws.sendBinary(PackHelloAck());
 			}
 		});
 		if (!candidate->listen().first) {
@@ -87,22 +106,19 @@ SendAfterStartResult RunSendAfterStartSelftest() {
 		return r;
 	}
 
-	n6k::WsClientOptions opts;
-	opts.url = "ws://127.0.0.1:" + std::to_string(r.port) + "/ws";
-
 	try {
-		auto reactor = n6k::CreateReactor(opts);
-		// Callbacks are no-ops: this test asserts only on the OUTBOUND direction.
-		reactor->Start([](const std::string &, bool) {}, [](const std::string &) {});
-		// The racing enqueue — the same position HELLO occupies in WsClient::StartReactorAndHandshake.
-		reactor->Send(kProbe);
+		auto hub = n6k::ConnectionHub::Create(
+		    nullptr, n6k::WebSocketOptions("ws://127.0.0.1:" + std::to_string(r.port) + "/ws", /*token=*/""));
+		// Returns only once the HELLO the hub queued on Open has been answered.
+		hub->EnsureConnected(nullptr);
+		hub->Send(kProbe);
 
 		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kProbeWaitMs);
 		while (!saw_probe.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		}
 		r.probe_received = saw_probe.load(std::memory_order_acquire);
-		reactor->Stop();
+		hub->Disconnect("selftest done");
 	} catch (...) {
 	}
 

@@ -1,28 +1,24 @@
-// Transport-agnostic catalog session shared by native and wasm; only the Create factory differs by platform.
+// A catalog session on a ConnectionHub, the same on native and wasm.
 
+#include "connection_hub.hpp"
+#include "hub_session.hpp"
 #include "n6k_body_builders.hpp"
 #include "n6k_catalog_session.hpp"
 #include "n6k_err_throw.hpp"
 #include "n6k_fetch.hpp"
-#include "n6k_io_thread.hpp" // shared I/O thread doorbell (wasm-only)
 #include "n6k_protocol_generated.hpp"
 #include "n6k_str_utils.hpp"
-#include "n6k_wasm_main_thread.hpp"
 #include "n6k_ws_arrow_stream.hpp"
 #include "ws_client.hpp"
-#include "ws_fd_hub.hpp"
 #include "ws_json.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
-#include <set>
 
 namespace duckdb {
 
@@ -105,20 +101,13 @@ int64_t SendRequestAndReadRowcount(n6k::WsClient &client, const std::string &cat
 
 } // namespace
 
-// Interned per host socket, so its address outlives every session that names it.
-static const void *HostSocketGroup(const string &key) {
-	static std::mutex mu;
-	static std::set<string> keys;
-	std::lock_guard<std::mutex> guard(mu);
-	return &*keys.insert(key).first;
-}
-
 class WsCatalogSession : public CatalogSession {
 public:
+	// `on_detach` runs once, after the client closes.
 	WsCatalogSession(std::shared_ptr<n6k::WsClient> client, string catalog_name, string server_catalog,
-	                 const void *socket_group)
+	                 const void *socket_group, std::function<void()> on_detach = nullptr)
 	    : client_(std::move(client)), catalog_name_(std::move(catalog_name)),
-	      server_catalog_(std::move(server_catalog)), socket_group_(socket_group) {
+	      server_catalog_(std::move(server_catalog)), socket_group_(socket_group), on_detach_(std::move(on_detach)) {
 	}
 
 	const string &ServerCatalog() const override {
@@ -303,13 +292,15 @@ public:
 		client_->MarkDisconnectedIfChannelReset();
 	}
 
-	// Release the WebSocket on DETACH, else transport threads keep the WsClient alive forever.
 	void Detach() override {
 		if (detached_) {
 			return;
 		}
 		detached_ = true;
 		client_->Close();
+		if (on_detach_) {
+			on_detach_();
+		}
 	}
 
 private:
@@ -317,152 +308,32 @@ private:
 	string catalog_name_;
 	string server_catalog_;
 	const void *socket_group_;
+	std::function<void()> on_detach_;
 	bool detached_ = false;
 };
 
-#ifdef WASM_LOADABLE_EXTENSIONS
-
-// Bytes for one vsock channel: two 1 MiB SPSC byte-rings, each prefixed by 16 B of
-// control words (HEAD/TAIL/CLOSED/EPOCH). MUST equal channelBytes(DEFAULT_CHANNEL_LAYOUT)
-// in packages/npm/src/virtual-socket/channel.ts = 2 * ((1<<20) + 16). Both sides build
-// Int32Array/Uint8Array views over these exact bytes, so any mismatch corrupts the rings.
-static constexpr size_t N6K_VSOCK_CHANNEL_BYTES = 2 * ((size_t(1) << 20) + 16);
-
-// Wasm: the ws-worker owns the socket; Create allocates the vsock channel + worker via JS before Connect handshakes.
-std::shared_ptr<CatalogSession> CatalogSession::Create(const string &base_url, const string &token,
-                                                       const string &catalog_name, const string &server_catalog,
-                                                       const string &ws_id, int ws_fd,
-                                                       const StreamCancelCheck &should_abort,
-                                                       shared_ptr<Logger> logger) {
-	(void)ws_fd;
+std::shared_ptr<CatalogSession>
+CatalogSession::CreateOnConnection(const std::shared_ptr<n6k::ConnectionHub> &hub, std::function<void()> on_detach,
+                                   const string &catalog_name, const string &server_catalog,
+                                   const StreamCancelCheck &should_abort, shared_ptr<Logger> logger) {
 	const string hello_catalog = server_catalog.empty() ? catalog_name : server_catalog;
-	// Per-attach session id lets ONE socket carry many catalogs.
-	static std::atomic<uint64_t> g_next_ns {1};
-	const uint64_t ns = g_next_ns.fetch_add(1);
-
-	// Reserve the channel's ring region in duckdb's shared wasm heap so the pump ws-worker — and
-	// later compute pthreads — address the same bytes with no copy. Zero it so the ring control
-	// words start empty+open. Ownership then passes to JS: it frees the region (via the wasm
-	// `free` export) on detach, once the pump ws-worker has released the ring — C++ must NOT
-	// free it (that races the pump's async teardown and would double-free).
-	void *ring = std::malloc(N6K_VSOCK_CHANNEL_BYTES);
-	if (!ring) {
-		throw IOException("n6k: failed to allocate %llu-byte vsock ring region",
-		                  static_cast<unsigned long long>(N6K_VSOCK_CHANNEL_BYTES));
-	}
-	std::memset(ring, 0, N6K_VSOCK_CHANNEL_BYTES);
-	const uintptr_t ring_ptr = reinterpret_cast<uintptr_t>(ring);
-
-	// Shared doorbell address forwarded to the pump so it wakes the one I/O thread after publishing an
-	// inbound frame.
-	const uintptr_t doorbell_ptr = reinterpret_cast<uintptr_t>(n6k::N6kIoThread::Instance().DoorbellAddress());
-
-	std::string setup_js;
-	if (!ws_id.empty()) {
-		setup_js = "n6k.vsockAttachWs('" + n6k::EscapeSingleQuotedJsLiteral(catalog_name) + "', '" +
-		           n6k::EscapeSingleQuotedJsLiteral(ws_id) + "', " + std::to_string(ns) + ", " +
-		           std::to_string(ring_ptr) + ", " + std::to_string(doorbell_ptr) + ")";
-	} else {
-		// Pass the raw ws spec; JS resolves it (incl. a relative base_url the C++ side can't).
-		string ws_spec = base_url + "/ws?catalog=" + hello_catalog;
-		setup_js = "n6k.vsockAttach('" + n6k::EscapeSingleQuotedJsLiteral(catalog_name) + "', '" +
-		           n6k::EscapeSingleQuotedJsLiteral(ws_spec) + "', '" + n6k::EscapeSingleQuotedJsLiteral(token) +
-		           "', " + std::to_string(ring_ptr) + ", " + std::to_string(doorbell_ptr) + ")";
-	}
-	// Run the vsockAttach glue on the main runtime thread: under threads>1 duckdb can execute this
-	// ATTACH on a compute pthread, whose JS scope has no globalThis.n6k (see n6k_wasm_main_thread.hpp).
-	std::string setup_res = n6k::RunScriptStringOnMain(setup_js);
-	if (setup_res.empty()) {
-		setup_res = "ERROR:null from vsock attach";
-	}
-	if (setup_res != "OK") {
-		std::free(ring);
-		throw IOException("n6k: vsock attach failed: %s", setup_res);
-	}
 
 	n6k::WsClientOptions opts;
-	opts.bearer_token = token;
 	opts.logger = std::move(logger);
 	opts.connect_timeout = std::chrono::seconds(5);
 	opts.catalog = hello_catalog;
-	opts.channel_key = catalog_name;
-	opts.ns = ns;
-	opts.send_hello = ws_id.empty();
-	opts.ring_ptr = ring_ptr;
-	if (!ws_id.empty()) {
-		opts.host_hello_capabilities = [ws_id]() {
-			auto joined =
-			    n6k::RunScriptStringOnMain("n6k.helloCapabilities('" + n6k::EscapeSingleQuotedJsLiteral(ws_id) + "')");
-			std::vector<std::string> caps;
-			for (auto &cap : StringUtil::Split(joined, ',')) {
-				caps.push_back(cap);
-			}
-			return caps;
-		};
-	}
-
-	auto client = n6k::WsClient::Create(opts);
-	try {
-		client->Connect(should_abort);
-	} catch (...) {
-		// Connect throws on any failure and no session is returned -- so nothing will ever call Detach,
-		// and the channel JS built above (pump worker and the 2 MiB ring region it now owns) would
-		// leak for the life of the page. Ask JS to close it, which is the same release path Detach
-		// takes. NOT std::free(ring): the pump's teardown is async and owns those views, so freeing
-		// from here races it.
-		n6k::RunScriptStringOnMain("n6k.vsockClose('" + n6k::EscapeSingleQuotedJsLiteral(catalog_name) + "')");
-		throw;
-	}
-	return std::make_shared<WsCatalogSession>(std::move(client), catalog_name, hello_catalog,
-	                                          ws_id.empty() ? nullptr : HostSocketGroup("ws_id:" + ws_id));
-}
-
-#else // native
-
-std::shared_ptr<CatalogSession> CatalogSession::Create(const string &base_url, const string &token,
-                                                       const string &catalog_name, const string &server_catalog,
-                                                       const string &ws_id, int ws_fd,
-                                                       const StreamCancelCheck &should_abort,
-                                                       shared_ptr<Logger> logger) {
-	(void)ws_id;
-	const string hello_catalog = server_catalog.empty() ? catalog_name : server_catalog;
-
-	// Per-attach session id; an inherited wsFd may carry several sessions. Never 0: the server refuses it.
-	static std::atomic<uint64_t> g_next_ns {1};
-
-	n6k::WsClientOptions opts;
-	opts.bearer_token = token;
-	opts.logger = std::move(logger);
-	opts.connect_timeout = std::chrono::seconds(5);
-	opts.catalog = hello_catalog;
-	opts.ns = g_next_ns.fetch_add(1);
-	opts.send_hello = ws_fd < 0;
-
-	if (ws_fd >= 0) {
-		opts.ws_fd = ws_fd;
-#ifndef _WIN32
-		opts.host_hello_capabilities = [ws_fd]() {
-			return n6k::FdHub::HelloCapabilities(ws_fd);
-		};
-#endif
-	} else {
-		string ws_query = "?catalog=" + hello_catalog;
-		if (StringUtil::StartsWith(base_url, "https://")) {
-			opts.url = "wss://" + base_url.substr(8) + "/ws" + ws_query;
-		} else if (StringUtil::StartsWith(base_url, "http://")) {
-			opts.url = "ws://" + base_url.substr(7) + "/ws" + ws_query;
-		} else {
-			throw IOException("n6k: base URL must be http(s):// or n6k(s)://, got %s", base_url);
-		}
-	}
+	opts.open_channel = [hub](uint64_t ns, const n6k::AbortCheck &abort) {
+		hub->EnsureConnected(abort);
+		return std::unique_ptr<n6k::Reactor>(new n6k::HubSession(hub, ns));
+	};
+	opts.hello_capabilities = [hub]() {
+		return hub->HelloCapabilities();
+	};
 
 	auto client = n6k::WsClient::Create(opts);
 	client->Connect(should_abort);
-
-	return std::make_shared<WsCatalogSession>(std::move(client), catalog_name, hello_catalog,
-	                                          ws_fd < 0 ? nullptr : HostSocketGroup("ws_fd:" + std::to_string(ws_fd)));
+	return std::make_shared<WsCatalogSession>(std::move(client), catalog_name, hello_catalog, hub.get(),
+	                                          std::move(on_detach));
 }
-
-#endif // WASM_LOADABLE_EXTENSIONS
 
 } // namespace duckdb

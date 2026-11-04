@@ -1,4 +1,4 @@
-"""Crossing across catalogs: attaches riding one wsFd socket fold into one plan.
+"""Crossing across catalogs: attaches riding one shared connection fold into one plan.
 
 Each attach's alias differs from the catalog it opens, so a plan that named a table by alias, or
 bound it in the wrong catalog, reads the wrong `marker` row.
@@ -15,7 +15,7 @@ import duckdb
 import pytest
 
 from _paths import EXT_PATH
-from test_wsfd_attach import SERVER_PORT, _connect, _n6k_connect, _open_pumped
+from test_wsfd_attach import SERVER_PORT, _attach, _connect, _n6k_connect, _open_pumped
 
 CROSSED_MARKERS = "SELECT x.catalog, y.catalog FROM x1.main.marker x JOIN y1.main.marker y ON x.catalog <> y.catalog"
 
@@ -31,9 +31,9 @@ def shared(server: int) -> Iterator[duckdb.DuckDBPyConnection]:
     c = _connect()
     py_sock, ext_sock, ws, _t_in = _open_pumped(f"ws://localhost:{SERVER_PORT}/tuned/ws?catalogs=a,b")
     try:
-        _n6k_connect(c, ext_sock.fileno())
-        c.execute(f"ATTACH '' AS x1 (TYPE n6k, wsFd {ext_sock.fileno()}, CATALOG 'a')")
-        c.execute(f"ATTACH '' AS y1 (TYPE n6k, wsFd {ext_sock.fileno()}, CATALOG 'b')")
+        conn_id = _n6k_connect(c, ext_sock.fileno())
+        _attach(c, conn_id, "x1", "a")
+        _attach(c, conn_id, "y1", "b")
         yield c
     finally:
         c.close()
@@ -84,8 +84,9 @@ def test_an_insert_from_a_join_across_catalogs(shared: duckdb.DuckDBPyConnection
 def test_attaches_on_separate_sockets_read_each_apart(server: int) -> None:
     c = _connect()
     try:
+        # A token apiece: one URL and token would share one connection.
         for alias, catalog in (("p1", "db"), ("p2", "other")):
-            c.execute(f"ATTACH 'n6k://localhost:{server}' AS {alias} (TYPE n6k, CATALOG '{catalog}')")
+            c.execute(f"ATTACH 'n6k://localhost:{server}' AS {alias} (TYPE n6k, CATALOG '{catalog}', TOKEN '{alias}')")
         sql = "SELECT count(*) FROM p1.main.users u JOIN p2.main.users v ON u.id = v.id"
         assert _crossing_reads(c, sql) == 2
         assert c.execute(sql).fetchone() == (3,)

@@ -9,11 +9,14 @@
 
 #include <string>
 
-#if !defined(WASM_LOADABLE_EXTENSIONS) && !defined(_WIN32)
-#define N6K_HAS_FD_TRANSPORT 1
+#ifndef WASM_LOADABLE_EXTENSIONS
+#include "connection_hub.hpp"
 #include "n6k_msgpack.hpp"
-#include "ws_fd_hub.hpp"
 #include "ws_msgpack.hpp"
+
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -27,7 +30,7 @@ namespace {
 static constexpr const char *FN_NAME = "n6k_list_catalogs";
 
 struct N6kListCatalogsBindData : public TableFunctionData {
-	int fd = -1;
+	hugeint_t connection_id;
 };
 
 struct N6kListCatalogsState : public GlobalTableFunctionState {
@@ -35,7 +38,7 @@ struct N6kListCatalogsState : public GlobalTableFunctionState {
 	idx_t offset = 0;
 };
 
-#ifdef N6K_HAS_FD_TRANSPORT
+#ifndef WASM_LOADABLE_EXTENSIONS
 
 static constexpr std::chrono::seconds LIST_TIMEOUT {10};
 
@@ -85,19 +88,20 @@ static void OnFrame(Waiter &w, const std::string &frame) {
 	}
 }
 
-static vector<string> ListCatalogs(int host_fd) {
-	auto hub = n6k::FdHub::Acquire(host_fd);
+static vector<string> ListCatalogs(ClientContext &context, const hugeint_t &connection_id) {
+	auto hub = n6k::ConnectionRegistry::Get(DatabaseInstance::GetDatabase(context))->Find(connection_id);
+	if (!hub) {
+		throw InvalidInputException("%s: no open connection %s", FN_NAME, UUID::ToString(connection_id));
+	}
+	hub->EnsureConnected([&context] { return context.IsInterrupted(); });
 	auto waiter = std::make_shared<Waiter>();
-	const uint32_t req_id = hub->BindRequestAndStartReader(
-	    [waiter](const std::string &frame, bool) { OnFrame(*waiter, frame); },
-	    [waiter](const std::string &reason) { Finish(*waiter, "connection closed: " + reason); });
+	const uint32_t req_id =
+	    hub->BindRequest([waiter](const std::string &frame, bool) { OnFrame(*waiter, frame); },
+	                     [waiter](const std::string &reason) { Finish(*waiter, "connection closed: " + reason); });
 
-	const bool sent =
-	    hub->SendLengthPrefixed(n6k::StreamFrameType::N6K, n6k::PackConnectionReq(static_cast<int>(n6k::FrameType::REQ),
-	                                                                              req_id, n6k::OP_CATALOG_LIST));
-	if (!sent) {
+	if (!hub->Send(n6k::PackConnectionReq(static_cast<int>(n6k::FrameType::REQ), req_id, n6k::OP_CATALOG_LIST))) {
 		hub->UnbindRequest(req_id);
-		throw IOException("%s: writing the request to wsFd %d failed", FN_NAME, host_fd);
+		throw IOException("%s: sending the request on connection %s failed", FN_NAME, hub->IdString());
 	}
 
 	std::unique_lock<std::mutex> lk(waiter->mu);
@@ -120,28 +124,26 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	names = {"catalog_name"};
 	return_types = {LogicalType::VARCHAR};
 	n6k::ThrowIfServed(context, FN_NAME);
-#ifndef N6K_HAS_FD_TRANSPORT
-	throw NotImplementedException("%s: wsFd is only supported in the native, non-Windows build", FN_NAME);
+#ifdef WASM_LOADABLE_EXTENSIONS
+	throw NotImplementedException("%s is only supported in the native build", FN_NAME);
 #else
 	auto result = make_uniq<N6kListCatalogsBindData>();
-	auto fd_it = input.named_parameters.find("wsFd");
-	if (fd_it == input.named_parameters.end() || fd_it->second.IsNull()) {
-		throw BinderException("%s requires wsFd: SELECT * FROM %s(wsFd => 7)", FN_NAME, FN_NAME);
+	auto it = input.named_parameters.find("connection");
+	if (it == input.named_parameters.end() || it->second.IsNull()) {
+		throw BinderException("%s requires connection: SELECT * FROM %s(connection => '<connection_id>')", FN_NAME,
+		                      FN_NAME);
 	}
-	const auto fd = fd_it->second.GetValue<int64_t>();
-	if (fd < 0 || fd > static_cast<int64_t>(NumericLimits<int32_t>::Maximum())) {
-		throw BinderException("%s: %s is not a valid file descriptor", FN_NAME, std::to_string(fd));
-	}
-	result->fd = static_cast<int>(fd);
+	result->connection_id = it->second.GetValue<hugeint_t>();
 	return std::move(result);
 #endif
 }
 
-unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<N6kListCatalogsState>();
-#ifdef N6K_HAS_FD_TRANSPORT
-	state->catalogs = ListCatalogs(input.bind_data->Cast<N6kListCatalogsBindData>().fd);
+#ifndef WASM_LOADABLE_EXTENSIONS
+	state->catalogs = ListCatalogs(context, input.bind_data->Cast<N6kListCatalogsBindData>().connection_id);
 #else
+	(void)context;
 	(void)input;
 #endif
 	return std::move(state);
@@ -162,7 +164,7 @@ void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 
 void RegisterN6kListCatalogs(ExtensionLoader &loader) {
 	TableFunction fn(FN_NAME, {}, Scan, Bind, InitGlobal);
-	fn.named_parameters["wsFd"] = LogicalType::BIGINT;
+	fn.named_parameters["connection"] = LogicalType::UUID;
 	loader.RegisterFunction(fn);
 }
 

@@ -19,7 +19,7 @@ interface N6kInitMessage {
   instanceId?: number;
 }
 
-// Per-catalog vsock channels for the shared-WsClient path.
+// One vsock channel per connection transport (a C++ dial), keyed by the transport's key.
 const vsock = createVsockRegistry();
 
 // Resolve a ws spec into a dialable ws(s):// URL; relative specs resolve against the worker origin.
@@ -35,25 +35,36 @@ function resolveWsUrl(spec: string): string {
 }
 
 interface N6kApi {
-  // vsock: shared-WsClient transport; moves opaque n6k frames over the per-catalog channel.
-  // ringPtr: C++ malloc pointer to the channel inside duckdb's shared wasm heap.
-  vsockAttach(
-    catalog: string,
+  // A connection's transport: a pump moves its opaque n6k frames between the ring C++ allocated at
+  // `ringPtr` in duckdb's shared wasm heap and a WebSocket. `key` names this one transport.
+  // Dial `wsUrl`:
+  vsockDial(
+    key: string,
+    connectionId: string,
+    ringPtr: number,
+    doorbellPtr: number,
     wsUrl: string,
-    token: string,
+  ): string;
+  // Or bridge the socket registered under `connectionId`:
+  vsockAdopt(
+    key: string,
+    connectionId: string,
     ringPtr: number,
     doorbellPtr: number,
   ): string;
-  vsockAttachWs(
-    catalog: string,
-    wsId: string,
-    ns: number,
-    ringPtr: number,
-    doorbellPtr: number,
-  ): string;
-  vsockClose(catalog: string): void;
-  // The HELLO_ACK capabilities negotiated on app socket `wsId`, comma-joined.
-  helloCapabilities(wsId: string): string;
+  vsockClose(key: string): void;
+  // The HELLO_ACK capabilities negotiated on registered socket `id`, comma-joined.
+  helloCapabilities(id: string): string;
+  // "1" while `id` names a registered socket.
+  isRegistered(id: string): string;
+  // The registered socket dialed to `wsUrl` with `token`, or "".
+  registeredFor(wsUrl: string, token: string): string;
+  resolveWsUrl(spec: string): string;
+  // Which catalogs ride which connection, so status is reported per catalog.
+  catalogJoined(connectionId: string, catalog: string): void;
+  catalogLeft(connectionId: string, catalog: string): void;
+  // The server invalidated `schemas` (comma-joined) of `catalog`.
+  invalidated(catalog: string, schemas: string): void;
 }
 
 interface N6kApiWithVersion extends N6kApi {
@@ -143,13 +154,21 @@ type VsockCarrier = {
   ringOffset: number;
   doorbellOffset: number;
 };
-// Ring offset per attached catalog: read by the n6k-vsock-selftest probe, and tells whether a
+// Ring offset per open transport: read by the n6k-vsock-selftest probe, and tells whether a
 // ring free belongs to the currently registered endpoint.
 const vsockAttachInfo = new Map<string, number>();
-// wsId -> HELLO_ACK capabilities, posted by the host after it handshakes an app socket.
-const helloCapsByWsId = new Map<string, string[]>();
+// Registered sockets, posted by the host after it handshakes each one.
+// `up`: its socket has not closed since. A closed one still answers to its id, awaiting a replacement, but
+// no URL ATTACH should ride it.
+type Registered = {
+  capabilities: string[];
+  url: string;
+  token: string;
+  up: boolean;
+};
+const registered = new Map<string, Registered>();
 function openVsockChannel(
-  catalog: string,
+  key: string,
   ringPtr: number,
   doorbellPtr: number,
 ): VsockCarrier {
@@ -163,8 +182,8 @@ function openVsockChannel(
       `n6k: invalid vsock ring/doorbell pointer (ring=${ringPtr}, doorbell=${doorbellPtr})`,
     );
   }
-  vsock.register(catalog, capturedWasmMemory.buffer, undefined, ringPtr);
-  vsockAttachInfo.set(catalog, ringPtr);
+  vsock.register(key, capturedWasmMemory.buffer, undefined, ringPtr);
+  vsockAttachInfo.set(key, ringPtr);
   return {
     wasmMemory: capturedWasmMemory,
     ringOffset: ringPtr,
@@ -185,51 +204,95 @@ globalThis.addEventListener(
       version: N6K_PROTOCOL_VERSION,
       npmVersion: N6K_VERSION,
 
-      // Open the channel, spawn a byte-pump ws-worker; returns immediately — HELLO buffers in the TX ring.
-      vsockAttach(
-        catalog: string,
+      // Returns at once: frames C++ sends before the socket opens wait in the TX ring.
+      vsockDial(
+        key: string,
+        connectionId: string,
+        ringPtr: number,
+        doorbellPtr: number,
         wsUrl: string,
-        token: string,
-        ringPtr: number,
-        doorbellPtr: number,
       ): string {
-        const carrier = openVsockChannel(catalog, ringPtr, doorbellPtr);
+        const carrier = openVsockChannel(key, ringPtr, doorbellPtr);
         n6kPort.postMessage({
-          type: "n6k-vsock-attach",
-          catalog,
-          wsUrl: resolveWsUrl(wsUrl),
-          token,
+          type: "n6k-vsock-dial",
+          key,
+          connectionId,
+          wsUrl,
           ...carrier,
         });
         return "OK";
       },
 
-      // As vsockAttach but adopts an app socket by wsId; ns is the session id so one socket carries many catalogs.
-      vsockAttachWs(
-        catalog: string,
-        wsId: string,
-        ns: number,
+      vsockAdopt(
+        key: string,
+        connectionId: string,
         ringPtr: number,
         doorbellPtr: number,
       ): string {
-        const carrier = openVsockChannel(catalog, ringPtr, doorbellPtr);
+        const registration = registered.get(connectionId);
+        if (!registration) {
+          return `ERROR: no registered socket ${connectionId}`;
+        }
+        if (!registration.up) {
+          return `ERROR: socket ${connectionId} is closed; call replaceWebsocket`;
+        }
+        const carrier = openVsockChannel(key, ringPtr, doorbellPtr);
         n6kPort.postMessage({
-          type: "n6k-vsock-attach-ws",
-          catalog,
-          wsId,
-          ns,
+          type: "n6k-vsock-adopt",
+          key,
+          connectionId,
           ...carrier,
         });
         return "OK";
       },
 
-      vsockClose(catalog: string): void {
-        vsock.close(catalog);
-        n6kPort.postMessage({ type: "n6k-vsock-detach", catalog });
+      vsockClose(key: string): void {
+        vsock.close(key);
+        n6kPort.postMessage({ type: "n6k-vsock-detach", key });
       },
 
-      helloCapabilities(wsId: string): string {
-        return (helloCapsByWsId.get(wsId) ?? []).join(",");
+      helloCapabilities(id: string): string {
+        return (registered.get(id)?.capabilities ?? []).join(",");
+      },
+
+      isRegistered(id: string): string {
+        return registered.has(id) ? "1" : "";
+      },
+
+      registeredFor(wsUrl: string, token: string): string {
+        const href = new URL(wsUrl).href;
+        for (const [id, r] of registered) {
+          if (r.up && r.token === token && new URL(r.url).href === href) {
+            return id;
+          }
+        }
+        return "";
+      },
+
+      resolveWsUrl,
+
+      catalogJoined(connectionId: string, catalog: string): void {
+        n6kPort.postMessage({
+          type: "n6k-catalog-joined",
+          connectionId,
+          catalog,
+        });
+      },
+
+      catalogLeft(connectionId: string, catalog: string): void {
+        n6kPort.postMessage({
+          type: "n6k-catalog-left",
+          connectionId,
+          catalog,
+        });
+      },
+
+      invalidated(catalog: string, schemas: string): void {
+        n6kPort.postMessage({
+          type: "n6k-invalidated",
+          catalog,
+          schemas: schemas.split(",").filter(Boolean),
+        });
       },
     };
 
@@ -253,8 +316,22 @@ globalThis.addEventListener(
     globalThis.addEventListener("message", function (ev: MessageEvent) {
       const m = ev.data;
       if (!m) return;
-      if (m.type === "n6k-hello-caps") {
-        helloCapsByWsId.set(m.wsId as string, m.capabilities as string[]);
+      if (m.type === "n6k-registered") {
+        registered.set(m.id as string, {
+          capabilities: m.capabilities as string[],
+          url: m.url as string,
+          token: m.token as string,
+          up: true,
+        });
+        return;
+      }
+      if (m.type === "n6k-socket-down") {
+        const r = registered.get(m.id as string);
+        if (r) r.up = false;
+        return;
+      }
+      if (m.type === "n6k-unregistered") {
+        registered.delete(m.id as string);
         return;
       }
       // Reclaim a heap-backed ring region. The driver sends this only AFTER the pump
@@ -264,13 +341,9 @@ globalThis.addEventListener(
         // Drop the (now-closed) endpoint first so its stale ring views can't be reused,
         // then return the region to duckdb's allocator.
         const off = m.ringOffset;
-        // Skip if the catalog was re-attached meanwhile: the registered endpoint is the new one.
-        if (
-          typeof m.catalog === "string" &&
-          vsockAttachInfo.get(m.catalog) === off
-        ) {
-          vsock.unregister(m.catalog);
-          vsockAttachInfo.delete(m.catalog);
+        if (typeof m.key === "string" && vsockAttachInfo.get(m.key) === off) {
+          vsock.unregister(m.key);
+          vsockAttachInfo.delete(m.key);
         }
         if (capturedWasmFree && typeof off === "number") capturedWasmFree(off);
         return;
@@ -298,21 +371,18 @@ globalThis.addEventListener(
         });
         return;
       }
-      // Selftest for the heap-backed data path: report a catalog's vsock ring offset into
-      // duckdb's Memory. No `catalog` = the most recent attach. Reply on the transferred
-      // port so duckdb-wasm's own handler never sees it.
+      // Selftest for the heap-backed data path: report the most recent transport's vsock ring offset
+      // into duckdb's Memory. Reply on the transferred port so duckdb-wasm's own handler never sees it.
       if (m.type === "n6k-vsock-selftest") {
         const port = m.replyPort as MessagePort | undefined;
-        const catalog = m.catalog as string | undefined;
-        const ringOffset = catalog
-          ? vsockAttachInfo.get(catalog)
-          : [...vsockAttachInfo.values()].at(-1);
+        const ringOffset = [...vsockAttachInfo.values()].at(-1);
         port?.postMessage({
           type: "n6k-vsock-selftest-result",
           attached: ringOffset != null,
           heap: ringOffset != null,
           ringOffset: ringOffset ?? null,
           canFree: capturedWasmFree != null,
+          openRings: vsockAttachInfo.size,
         });
         return;
       }

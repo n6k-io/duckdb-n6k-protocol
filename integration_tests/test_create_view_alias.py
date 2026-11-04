@@ -144,7 +144,8 @@ def test_body_that_does_not_run_on_the_server_is_refused(attached, body):
 
 def test_body_in_another_attach_is_refused(attached, server):
     conn, alias, view = attached
-    conn.execute(f"ATTACH 'n6k://localhost:{server}' AS peer (TYPE n6k, CATALOG 'peer')")
+    # Its own token puts it on a connection of its own; one URL and token would share the view's.
+    conn.execute(f"ATTACH 'n6k://localhost:{server}' AS peer (TYPE n6k, CATALOG 'peer', TOKEN 'peer')")
     with pytest.raises(duckdb.Error, match="does not run wholly on the source"):
         conn.execute(f"CREATE VIEW {alias}.main.{view} AS SELECT id FROM peer.main.users")
     assert _server_view_sql(conn, alias, view) == []

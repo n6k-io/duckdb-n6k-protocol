@@ -9,7 +9,7 @@ namespace duckdb {
 namespace n6k {
 
 N6kIoThread &N6kIoThread::Instance() {
-	// Function-local static: thread-safe lazy init (first attach) even if two compute pthreads race
+	// Function-local static: thread-safe lazy init (first use) even if two compute pthreads race
 	// here; destroyed at static destruction, which stops + joins the thread.
 	static N6kIoThread instance;
 	return instance;
@@ -48,7 +48,7 @@ N6kIoThread::Handle N6kIoThread::Register(Registration reg) {
 		channels_[h] = std::move(ch);
 	}
 	// Wake the I/O thread to pick up the new channel and drain any frames the pump delivered before
-	// the reactor finished registering (e.g. a fast handshake reply).
+	// the transport finished registering (e.g. a fast handshake reply).
 	BumpDoorbell();
 	return h;
 }
@@ -88,8 +88,8 @@ void N6kIoThread::UnregisterAndAwaitQuiesce(Handle h) {
 }
 
 void N6kIoThread::RetireChannelWithClose(Channel &ch, const char *reason) {
-	// Retire the channel from draining and surface the close to the reactor exactly once. Left in the
-	// registry (defunct) until the reactor Unregisters — the reactor owns the ring's lifetime.
+	// Retire the channel from draining and surface the close to the transport exactly once. Left in the
+	// registry (defunct) until the transport Unregisters — the transport owns the ring's lifetime.
 	ch.defunct = true;
 	if (ch.close_fired) {
 		return;
@@ -106,7 +106,7 @@ void N6kIoThread::RetireChannelWithClose(Channel &ch, const char *reason) {
 bool N6kIoThread::DrainOutbound(Channel &ch) {
 	if (ch.defunct) {
 		std::lock_guard<std::mutex> lk(ch.out_mu);
-		ch.outbound.clear(); // closed/reset: the backlog will never reach the peer
+		ch.outbound.clear(); // retired: the backlog will never reach the peer
 		return false;
 	}
 	std::deque<std::string> pending;
@@ -156,7 +156,7 @@ void N6kIoThread::Loop() {
 					continue;
 				}
 				if (ch->defunct) {
-					continue; // closed/reset; awaiting the reactor's Unregister
+					continue; // retired; awaiting the transport's Unregister
 				}
 				snapshot.push_back(ch);
 			}
@@ -168,7 +168,7 @@ void N6kIoThread::Loop() {
 		bool progress = false;
 		for (auto &ch : snapshot) {
 			if (ch->reg.ring1.Epoch() != ch->reg.pinned_epoch) {
-				RetireChannelWithClose(*ch, "channel reset"); // host swapped the channel; this generation retires
+				RetireChannelWithClose(*ch, "channel reset"); // nothing writes the epoch, so this never fires
 				continue;
 			}
 			// RX first, then TX, so a PONG queued from an inbound PING goes out on this same pass.
@@ -206,8 +206,8 @@ void N6kIoThread::Loop() {
 		}
 
 		if (!progress) {
-			// Park on the doorbell, bounded so a host epoch reset (ringReset does not notify) and a
-			// pending retirement are still noticed within the timeout even if a notify is missed.
+			// Park on the doorbell, bounded so a pending retirement is still noticed within the timeout even if
+			// a notify is missed.
 			__builtin_wasm_memory_atomic_wait32(&doorbell_, seen, static_cast<int64_t>(250) * 1000000);
 		}
 	}

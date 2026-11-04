@@ -24,9 +24,13 @@ ATTACH 'n6k://host:port/prefix' AS db (TYPE n6k);
 `TYPE n6k` is required — DuckDB does not auto-detect the storage type from
 the `n6k://` URL scheme.
 
-The client dials `n6k://` as `ws://` and `n6ks://` as `wss://`, path
-`/ws?catalog=<name>`, where `<name>` is the `catalog` ATTACH option, else the
-`ATTACH ... AS <name>` alias. Trailing slashes on the base URL are stripped.
+The client dials `n6k://` as `ws://` and `n6ks://` as `wss://`, path `/ws`,
+followed by any `?query` the URL carries. The catalog it opens travels in
+`FT_OPEN`: the `catalog` ATTACH option, else the `ATTACH ... AS <name>` alias.
+A trailing slash on the base URL is stripped.
+
+Every `ATTACH` of one URL (and token) shares one connection, opened by the first
+and closed when the last is detached (see Shared connections).
 
 ## Authentication
 
@@ -38,7 +42,7 @@ only implement these standards:
 
 - RFC 8414 — discovery (`/.well-known/oauth-authorization-server`)
 - RFC 8628 — device login (`n6k_login`)
-- RFC 6749 — token endpoint (underlies the device grant + the exchange)
+- RFC 6749 — token endpoint (underlies the device grant + the exchange); §6 refresh-token grant
 - RFC 8693 — token exchange (durable subject token → `aud=data-service` JWT)
 - RFC 7519 + 7517 + 7518/8037 — JWT, published key set (JWKS), EdDSA
 
@@ -58,6 +62,27 @@ CREATE PERSISTENT SECRET n6k_auth (
 );
 ATTACH 'n6k://data.example:443' AS db (TYPE n6k);  -- mints + renews automatically
 ```
+
+If the secret has a `refresh_token`, the extension instead POSTs the RFC 6749 §6
+refresh-token grant to `token_endpoint` with `client_id` (and `resource`, when
+set). `token_endpoint` and `client_id` are required; `subject_token` and `issuer`
+are not used, and no discovery runs. `refresh_token` is redacted.
+
+```sql
+CREATE PERSISTENT SECRET n6k_auth (
+  TYPE n6k_refresh, REFRESH_TOKEN '…', TOKEN_ENDPOINT 'https://auth.example/oauth/token',
+  CLIENT_ID 'n6k-duckdb', RESOURCE 'data-service', SCOPE 'data.example:443'
+);
+```
+
+A new refresh token in the response replaces the stored one in the same secret. A
+temporary secret stays temporary, so its rotated token is lost on exit. An
+`invalid_grant` response fails with a "log in again" error.
+
+Refreshes are serialized within a process but not across processes. With a provider
+that rotates refresh tokens, a second process still holding the old token gets the
+"log in again" error even though the login is valid; restarting it picks up the new
+token. A provider with reuse detection may instead revoke the login for both.
 
 ### bearer token
 
@@ -104,34 +129,39 @@ This is useful for unauthenticated local/test servers, and it keeps a stale
 would otherwise fail the connect during OAuth discovery).
 
 Note: the token is checked once, on the socket's single `FT_HELLO`, and never
-re-validated on a live connection.
+re-validated on a live connection. On a native redial, a token that came from
+secrets (2, 3) is resolved again, so an expired JWT is re-minted first. An inline
+token (1) is resent as is, and a connection that opened with no token stays
+anonymous.
 
 ## Attaching an existing WebSocket (WASM/browser)
 
-By default the driver opens and owns one WebSocket per ATTACH. In the browser
-build you can instead hand it a socket your app already opened — so the app
-keeps control of the socket's auth and reconnection, and can send its own
-JSON-RPC traffic on the same connection through the registration's `rpc`:
+By default the driver opens and owns one WebSocket per URL and token (see
+[Shared connections](#shared-connections)). In the browser build you can instead
+hand it a socket your app already opened — so the app keeps control of the
+socket's auth and reconnection, and can send its own JSON-RPC traffic on the same
+connection through the registration's `rpc`:
 
 ```js
 const { conn, registerWebsocket, replaceWebsocket } = await createDuckDB();
 // ws: a WebSocket you opened. Sends the socket's one FT_HELLO {token}; resolves
 // on HELLO_ACK with { wsId, capabilities, rpc, close }, rejects on HELLO_ERR or close.
 const { wsId } = await registerWebsocket(ws, token);
-await conn.query(`ATTACH '' AS foo (TYPE n6k, wsId '${wsId}')`);
+await conn.query(`ATTACH '' AS foo (TYPE n6k, CONNECTION '${wsId}')`);
 ```
 
-The `wsId` ATTACH option is **WASM/browser only** — native throws. Because the
-socket is already open, several things the driver normally owns become the app's
-responsibility:
+`registerWebsocket` is the browser's `n6k_connect`, and `wsId` is the connection's
+id. A plain `ATTACH 'n6k://…'` with the same URL and token rides the registered
+socket too, for as long as that socket is open. Because the socket is already
+open, several things the driver normally owns become the app's responsibility:
 
 - **Catalog binding** — each `ATTACH` sends an `FT_OPEN {ns, catalog}` naming
   the server catalog (the `catalog` ATTACH option, else the alias); the server answers
   `OPEN_ACK` or `OPEN_ERR`. See the
   [handshake lifecycle](n6k-network-protocol.md#lifecycle).
 - **Auth** — the token goes in the socket's single `FT_HELLO`, sent by
-  `registerWebsocket`. An `ATTACH` with `wsId` sends `OPEN` only; an inline
-  `token` ATTACH option alongside `wsId` fails the ATTACH with an `IOException`.
+  `registerWebsocket`. An `ATTACH` with `CONNECTION` sends `OPEN` only; an inline
+  `token` ATTACH option alongside `CONNECTION` fails the ATTACH with an `IOException`.
 
 **Binary and text.** Every n6k frame is a binary WebSocket message; text frames
 are JSON-RPC 2.0, one message per frame. The driver attaches its listener with
@@ -141,15 +171,16 @@ forced to `"arraybuffer"`; don't put your own binary traffic on a shared socket.
 `rpc` throws unless the server granted `jsonrpc` in HELLO_ACK (a Python server
 does when its app serves JSON-RPC; see `register()`). The driver's HELLO offers
 `jsonrpc` and `mcp`, so the server may send notifications before the first call. The registration outlives the last
-`DETACH`. `close()` ends it; with catalogs still attached, the `wsId` stays bound until the last DETACH.
+`DETACH`. `close()` ends it: with catalogs still attached, the socket stays bridged until the last DETACH.
 
 **Reconnection.** The driver cannot reopen a socket it does not own. On a drop it
 reports `disconnected` status; the app opens a fresh socket and hands it over,
 keeping the catalog attached — no DETACH/ATTACH, and in-flight requests fail so
-the app re-issues them:
+the app re-issues them. Status returns to `connected` at once, and each catalog
+sends a new `OPEN` on its next request:
 
 ```js
-await replaceWebsocket(wsId, newWs, token); // re-HELLOs, then re-OPENs every attached catalog
+await replaceWebsocket(wsId, newWs, token); // re-HELLOs; attached catalogs reopen on their next request
 ```
 
 One registered socket can back several catalogs: each `ATTACH` opens its own
@@ -159,14 +190,72 @@ One registered socket can back several catalogs: each `ATTACH` opens its own
 `replaceWebsocket` steps for you, and its `connect()` resolves once they
 attach or fail. See the [npm README](../packages/npm/README.md#databases--sockets).
 
+## Shared connections
+
+A connection is keyed by the URL it dials (query included) and the token its
+`FT_HELLO` carries, for `wsFd` by the socket, or for a registered WebSocket by its
+`wsId`. Every `n6k_connect` and every
+`ATTACH 'n6k://…'` holds a lease on its connection, opening it if none is open
+for that key. Every `ATTACH ... (CONNECTION '<id>')` holds a lease on the
+connection that id names, and fails if there is none or it is dead. `n6k_disconnect(<id>)`
+drops an `n6k_connect` lease and fails when none is left; `DETACH` drops its `ATTACH`'s
+lease. The last one dropped closes the connection. The
+connection's one `FT_HELLO` is sent when it opens, and each `ATTACH` sends only
+`FT_OPEN`. `DETACH` closes that catalog's session on the server. So two
+`ATTACH 'n6k://host'` with one token ride one socket, on native and in the browser.
+`n6k_connect` and the functions below are native only; the browser's explicit
+connection is `registerWebsocket`.
+
+```sql
+SELECT connection_id FROM n6k_connect(url => 'n6k://localhost:8099/tuned?catalogs=a,b');
+ATTACH '' AS a (TYPE n6k, CONNECTION '<id>');
+ATTACH '' AS b (TYPE n6k, CONNECTION '<id>');
+SELECT * FROM n6k_connections();   -- connection_id, alive, capabilities, catalogs, leases
+SELECT * FROM n6k_disconnect('<id>');   -- a and b keep it open until they are detached
+```
+
+`n6k_connect` takes exactly one of:
+
+- `url => 'n6k(s)://host[:port][/prefix][?query]'`: the extension dials
+  `ws(s)://host[:port][/prefix]/ws[?query]` itself. After a drop, the next request
+  on any of its catalogs dials again, and `n6k_reconnect(<id>)` dials again at once
+  (dropping the current socket if it is still up); its catalogs reopen on their
+  next request.
+- `wsFd => <fd>`: one end of a socket the host already connected (below). A dropped
+  socket cannot be dialed again, and `n6k_reconnect` fails.
+
+and optionally `token` / `scope` (resolved as `ATTACH` resolves them; `wsFd`
+requires one of the two), and two host callbacks, each the name of a scalar
+function taking `(connection_id UUID, text VARCHAR)`:
+
+- `on_text`: called with each JSON-RPC text message the server sends; a non-NULL,
+  non-empty result is sent back as text. `HELLO` offers `jsonrpc` / `mcp` with it, with
+  `on_close`, or on any `wsFd` connection.
+  Without it, a JSON-RPC request is answered "Method not found".
+  `n6k_send_text(<id>, text)` sends text the other way.
+- `on_close`: called with the reason when the server or the socket drops the
+  connection.
+
+Only the `n6k_connect` that opens a connection may give `on_text` / `on_close`: one
+given while a connection for that key is already open fails, since that
+connection's `HELLO` is already sent.
+
+The callbacks run on a thread of the connection's own, on a connection marked as
+served, so they cannot call `n6k_connect` and the other connection functions.
+
+Connection ids are per database.
+
+Parameters and errors: `src/n6k_client/n6k_connect_function.cpp` and
+`n6k_connection_functions.cpp`. The connection itself, its handshake and its
+routing: `src/n6k_client/connection_hub.cpp`.
+
 ## Attaching an existing socket fd (native)
 
-The native build has the fd-level analogue of `wsId`: hand the extension one end
+The native build has the fd-level analogue of `registerWebsocket`: hand the extension one end
 of a connected socket — typically `socket.socketpair()` — as a raw file
 descriptor, and it speaks n6k frames over that fd instead of dialing the server
 itself. The host process opens the real WebSocket and performs the HTTP upgrade,
-then pumps frames between the WebSocket and its end of the pair. The socket's
-one `FT_HELLO` is sent by `n6k_connect`; each `ATTACH` then sends `FT_OPEN`:
+then pumps frames between the WebSocket and its end of the pair:
 
 ```python
 import socket, struct, threading
@@ -197,60 +286,41 @@ threading.Thread(target=sock_to_ws, daemon=True).start()
 
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 con.load_extension("/path/to/n6k_client.duckdb_extension")
-fd = ext_sock.fileno()
-con.execute(f"SELECT * FROM n6k_connect(wsFd => {fd}, token => '...')")  # FT_HELLO
-con.execute(f"ATTACH '' AS db (TYPE n6k, wsFd {fd})")  # FT_OPEN
+conn_id = con.execute(
+    f"SELECT connection_id FROM n6k_connect(wsFd => {ext_sock.fileno()}, token => '...')"
+).fetchone()[0]  # FT_HELLO
 ext_sock.close()  # the extension dup()'d the fd; drop our copy
+con.execute(f"ATTACH '' AS db (TYPE n6k, CONNECTION '{conn_id}')")  # FT_OPEN
 
 con.execute("SELECT * FROM db.main.users")
 ```
 
-The `wsFd` ATTACH option is **native only** — the WASM build throws (use `wsId`
-there instead). Because the socket is already open, the same responsibilities
-that `wsId` shifts to the app apply here:
-
-- **Catalog binding** — each `ATTACH` sends an `FT_OPEN {ns, catalog}` naming
-  the server catalog (the `catalog` ATTACH option, else the alias) and waits for
-  `OPEN_ACK` (credit tunables + capabilities) or `OPEN_ERR`.
-- **Auth / handshake** — `n6k_connect(wsFd => <fd>, ...)` sends the socket's
-  one `FT_HELLO` and waits for `HELLO_ACK`, which arrives over the fd via the
-  pump; its `capabilities` column is the `HELLO_ACK` list. Parameters and errors:
-  `Bind` in `src/n6k_client/n6k_connect_function.cpp`. An `ATTACH` with `wsFd`
-  sends `OPEN` only; an inline `token` ATTACH option alongside `wsFd` fails the
-  ATTACH with an `IOException`.
+`wsFd` is **native only** — the WASM build throws (use `registerWebsocket` there instead).
+Its `HELLO` offers `jsonrpc` / `mcp` whether or not `on_text` is set: the host
+relaying the socket may answer JSON-RPC itself. An inline `token` ATTACH option
+alongside `CONNECTION` fails the ATTACH with an `IOException`.
 
 **Stream framing (required).** Over a WebSocket each binary message is exactly
 one n6k frame and each text message one JSON-RPC message, so boundaries and types
 come for free. A raw byte stream has neither — so the fd path **must** use n6k
 stream framing (the "Stream framing" constants in
 `packages/python/src/n6k_protocol/protocol.py`); `packages/python/src/n6k_server/pump.py` is a reference pump.
-The extension framing is implemented in `src/n6k_client/ws_fd_hub.cpp`.
+The extension framing is implemented in `src/n6k_client/ws_transport_raw.cpp`.
 
-**fd ownership.** The extension `dup()`s the fd at `ATTACH` time and owns the
-copy, so the host closes its own `ext_sock` right after attaching — no
-double-close race. On `DETACH` (or connection teardown) the extension closes its
-dup, which the host observes as EOF on `py_sock`, letting its pump threads exit.
+**fd ownership.** `n6k_connect` `dup()`s the fd and the connection owns the
+copy, so the host closes its own `ext_sock` right after connecting. When the
+last lease is dropped (or the database closes) the extension closes its dup,
+which the host observes as EOF on `py_sock`, letting its pump threads exit. A
+second `n6k_connect` on a socket that already carries a live connection shares it
+and takes another lease; with `on_text` / `on_close` it fails.
 
-**Sharing one fd across several `ATTACH`es.** The same `wsFd` may back more than
-one catalog. A process-global hub (`src/n6k_client/ws_fd_hub.cpp`) owns the fd: exactly
-one `dup()`, one reader thread, one serialized writer, no matter how many
-sessions ride it. Inbound frames are demultiplexed by the protocol's `ns` key —
-each `ATTACH` stamps a distinct `ns` on its `FT_OPEN`, the server stamps every
-session-scoped reply with the same `ns`, and the hub routes on it. Routing of
-frames without an `ns`: `FdHub::DispatchInbound`.
+**Sharing.** One connection backs any number of catalogs: see
+[Shared connections](#shared-connections) and
+[Sessions](n6k-network-protocol.md#sessions). Routing of frames without an `ns`:
+`ConnectionHub::OnMessage`.
 
-The fd is closed only when the **last** session on it detaches, and teardown
-never calls `shutdown()` — that would tear the socket down for every sibling.
-Because the hub registry is keyed by fd *number*, a host must not close and
-recycle an fd number while an `ATTACH` still rides it.
-
-**Conflicts.** `wsFd` is mutually exclusive with a URL / `host` / `port` / `secure`
-/ `prefix`: the socket is already connected, so any dial target is rejected as a
-hard `IOException` rather than silently ignored. Token resolution is skipped too —
-the token was sent by `n6k_connect`.
-
-A full worked example (with the bidirectional pump and a `DETACH`-closes-the-fd
-assertion) is in `integration_tests/test_wsfd_attach.py`.
+A full worked example (with the bidirectional pump and a
+last-release-closes-the-fd assertion) is in `integration_tests/test_wsfd_attach.py`.
 
 ## Function registry
 

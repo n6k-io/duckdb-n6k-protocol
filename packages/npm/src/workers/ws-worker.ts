@@ -1,4 +1,4 @@
-// One byte-pump ws-worker per attach: internal (owns a WebSocket) or external (app socket bridged).
+// One byte-pump ws-worker per connection transport: internal (owns a WebSocket) or external (app socket bridged).
 
 import { applyHostDebugFlag, createLogger } from "../logger";
 import { wsWorkerEndpoint, type Endpoint } from "../virtual-socket/channel";
@@ -8,13 +8,13 @@ import {
   createInboundBuffer,
   type InboundBuffer,
 } from "../virtual-socket/pump";
-import { invalidatedSchemas, tryHeader } from "../ws-framing";
 
 const log = createLogger("ws-worker");
 
-// Owns the real WebSocket, moves opaque frames to/from the vsock channel; parses headers only to report invalidations.
+// Owns the real WebSocket and moves opaque frames to/from the vsock channel.
 let pumpEndpoint: Endpoint | null = null;
 let pumpStopped = false;
+let pumpDone: Promise<void> = Promise.resolve();
 // Overflow buffer for inbound frames that didn't fit the RX ring (see pump.ts).
 let pumpInbound: InboundBuffer = createInboundBuffer();
 
@@ -26,7 +26,7 @@ type Transport = {
 };
 let transport: Transport | null = null;
 let externalOpen = false;
-let catalogName: string | null = null;
+let label: string | null = null;
 
 function postErr(message: string) {
   (globalThis as unknown as Worker).postMessage({ type: "error", message });
@@ -43,18 +43,13 @@ function sendBytes(frame: Uint8Array<ArrayBuffer>) {
 // Start the byte pump; frames queued before open buffer in the TX ring and flush here.
 function startPump() {
   if (!pumpEndpoint) return;
-  void runPump(
+  pumpDone = runPump(
     pumpEndpoint,
     { send: (frame) => sendBytes(frame) },
     pumpInbound,
     () => pumpStopped,
-  ).then(() => {
-    // runPump has exited, so its last ring access (final drain + the ringClose that
-    // woke it) is done and nothing here touches the ring again. Tell the driver the
-    // heap-backed region is safe to free — it gates the free on this ack.
-    (globalThis as unknown as Worker).postMessage({
-      type: "pump-ring-released",
-    });
+  ).catch((error: unknown) => {
+    log.error("pump failed:", error);
   });
 }
 
@@ -63,7 +58,7 @@ function forwardPumpInbound(frame: Uint8Array) {
   if (!pumpEndpoint) return;
   if (acceptInbound(pumpEndpoint, pumpInbound, frame)) return;
   pumpStopped = true;
-  pumpEndpoint.close(); // wakes a C++ WaitUntil parked on the channel
+  pumpEndpoint.close();
   try {
     ws?.close(1009, "n6k inbound overflow"); // 1009 = Message Too Big
   } catch {
@@ -76,13 +71,13 @@ function forwardPumpInbound(frame: Uint8Array) {
   ws = null;
 }
 
-// Pump-mode dial: open the socket and wire it to the channel; C++ WsClient drives the protocol.
+// Pump-mode dial: open the socket and wire it to the channel; C++ drives the protocol.
 function openPump(url: string, subprotocol?: string) {
   if (ws) {
     postErr("ws-worker already opened");
     return;
   }
-  log.debug(`dialing socket (pump): catalog=${catalogName} url=${url}`);
+  log.debug(`dialing socket (pump): ${label} url=${url}`);
   ws = subprotocol ? new WebSocket(url, subprotocol) : new WebSocket(url);
   ws.binaryType = "arraybuffer";
   transport = {
@@ -90,29 +85,19 @@ function openPump(url: string, subprotocol?: string) {
     isOpen: () => !!ws && ws.readyState === 1 /* OPEN */,
   };
   ws.addEventListener("open", function () {
-    log.debug(`socket open (pump): catalog=${catalogName}`);
+    log.debug(`socket open (pump): ${label}`);
     startPump();
-    // Transport up; report "ready" so the catalog flips to connected.
+    // Transport up; report "ready" so its catalogs flip to connected.
     (globalThis as unknown as Worker).postMessage({ type: "ready" });
   });
   ws.addEventListener("message", function (ev: MessageEvent) {
-    if (typeof ev.data === "string") return; // text belongs to the app
-    const frame = new Uint8Array(ev.data as ArrayBuffer);
-    // Only this own-socket path: in external mode the main thread already saw the frame.
-    const schemas = invalidatedSchemas(tryHeader(frame));
-    // Forward first, so the engine has the PUSH before anything refetches on this notice.
-    forwardPumpInbound(frame);
-    if (schemas) {
-      (globalThis as unknown as Worker).postMessage({
-        type: "invalidated",
-        schemas,
-      });
-    }
+    if (typeof ev.data === "string") return; // an internal socket has no JSON-RPC consumer
+    forwardPumpInbound(new Uint8Array(ev.data as ArrayBuffer));
   });
   ws.addEventListener("close", function (ev: CloseEvent) {
     const reason = ev.reason || `code=${ev.code}`;
     pumpStopped = true;
-    pumpEndpoint?.close(); // wakes a C++ WaitUntil parked on the channel
+    pumpEndpoint?.close();
     (globalThis as unknown as Worker).postMessage({ type: "closed", reason });
     ws = null;
   });
@@ -134,7 +119,7 @@ function openPump(url: string, subprotocol?: string) {
     switch (msg.type) {
       case "init-channel": {
         applyHostDebugFlag(msg.debug);
-        if (typeof msg.catalog === "string") catalogName = msg.catalog;
+        if (typeof msg.label === "string") label = msg.label;
         // Rings live in duckdb's shared WebAssembly.Memory at the C++ malloc offset.
         const memory = (msg.wasmMemory as WebAssembly.Memory).buffer;
         const base = wsWorkerEndpoint(
@@ -145,10 +130,8 @@ function openPump(url: string, subprotocol?: string) {
         // Wake the shared n6k I/O thread by ringing its doorbell (the loop parks on it)
         // whenever this channel's RX ring changes state — after publishing an inbound frame, and on
         // close. send is the single publish choke point (acceptInbound/flushInbound/forwardPumpInbound
-        // all route through it); ringing on close makes the I/O thread notice a drop promptly (it would
-        // otherwise wait out its 250ms poll — long enough for a reconnect's ring reset to bump the
-        // epoch first, so the stale registration reports "channel reset" instead of "socket closed" and
-        // races the reconnected request).
+        // all route through it); ringing on close makes the I/O thread notice a drop without waiting out
+        // its bounded park.
         const doorbell = new Int32Array(
           memory,
           msg.doorbellOffset as number,
@@ -165,6 +148,7 @@ function openPump(url: string, subprotocol?: string) {
             if (ok) ringDoorbell();
             return ok;
           },
+          // The C++ I/O thread reports this as a drop once the ring is drained.
           close: () => {
             base.close();
             ringDoorbell();
@@ -201,7 +185,7 @@ function openPump(url: string, subprotocol?: string) {
         // App's socket dropped (external mode): mirror the internal "close".
         externalOpen = false;
         pumpStopped = true;
-        pumpEndpoint?.close(); // wakes a C++ WaitUntil parked on the channel
+        pumpEndpoint?.close();
         (globalThis as unknown as Worker).postMessage({
           type: "closed",
           reason: msg.reason || "app socket closed",
@@ -209,13 +193,24 @@ function openPump(url: string, subprotocol?: string) {
         break;
       }
       case "close": {
-        // Retire this worker: (internal) send a WS close so the server drops its handler.
-        externalOpen = false;
-        try {
-          ws?.close(1000, "detach");
-        } catch {
-          /* ignore */
-        }
+        // Wakes a pump parked on rings C++ already closed, whose own wake was spent before this.
+        pumpStopped = true;
+        pumpInbound.kick?.();
+        // After the final drain, so queued frames still reach the socket. Nothing here touches the ring after
+        // this ack; the driver may free it. Without pumpEndpoint.close(), C++ never sees reconnect()'s drop.
+        void pumpDone.then(() => {
+          pumpEndpoint?.close();
+          pumpEndpoint = null;
+          externalOpen = false;
+          try {
+            ws?.close(1000, "detach");
+          } catch {
+            /* ignore */
+          }
+          (globalThis as unknown as Worker).postMessage({
+            type: "pump-ring-released",
+          });
+        });
         break;
       }
       default: {

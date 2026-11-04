@@ -36,6 +36,7 @@ struct WsTableList {
 };
 
 class RequestState;
+class ConnectionHub;
 
 // `hello`: negotiated once per socket (HELLO_ACK). `open`: negotiated for this catalog (OPEN_ACK).
 struct NegotiatedCapabilities {
@@ -98,22 +99,26 @@ public:
 	using PushHandler = std::function<void(uint8_t op, const std::string &body)>;
 	virtual void SetPushHandler(PushHandler handler) = 0;
 
-	// Synchronously drain queued PUSH events to the handler.
+	// Non-blocking: marks the session down if its connection was replaced, so the next request reopens it.
+	// PUSH frames never queue here; they reach the handler as they arrive.
 	virtual void PollPushEvents() = 0;
 
-	// Idempotently tear down the connection on DETACH (not when the last shared_ptr drops).
+	// Idempotently close this session and drop its connection lease. Dropping the last shared_ptr instead leaves
+	// the session open: see WsClient::OpenChannelAndHandshake.
 	virtual void Detach() = 0;
 
 	// The server's name for this catalog: what OPEN sent.
 	virtual const string &ServerCatalog() const = 0;
-	// Equal for every session riding one host socket (wsFd / wsId); null for a socket of the session's own.
+	// Equal for every session riding one connection.
 	virtual const void *SocketGroup() const = 0;
 
-	// catalog_name = ATTACH alias; server_catalog defaults to it; ws_id/ws_fd ride a host socket.
-	static std::shared_ptr<CatalogSession> Create(const string &base_url, const string &token,
-	                                              const string &catalog_name, const string &server_catalog,
-	                                              const string &ws_id, int ws_fd, const StreamCancelCheck &should_abort,
-	                                              shared_ptr<Logger> logger = nullptr);
+	// Rides `hub`, dialing it if it is down. catalog_name = ATTACH alias; server_catalog defaults to it.
+	// `on_detach` runs once, after the session closes.
+	static std::shared_ptr<CatalogSession> CreateOnConnection(const std::shared_ptr<n6k::ConnectionHub> &hub,
+	                                                          std::function<void()> on_detach,
+	                                                          const string &catalog_name, const string &server_catalog,
+	                                                          const StreamCancelCheck &should_abort,
+	                                                          shared_ptr<Logger> logger = nullptr);
 };
 
 } // namespace duckdb

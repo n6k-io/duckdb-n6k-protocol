@@ -10,7 +10,7 @@ export type DatabaseSpec =
   | { path: string; options?: AttachOptions }
   | { socket: string; catalog?: string; options?: AttachOptions };
 
-// Socket-backed entries carry no wsId here; N6kDuckDB adds it at ATTACH time.
+// Socket-backed entries carry no connection here; N6kDuckDB adds it at ATTACH time.
 export function specToConfig(spec: DatabaseSpec): AttachConfig {
   if (typeof spec === "string") return makeConfig(spec);
   if ("socket" in spec) {
@@ -37,9 +37,9 @@ export function socketsOf(
     const keys = new Set(
       Object.keys(spec.options ?? {}).map((k) => k.toLowerCase()),
     );
-    if (keys.has("token") || keys.has("wsid")) {
+    if (keys.has("token") || keys.has("connection")) {
       throw new Error(
-        `n6k: databases.${alias} rides socket '${spec.socket}'; set the token on the socket, not 'token'/'wsId' options`,
+        `n6k: databases.${alias} rides socket '${spec.socket}'; set the token on the socket, not 'token'/'connection' options`,
       );
     }
     out[alias] = spec.socket;

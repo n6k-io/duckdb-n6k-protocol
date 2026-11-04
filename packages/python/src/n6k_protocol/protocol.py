@@ -23,8 +23,7 @@ from typing import Any, Final, Union
 
 # The major version: bump only on incompatible changes (frame layout, op semantics, etc.).
 # Additive changes are negotiated as capabilities instead (HELLO_CAPS / OPEN_CAPS). Both ends check
-# it: the server against HELLO (HELLO_ERR on mismatch), the client against HELLO_ACK
-# (create-n6k-worker.ts, src/n6k_client/ws_client.cpp, n6k_connect_function.cpp).
+# it: the server against HELLO (HELLO_ERR on mismatch), the client against HELLO_ACK.
 N6K_PROTOCOL_VERSION = 12
 
 # ── Frame types ──────────────────────────────────────────────────────────────

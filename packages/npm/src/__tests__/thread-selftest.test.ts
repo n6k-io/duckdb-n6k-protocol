@@ -47,7 +47,7 @@ backendDescribe()(`thread selftest [${backendName}]`, () => {
       expect(row.woke_from_park).toBe(true);
       expect(row.wait_result).toBe(0); // 0 = woken (not 1 not-equal / 2 timed-out)
       // A pthread can reach the main-worker n6k glue via emscripten main-thread proxying — the
-      // basis for making the control-plane glue (vsockAttach/vsockClose) safe under threads>1.
+      // basis for making the control-plane glue safe under threads>1.
       expect(row.main_proxy_sees_n6k).toBe(true);
     }
   }, 30_000);

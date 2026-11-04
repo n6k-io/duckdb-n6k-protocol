@@ -12,7 +12,6 @@ import {
   ringWaitSpaceAsync,
   ringWaitTimed,
   ringIsClosed,
-  ringReset,
   ringClose,
   ringEpoch,
 } from "./ring";
@@ -46,7 +45,7 @@ export type Endpoint = {
   // Wait up to `timeoutMs` for the next inbound frame (worker threads only).
   recvWaitTimed(timeoutMs: number): void;
   inboundClosed(): boolean;
-  // Reset counter; a lazily-polling consumer reads it to notice a swap.
+  // The outbound ring's RING_EPOCH.
   epoch(): number;
   close(): void;
 };
@@ -115,15 +114,4 @@ export function wsWorkerEndpoint(
 ): Endpoint {
   const { duckdbToWs, wsToDuckdb } = rings(buf, layout, baseOffset);
   return makeEndpoint(wsToDuckdb, duckdbToWs);
-}
-
-// Reset both rings for reuse across a reconnect; only safe when both sides are idle.
-export function resetChannel(
-  buf: ArrayBufferLike,
-  layout: ChannelLayout = DEFAULT_CHANNEL_LAYOUT,
-  baseOffset = 0,
-): void {
-  const { duckdbToWs, wsToDuckdb } = rings(buf, layout, baseOffset);
-  ringReset(duckdbToWs);
-  ringReset(wsToDuckdb);
 }

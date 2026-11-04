@@ -12,6 +12,11 @@
 namespace duckdb {
 namespace n6k {
 
+uint64_t NextSessionNs() {
+	static std::atomic<uint64_t> next {1};
+	return next.fetch_add(1);
+}
+
 RequestState::RequestState(uint32_t req_id, std::weak_ptr<WsClient> owner) : req_id_(req_id), owner_(std::move(owner)) {
 }
 
@@ -135,13 +140,6 @@ WsClient::~WsClient() {
 	ShutdownFromOwner("client shutdown");
 }
 
-void WsClient::RecordHelloAck(int protocol_version, std::vector<std::string> capabilities) {
-	std::lock_guard<std::mutex> lk(state_mu_);
-	state_.protocol_version = protocol_version;
-	state_.hello_capabilities = std::move(capabilities);
-	state_.hello_arrived = true;
-}
-
 void WsClient::RecordOpenAck(OpenAck ack) {
 	std::lock_guard<std::mutex> lk(state_mu_);
 	state_.open = std::move(ack);
@@ -157,26 +155,17 @@ void WsClient::RecordOpenError(const std::string &msg) {
 	}
 }
 
-void WsClient::RecordPending(HandshakeStep step, const std::string &msg) {
+void WsClient::RecordOpenPending(const std::string &msg) {
 	std::lock_guard<std::mutex> lk(state_mu_);
-	const bool hello = step == HandshakeStep::HELLO;
-	if (!(hello ? state_.hello_arrived : state_.open_arrived)) {
-		auto &pending = hello ? state_.hello_pending : state_.open_pending;
-		pending.beats++;
-		pending.message = msg;
+	if (!state_.open_arrived) {
+		state_.open_pending.beats++;
+		state_.open_pending.message = msg;
 	}
 }
 
 void WsClient::RecordHandshakeError(const std::string &msg) {
 	std::lock_guard<std::mutex> lk(state_mu_);
-	// A gate that already has an answer keeps it: the first reason recorded is the most specific one.
-	if (!state_.hello_arrived) {
-		state_.hello_error = msg;
-		if (state_.hello_pending.beats > 0) {
-			state_.hello_error += " (handshake was pending: " + state_.hello_pending.message + ")";
-		}
-		state_.hello_arrived = true;
-	}
+	// An OPEN that already has an answer keeps it: the first reason recorded is the most specific one.
 	if (!state_.open_arrived) {
 		state_.open_error = msg;
 		if (state_.open_pending.beats > 0) {
@@ -192,26 +181,17 @@ void WsClient::ResetHandshakeForReconnect() {
 	state_ = ConnState();
 }
 
-bool WsClient::HelloArrived() const {
-	std::lock_guard<std::mutex> lk(state_mu_);
-	return state_.hello_arrived;
-}
-
 bool WsClient::OpenArrived() const {
 	std::lock_guard<std::mutex> lk(state_mu_);
 	return state_.open_arrived;
 }
 
-uint64_t WsClient::PendingBeats(HandshakeStep step) const {
+uint64_t WsClient::OpenPendingBeats() const {
 	std::lock_guard<std::mutex> lk(state_mu_);
-	return step == HandshakeStep::HELLO ? state_.hello_pending.beats : state_.open_pending.beats;
+	return state_.open_pending.beats;
 }
 
-void WsClient::AwaitReply(HandshakeStep step, const AbortCheck &should_abort) {
-	const bool hello = step == HandshakeStep::HELLO;
-	auto arrived = [this, hello] {
-		return hello ? HelloArrived() : OpenArrived();
-	};
+void WsClient::AwaitOpenReply(const AbortCheck &should_abort) {
 	auto deadline = std::chrono::steady_clock::now() + opts_.connect_timeout;
 	uint64_t seen = 0;
 	while (true) {
@@ -220,24 +200,22 @@ void WsClient::AwaitReply(HandshakeStep step, const AbortCheck &should_abort) {
 		if (seen > 0 && should_abort) {
 			wake = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(250));
 		}
-		WaitProgress([this, &arrived, step, seen] { return arrived() || PendingBeats(step) != seen; }, wake);
-		if (arrived()) {
+		WaitProgress([this, seen] { return OpenArrived() || OpenPendingBeats() != seen; }, wake);
+		if (OpenArrived()) {
 			return;
 		}
 		if (seen > 0 && should_abort && should_abort()) {
-			if (!hello) {
-				SendFrame(PackIdOnlyFrame(static_cast<int>(FrameType::CANCEL), 0, opts_.ns));
-			}
+			SendFrame(PackIdOnlyFrame(static_cast<int>(FrameType::CANCEL), 0, CurrentNs()));
 			throw InterruptException();
 		}
-		const auto beats = PendingBeats(step);
+		const auto beats = OpenPendingBeats();
 		if (beats != seen) {
 			seen = beats;
 			deadline = std::chrono::steady_clock::now() + opts_.open_pending_stall;
 			continue;
 		}
 		const auto now = std::chrono::steady_clock::now();
-		// WaitUntil returns early with nothing new only once the reactor is stopping.
+		// WaitProgress returns early with nothing new only once the client is stopping.
 		if (stopping_.load() || now < wake) {
 			throw std::runtime_error("n6k ws client closed while opening catalog \"" + opts_.catalog + "\"");
 		}
@@ -250,10 +228,9 @@ void WsClient::AwaitReply(HandshakeStep step, const AbortCheck &should_abort) {
 		std::string status;
 		{
 			std::lock_guard<std::mutex> lk(state_mu_);
-			status = hello ? state_.hello_pending.message : state_.open_pending.message;
+			status = state_.open_pending.message;
 		}
-		const std::string what = hello ? "handshake" : "catalog \"" + opts_.catalog + "\" open";
-		throw std::runtime_error("n6k: " + what + " stalled: no FT_" + (hello ? "HELLO" : "OPEN") + "_PENDING for " +
+		throw std::runtime_error("n6k: catalog \"" + opts_.catalog + "\" open stalled: no FT_OPEN_PENDING for " +
 		                         std::to_string(opts_.open_pending_stall.count()) + "ms (last status: " + status + ")");
 	}
 }
@@ -268,6 +245,11 @@ std::shared_ptr<Reactor> WsClient::CurrentReactor() const {
 	return reactor_;
 }
 
+uint64_t WsClient::CurrentNs() const {
+	std::lock_guard<std::mutex> lk(reactor_mu_);
+	return ns_;
+}
+
 void WsClient::SendFrame(const std::string &frame_bytes) {
 	if (auto r = CurrentReactor()) {
 		r->Send(frame_bytes);
@@ -278,11 +260,14 @@ void WsClient::SendFrame(const std::string &frame_bytes) {
 }
 
 bool WsClient::WaitProgress(const std::function<bool()> &ready, std::chrono::steady_clock::time_point deadline) {
-	auto r = CurrentReactor();
-	if (!r) {
-		return ready();
-	}
-	return r->WaitUntil(ready, deadline);
+	std::unique_lock<std::mutex> lk(progress_mu_);
+	progress_cv_.wait_until(lk, deadline, [&] { return ready() || stopping_.load(); });
+	return ready();
+}
+
+void WsClient::NotifyProgress() {
+	{ std::lock_guard<std::mutex> lk(progress_mu_); }
+	progress_cv_.notify_all();
 }
 
 void WsClient::MarkDisconnectedIfChannelReset() {
@@ -293,11 +278,7 @@ void WsClient::MarkDisconnectedIfChannelReset() {
 	if (!r) {
 		return;
 	}
-	// A moved epoch means the host reset the transport channel: this reactor belongs to the OLD
-	// generation. Mark disconnected so the lazy Reconnect runs.
-	// Not gated on state_.connected, so every idle poll in the reset window trips. Native reactors report
-	// epoch 0 == connected_epoch_, so this never trips off-wasm.
-	if (r->Epoch() != connected_epoch_.load()) {
+	if (r->Generation() != connected_generation_.load()) {
 		std::lock_guard<std::mutex> lk(state_mu_);
 		state_.connected = false;
 	}
@@ -311,33 +292,15 @@ void WsClient::OnMessage(const std::string &bytes, bool binary) {
 		RecordHandshakeError("unexpected text frame from server");
 		return;
 	}
-	// Bytes after the msgpack header map are the raw Arrow body.
-	//
-	// An unparseable frame carries no req_id, so there is no request to fail individually and a
-	// silent drop hangs it to its deadline. Version skew or corruption is a connection-level fault:
-	// fail every in-flight request, clear state_.connected, and let the lazy Reconnect rebuild.
-	msgpack::object_handle oh;
+	// Bytes after the msgpack header map are the raw Arrow body. Unguarded: ConnectionHub::OnMessage delivers
+	// only frames whose header parses to a map.
 	size_t off = 0;
-	try {
-		oh = msgpack::unpack(bytes.data(), bytes.size(), off);
-	} catch (const std::exception &e) {
-		FailConnectionAndAllInFlightRequests(std::string("malformed frame from server (msgpack): ") + e.what());
-		return;
-	}
+	msgpack::object_handle oh = msgpack::unpack(bytes.data(), bytes.size(), off);
 	const msgpack::object &h = oh.get();
-	if (h.type != msgpack::type::MAP) {
-		FailConnectionAndAllInFlightRequests("malformed frame from server: header is not a msgpack map");
-		return;
-	}
 	const auto type = static_cast<FrameType>(GetInt(h, "t", -1));
 	const auto req_id = static_cast<uint32_t>(GetInt(h, "id", 0));
 	const char *body_ptr = bytes.data() + off;
 	const size_t body_len = bytes.size() - off;
-
-	if (type == FrameType::HELLO_ACK) {
-		RecordHelloAck(static_cast<int>(GetInt(h, "protocol_version")), GetStrArray(h, "capabilities"));
-		return;
-	}
 
 	if (type == FrameType::OPEN_ACK) {
 		OpenAck ack;
@@ -346,21 +309,15 @@ void WsClient::OnMessage(const std::string &bytes, bool binary) {
 		return;
 	}
 
-	if (type == FrameType::OPEN_PENDING || type == FrameType::HELLO_PENDING) {
-		RecordPending(type == FrameType::HELLO_PENDING ? HandshakeStep::HELLO : HandshakeStep::OPEN,
-		              GetStr(h, "message"));
+	if (type == FrameType::OPEN_PENDING) {
+		RecordOpenPending(GetStr(h, "message"));
 		return;
 	}
 
-	if (type == FrameType::HELLO_ERR || type == FrameType::OPEN_ERR) {
+	if (type == FrameType::OPEN_ERR) {
 		const std::string etype = GetStr(h, "exception_type");
 		const std::string emsg = GetStr(h, "exception_message");
-		const std::string msg = etype.empty() ? emsg : etype + ": " + emsg;
-		if (type == FrameType::HELLO_ERR) {
-			RecordHandshakeError(msg);
-		} else {
-			RecordOpenError(msg);
-		}
+		RecordOpenError(etype.empty() ? emsg : etype + ": " + emsg);
 		return;
 	}
 
@@ -427,45 +384,41 @@ void WsClient::OnMessage(const std::string &bytes, bool binary) {
 }
 
 void WsClient::OnClose(const std::string &reason) {
-	// Runs on the transport callback thread: must not stop the socket or join the writer.
+	// Runs on a transport thread or inside a caller's hub call (ConnectionHub::BindSession, SendOnGeneration,
+	// Reconnect, Disconnect): must not close the channel.
 	FailConnectionAndAllInFlightRequests(reason.empty() ? "socket closed" : reason);
 }
 
-void WsClient::StartReactorAndHandshake(bool &answered, const AbortCheck &should_abort) {
-	// Capture a strong self in reactor callbacks so the client outlives in-flight callbacks; ShutdownFromOwner breaks
-	// the cycle.
-	auto self = shared_from_this();
-	auto r = std::shared_ptr<Reactor>(CreateReactor(opts_));
-	r->Start([self](const std::string &bytes, bool binary) { self->OnMessage(bytes, binary); },
-	         [self](const std::string &reason) { self->OnClose(reason); });
+void WsClient::OpenChannelAndHandshake(bool &answered, const AbortCheck &should_abort) {
+	answered = false;
+	const uint64_t ns = NextSessionNs();
+	std::shared_ptr<Reactor> r(opts_.open_channel(ns, should_abort));
 	{
 		std::lock_guard<std::mutex> lk(reactor_mu_);
 		reactor_ = r;
+		ns_ = ns;
 	}
+	// A strong self in the callbacks keeps the client alive through any in flight. The channel may hold them
+	// until it is destroyed, so dropping reactor_ is what breaks the cycle.
+	auto self = shared_from_this();
+	r->Start(
+	    [self](const std::string &bytes, bool binary) {
+		    self->OnMessage(bytes, binary);
+		    self->NotifyProgress();
+	    },
+	    [self](const std::string &reason) {
+		    self->OnClose(reason);
+		    self->NotifyProgress();
+	    });
 
-	answered = false;
-	if (opts_.send_hello) {
-		// Offers no APP_HELLO_CAPS: OnMessage treats any text frame as a handshake error.
-		SendFrame(PackHello(static_cast<int>(FrameType::HELLO), opts_.bearer_token,
-		                    std::array<const char *, 1> {{CAP_CROSSING}}));
-		AwaitReply(HandshakeStep::HELLO, should_abort);
-		answered = true;
-		std::lock_guard<std::mutex> lk(state_mu_);
-		if (!state_.hello_error.empty()) {
-			throw std::runtime_error(state_.hello_error);
-		}
-		if (state_.protocol_version != N6K_PROTOCOL_VERSION) {
-			throw std::runtime_error("server protocol_version=" + std::to_string(state_.protocol_version) +
-			                         ", expected " + std::to_string(N6K_PROTOCOL_VERSION));
-		}
-	} else if (opts_.host_hello_capabilities) {
-		auto caps = opts_.host_hello_capabilities();
+	if (opts_.hello_capabilities) {
+		auto caps = opts_.hello_capabilities();
 		std::lock_guard<std::mutex> lk(state_mu_);
 		state_.hello_capabilities = std::move(caps);
 	}
 
-	SendFrame(PackOpen(static_cast<int>(FrameType::OPEN), opts_.ns, opts_.catalog));
-	AwaitReply(HandshakeStep::OPEN, should_abort);
+	SendFrame(PackOpen(static_cast<int>(FrameType::OPEN), ns, opts_.catalog));
+	AwaitOpenReply(should_abort);
 	answered = true;
 	{
 		std::lock_guard<std::mutex> lk(state_mu_);
@@ -473,14 +426,13 @@ void WsClient::StartReactorAndHandshake(bool &answered, const AbortCheck &should
 			throw std::runtime_error(state_.open_error);
 		}
 	}
-	// Pin the epoch we connected on, so a later host-driven reset shows as a moved epoch.
-	connected_epoch_.store(r->Epoch());
+	connected_generation_.store(r->Generation());
 }
 
 OpenAck WsClient::Connect(const AbortCheck &should_abort) {
 	bool answered;
 	try {
-		StartReactorAndHandshake(answered, should_abort);
+		OpenChannelAndHandshake(answered, should_abort);
 	} catch (const std::exception &e) {
 		ShutdownFromOwner(e.what());
 		throw;
@@ -492,25 +444,26 @@ OpenAck WsClient::Connect(const AbortCheck &should_abort) {
 void WsClient::Reconnect(const AbortCheck &should_abort) {
 	// Serialize the whole rebuild: under threads>1 several compute pthreads can observe a disconnected
 	// state and all call Reconnect. The first rebuilds; the rest re-check under this lock and bail, so
-	// we never race the reactor_ swap or spawn duplicate service threads.
+	// we never race the reactor_ swap.
 	std::lock_guard<std::mutex> reconnect_lk(reconnect_mu_);
 	if (IsConnected() || stopping_.load()) {
 		return;
 	}
 	ResetHandshakeForReconnect();
+	// Releases the old ns on the server before a fresh one opens.
 	if (auto old = CurrentReactor()) {
-		old->RetireKeepingChannelOpen();
+		old->Close();
 	}
 	bool answered;
 	try {
-		StartReactorAndHandshake(answered, should_abort);
+		OpenChannelAndHandshake(answered, should_abort);
 	} catch (const std::exception &e) {
 		{
 			std::lock_guard<std::mutex> lk(state_mu_);
 			state_.connected = false;
 		}
-		// A peer that answered but is unusable will not become usable by retrying, so tear down. A bare
-		// timeout leaves the client alive and a later request reconnects again.
+		// An OPEN_ERR, a drop during the reopen or a bad frame stops the client for good: only a re-ATTACH
+		// recovers. Otherwise (timeout, stall, abort, failed dial) a later request reconnects again.
 		if (answered) {
 			ShutdownFromOwner(e.what());
 		}
@@ -520,12 +473,11 @@ void WsClient::Reconnect(const AbortCheck &should_abort) {
 
 std::shared_ptr<RequestState> WsClient::AwaitReadySessionAndSendRequest(uint8_t op, const std::string &body,
                                                                         const AbortCheck &should_abort) {
-	// Lazily re-establish a dropped (not closed) connection: rebuild + re-handshake so a server drop recovers with no
-	// re-ATTACH. A moved epoch means an out-of-band channel swap (wasm replaceWebsocket): clear `connected` to force a
-	// fresh OPEN.
+	// Lazily re-establish a dropped (not closed) connection: reopen + re-handshake so a server drop recovers with no
+	// re-ATTACH. A moved generation means the connection beneath was replaced: clear `connected` to force a fresh OPEN.
 	if (IsConnected() && !stopping_.load()) {
 		auto r = CurrentReactor();
-		if (r && r->Epoch() != connected_epoch_.load()) {
+		if (r && r->Generation() != connected_generation_.load()) {
 			std::lock_guard<std::mutex> lk(state_mu_);
 			state_.connected = false;
 		}
@@ -556,7 +508,8 @@ std::shared_ptr<RequestState> WsClient::AwaitReadySessionAndSendRequest(uint8_t 
 			arrow_len = body.size() - nl - 1;
 		}
 	}
-	SendFrame(PackReqFrame(static_cast<int>(FrameType::REQ), req_id, op, args, args_len, arrow, arrow_len, opts_.ns));
+	SendFrame(
+	    PackReqFrame(static_cast<int>(FrameType::REQ), req_id, op, args, args_len, arrow, arrow_len, CurrentNs()));
 	return st;
 }
 
@@ -569,19 +522,19 @@ void WsClient::Credit(uint32_t req_id, uint32_t n) {
 	if (stopping_.load()) {
 		return;
 	}
-	SendFrame(PackCredit(static_cast<int>(FrameType::CREDIT), req_id, n, opts_.ns));
+	SendFrame(PackCredit(static_cast<int>(FrameType::CREDIT), req_id, n, CurrentNs()));
 }
 
 void WsClient::SendCancel(uint32_t req_id) {
 	if (stopping_.load()) {
 		return;
 	}
-	SendFrame(PackIdOnlyFrame(static_cast<int>(FrameType::CANCEL), req_id, opts_.ns));
+	SendFrame(PackIdOnlyFrame(static_cast<int>(FrameType::CANCEL), req_id, CurrentNs()));
 }
 
 void WsClient::FailConnectionAndAllInFlightRequests(const std::string &reason) {
-	// Both gates open with the drop reason before any request is failed, so a thread woken by the
-	// synthetic error below already sees why. RecordHandshakeError leaves a gate that already has an
+	// The OPEN gate opens with the drop reason before any request is failed, so a thread woken by the
+	// synthetic error below already sees why. RecordHandshakeError leaves an OPEN that already has an
 	// answer alone.
 	{
 		std::lock_guard<std::mutex> lk(state_mu_);
@@ -622,15 +575,15 @@ void WsClient::ShutdownFromOwner(const std::string &reason) {
 	}
 
 	FailConnectionAndAllInFlightRequests(reason);
+	NotifyProgress();
 
-	// Stop the reactor: joins/releases its transport and destroys the self-holding callbacks, breaking the cycle.
 	std::shared_ptr<Reactor> r;
 	{
 		std::lock_guard<std::mutex> lk(reactor_mu_);
 		r = std::move(reactor_);
 	}
 	if (r) {
-		r->Stop();
+		r->Close();
 	}
 }
 

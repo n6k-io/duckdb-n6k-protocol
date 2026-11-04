@@ -8,8 +8,9 @@
 #include "ws_send_after_start_selftest.hpp"
 #include "open_ns_selftest.hpp"
 #include "open_pending_selftest.hpp"
-#include "ws_fd_hub_selftest.hpp"
+#include "connection_hub_selftest.hpp"
 #include "n6k_connect_function.hpp"
+#include "n6k_connection_functions.hpp"
 #include "n6k_list_catalogs_function.hpp"
 #include "n6k_parse_sql_get_tables.hpp"
 #include "n6k_split_statements.hpp"
@@ -35,8 +36,9 @@ void LoadInternal(ExtensionLoader &loader) {
 	RegisterN6kSelftestSendAfterStart(loader);
 	RegisterN6kSelftestOpenNsDistinct(loader);
 	RegisterN6kSelftestOpenPending(loader);
-	RegisterN6kSelftestFdHubRouting(loader);
+	RegisterN6kSelftestHubRouting(loader);
 	RegisterN6kConnect(loader);
+	RegisterN6kConnectionFunctions(loader);
 	RegisterN6kListCatalogs(loader);
 	RegisterN6kParseSqlGetTables(loader);
 	RegisterN6kSplitStatements(loader);

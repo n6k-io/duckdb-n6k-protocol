@@ -39,28 +39,19 @@ backendDescribe()(`drop [${backendName}]`, () => {
   const forceDropTest = backend?.caps.forceDrop ? test : test.skip;
 
   forceDropTest(
-    "server force-close errors the next query, then DETACH + re-ATTACH recovers",
+    "after a server force-close, queries recover with no DETACH",
     async () => {
       expect(await countUsers()).toBeGreaterThan(0);
 
       await wsCloseAll();
 
-      let caught: Error | null = null;
-      try {
-        await handle.conn.query(`SELECT count(*) FROM db.main.users`);
-      } catch (error) {
-        caught = error as Error;
+      // One issued before the client sees the drop may fail; the next redials.
+      let users = 0;
+      const deadline = Date.now() + 10_000;
+      while (users === 0 && Date.now() < deadline) {
+        users = await countUsers().catch(() => 0);
       }
-      expect(caught).not.toBeNull();
-      expect(caught!.message.length).toBeGreaterThan(0);
-
-      try {
-        await handle.conn.query(`DETACH db`);
-      } catch {
-        /* ignore */
-      }
-      await handle.conn.query(ATTACH);
-      expect(await countUsers()).toBeGreaterThan(0);
+      expect(users).toBeGreaterThan(0);
     },
     30_000,
   );

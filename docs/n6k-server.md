@@ -365,8 +365,8 @@ default session.
   read or accept gets `HELLO_ERR` and a write shutdown instead, with no `CLOSE`. A WebSocket supplies message
   boundaries and types for free; a raw stream socket needs this header. This is the same
   "transport owns length-framing" convention used by the
-  [native `wsFd` attach path](n6k-network.md#attaching-an-existing-socket-fd-native)
-  (`src/n6k_client/ws_fd_hub.cpp`), so a pump can shuttle frames between this
+  [native `wsFd` client path](n6k-network.md#attaching-an-existing-socket-fd-native)
+  (`src/n6k_client/ws_transport_raw.cpp`), so a pump can shuttle frames between this
   socket and a real WebSocket unchanged — which is what `n6k_server.pump` does for
   `n6k_serve_fd`. Over `n6k_serve_http` there is no prefix: one binary message is
   one frame.
@@ -538,5 +538,5 @@ reference).
   format, ops, and lifecycle this extension implements.
 - [`n6k-conformance.md`](n6k-conformance.md) — the shared test harness.
 - [`n6k-network.md`](n6k-network.md) — the client / SQL side: `ATTACH`, auth,
-  `wsId`/`wsFd`, and the function registry.
+  shared connections, and the function registry.
 </content>

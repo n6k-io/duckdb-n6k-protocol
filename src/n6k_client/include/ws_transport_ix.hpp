@@ -22,6 +22,7 @@ public:
 
 	void Start(MessageFn on_message, CloseFn on_close, OpenFn on_open) override;
 	bool Send(const std::string &frame) override;
+	bool SendText(const std::string &text) override;
 	void Stop() override;
 
 private:

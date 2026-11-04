@@ -30,7 +30,7 @@ void IxWebSocketTransport::Start(MessageFn on_message, CloseFn on_close, OpenFn 
 			on_message(msg->str, msg->binary);
 		} else if (msg->type == ix::WebSocketMessageType::Open) {
 			// The 101 landed and the socket is ReadyState::Open. Until this point sendBinary refuses
-			// every frame, so the reactor's writer must stay parked (see NativeReactor::StartWriterThread).
+			// every frame, so the hub queues nothing before it (ConnectionHub::AwaitHello).
 			if (on_open) {
 				on_open();
 			}
@@ -54,10 +54,17 @@ bool IxWebSocketTransport::Send(const std::string &frame) {
 	return ws_->sendBinary(frame).success;
 }
 
+bool IxWebSocketTransport::SendText(const std::string &text) {
+	if (!ws_) {
+		return false;
+	}
+	return ws_->sendText(text).success;
+}
+
+// ws_ stays until destruction: a hub thread may still be inside Send, and ix refuses a send once stopped.
 void IxWebSocketTransport::Stop() {
 	if (ws_) {
 		ws_->stop();
-		ws_.reset();
 	}
 }
 

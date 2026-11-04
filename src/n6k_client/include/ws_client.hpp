@@ -34,33 +34,26 @@ struct OpenAck {
 	std::vector<std::string> capabilities;
 };
 
-// Polled once a PENDING has arrived for HELLO or OPEN; true throws InterruptException, sending
-// CANCEL {ns, id:0} only for OPEN. Called only during the call it is passed to; empty never aborts.
+// Polled once an OPEN_PENDING has arrived (and by the connection while it dials); true throws
+// InterruptException, sending CANCEL {ns, id:0} for a pending OPEN. Called only during the call it is passed
+// to; empty never aborts.
 using AbortCheck = std::function<bool()>;
 
+// Never 0: the server refuses it. Process-wide, so no two sessions on one connection ever share one.
+uint64_t NextSessionNs();
+
 struct WsClientOptions {
-	std::string url;
-	std::string bearer_token;
-	// SERVER-side catalog name; sent in the ?catalog= dial query and the FT_OPEN frame.
+	// SERVER-side catalog name; sent in the FT_OPEN frame.
 	std::string catalog;
-	// Wasm only: vsock channel key = LOCAL ATTACH alias (unique per duckdb instance).
-	std::string channel_key;
-	// Session tag so ONE socket carries many catalog sessions; never 0.
-	uint64_t ns = 0;
-	// The client owns the socket and so its FT_HELLO. False when riding a host socket (wsFd /
-	// wsid), whose owner already sent it.
-	bool send_hello = true;
-	// Wasm only: heap address of the vsock channel's ring region, so the reactor
-	// reads/writes the rings directly with native atomics.
-	uintptr_t ring_ptr = 0;
 	std::chrono::milliseconds connect_timeout {5000};
-	// Once the server answers HELLO / OPEN with HELLO_PENDING / OPEN_PENDING that step has no overall
-	// deadline; it fails only when this long passes with no further pending, ACK or ERR.
+	// Once the server answers OPEN with OPEN_PENDING it has no overall deadline; it fails only when this
+	// long passes with no further pending, ACK or ERR.
 	std::chrono::milliseconds open_pending_stall {OPEN_PENDING_STALL_MS};
-	// >= 0: ride this already-connected socket fd instead of dialing url. Native only.
-	int ws_fd = -1;
-	// !send_hello: the HELLO_ACK capabilities the socket owner negotiated, asked on every (re)connect.
-	std::function<std::vector<std::string>()> host_hello_capabilities;
+	// Called once per OPEN attempt with a fresh ns; returns an unstarted channel for it, or throws when the
+	// connection beneath cannot be (re)established.
+	std::function<std::unique_ptr<Reactor>(uint64_t ns, const AbortCheck &)> open_channel;
+	// The HELLO_ACK capabilities of the connection beneath, asked on every (re)open.
+	std::function<std::vector<std::string>()> hello_capabilities;
 	// Receives a WsLogType row per frame sent and received; null logs nothing.
 	shared_ptr<Logger> logger;
 };
@@ -119,9 +112,8 @@ public:
 	static std::shared_ptr<WsClient> Create(WsClientOptions opts);
 	~WsClient();
 
-	// Opens the socket, blocks until OPEN_ACK (indefinitely while the server keeps sending HELLO_PENDING /
-	// OPEN_PENDING);
-	// throws on failure/timeout/stall/version mismatch.
+	// Opens a channel and blocks until OPEN_ACK (indefinitely while the server keeps sending OPEN_PENDING);
+	// throws on failure/timeout/stall.
 	OpenAck Connect(const AbortCheck &should_abort);
 
 	// `should_abort` guards the reconnect this call runs when the connection is down.
@@ -132,7 +124,8 @@ public:
 
 	void SendCancel(uint32_t req_id);
 
-	// Server-initiated PUSH dispatch; invoked on the WS callback thread. Set before Connect().
+	// Server-initiated PUSH dispatch; invoked on the thread delivering inbound frames. A PUSH that arrives while
+	// no handler is set is dropped.
 	using PushHandler = std::function<void(uint8_t op, const std::string &body)>;
 	void SetPushHandler(PushHandler h);
 
@@ -141,38 +134,27 @@ public:
 	OpenAck GetOpenAck() const;
 	std::vector<std::string> GetHelloCapabilities() const;
 
-	// Proactive teardown (idempotent): fail in-flight reqs + stop reactor. Never from an inbound callback.
+	// Proactive teardown (idempotent): fail in-flight reqs + close the channel. Never from an inbound callback.
 	void Close();
 
-	// Block until ready() or deadline. ready() must self-lock and hold no client mutex (Reactor contract).
-	bool WaitProgress(const std::function<bool()> &ready, std::chrono::steady_clock::time_point deadline);
-
-	// Non-blocking: mark the connection down if the host reset the transport channel. Native: no-op.
+	// Non-blocking: mark the connection down if the channel's connection was replaced beneath it.
 	void MarkDisconnectedIfChannelReset();
 
 private:
-	enum class HandshakeStep { HELLO, OPEN };
-
-	//! HELLO_PENDING / OPEN_PENDING frames seen before that step's final reply, and the status the last
-	//! one carried.
+	//! OPEN_PENDING frames seen before the final reply, and the status the last one carried.
 	struct PendingState {
 		uint64_t beats = 0;
 		std::string message;
 	};
 
-	// The whole handshake state of one connection, under one lock: written by the reactor's inbound
-	// thread and read by requesting threads, so a reader never sees a combination that never existed.
+	// The whole handshake state of one session, shared by the channel's inbound thread and requesting
+	// threads under state_mu_.
 	struct ConnState {
-		//! A HELLO_ACK or a HELLO_ERR has been seen.
-		bool hello_arrived = false;
-		int protocol_version = 0;
 		std::vector<std::string> hello_capabilities;
-		std::string hello_error;
-		//! An OPEN_ACK or an OPEN_ERR has been seen.
+		//! The OPEN wait is over: an OPEN_ACK, an OPEN_ERR or a recorded handshake error.
 		bool open_arrived = false;
 		OpenAck open;
 		std::string open_error;
-		PendingState hello_pending;
 		PendingState open_pending;
 		//! An OPEN_ACK landed and no drop has been observed since.
 		bool connected = false;
@@ -182,67 +164,71 @@ private:
 	WsClient(const WsClient &) = delete;
 	WsClient &operator=(const WsClient &) = delete;
 
-	// Inbound-thread state transitions. Each takes state_mu_ for its whole update, so a reader never
-	// sees half of one.
-	void RecordHelloAck(int protocol_version, std::vector<std::string> capabilities);
+	// Handshake state transitions. Each takes state_mu_ for its whole update, so a reader never sees
+	// half of one.
 	void RecordOpenAck(OpenAck ack);
 	void RecordOpenError(const std::string &msg);
-	void RecordPending(HandshakeStep step, const std::string &msg);
+	void RecordOpenPending(const std::string &msg);
 	void RecordHandshakeError(const std::string &msg);
 	void ResetHandshakeForReconnect();
 
-	// Predicates for WaitProgress. Each self-locks and must be called with no other client mutex
-	// held (Reactor contract: the wasm reactor dispatches inbound frames between checks).
-	bool HelloArrived() const;
+	// Block until ready() or deadline. ready() must self-lock state_mu_ only.
+	bool WaitProgress(const std::function<bool()> &ready, std::chrono::steady_clock::time_point deadline);
+	void NotifyProgress();
+
+	// Predicates for WaitProgress.
 	bool OpenArrived() const;
-	uint64_t PendingBeats(HandshakeStep step) const;
+	uint64_t OpenPendingBeats() const;
 
-	// Wait for that step's ACK/ERR: the first reply within connect_timeout, then each pending frame
-	// extends the deadline by open_pending_stall.
-	void AwaitReply(HandshakeStep step, const AbortCheck &should_abort);
+	// Wait for OPEN_ACK/ERR: the first reply within connect_timeout, then each pending frame extends the
+	// deadline by open_pending_stall.
+	void AwaitOpenReply(const AbortCheck &should_abort);
 
-	// From an inbound callback: fail in-flight reqs, record error, mark disconnected. No reactor stop.
+	// Never stops the reactor, so it is safe from an inbound callback.
 	void FailConnectionAndAllInFlightRequests(const std::string &reason);
-	// Stops the reactor (idempotent). From the owner (dtor/Close) only, never an inbound callback.
+	// Stops the reactor (idempotent). Never from an inbound callback.
 	void ShutdownFromOwner(const std::string &reason);
 	void OnMessage(const std::string &bytes, bool binary);
 	void OnClose(const std::string &reason);
 
-	// Re-establish after a drop: reset handshake, rebuild reactor, re-run HELLO (when owned) and OPEN.
-	// Throws if the peer is unusable, so the caller sees why.
+	// Re-establish after a drop: close the old channel, open one under a fresh ns, and OPEN again. Throws if
+	// the peer is unusable, so the caller sees why.
 	void Reconnect(const AbortCheck &should_abort);
 
-	// Start a reactor, run the handshake on it, and throw the reason it is unusable. `answered` reports
-	// whether the server replied at all, so a bare timeout can be told from a refusal.
-	void StartReactorAndHandshake(bool &answered, const AbortCheck &should_abort);
+	// Open a channel, run the handshake on it, and throw the reason it is unusable. `answered` is true once
+	// the OPEN wait ends with an OPEN_ACK, an OPEN_ERR or a recorded handshake error; false for a timeout, a
+	// stall, an abort, a stopping client, or a channel that could not open.
+	void OpenChannelAndHandshake(bool &answered, const AbortCheck &should_abort);
 
 	void SendFrame(const std::string &frame_bytes);
 
-	// Snapshot the current reactor as a strong ref so a caller keeps it alive
-	// while Reconnect concurrently swaps in a new one — avoids the use-after-free of a bare pointer.
+	// A strong ref, so a caller keeps the channel alive while Reconnect swaps in a new one.
 	std::shared_ptr<Reactor> CurrentReactor() const;
+	uint64_t CurrentNs() const;
 
 	WsClientOptions opts_;
-	// reactor_ is hot-swapped across a reconnect and read concurrently by compute pthreads under
-	// threads>1. reactor_mu_ guards the pointer itself; reconnect_mu_ serializes the whole Reconnect
-	// body (with a double-checked state_.connected) so two threads can't both rebuild + spawn service threads.
+	// reactor_mu_ guards reactor_ and ns_ together; reconnect_mu_ serializes the whole Reconnect body
+	// (with a double-checked state_.connected) so two threads can't both reopen.
 	mutable std::mutex reactor_mu_;
 	std::mutex reconnect_mu_;
 	std::shared_ptr<Reactor> reactor_;
+	uint64_t ns_ = 0;
 
-	// Deliberately outside ConnState: a one-way latch, set by the owner (dtor/Close) and read on the
+	// Deliberately outside ConnState: a one-way latch, set by ShutdownFromOwner and read on the
 	// send path without a lock. It answers "is this object being torn down", which is true regardless
 	// of what the handshake state says.
 	std::atomic<bool> stopping_ {false};
+	// Never reset across reopens, so a late CREDIT/CANCEL for an old request can't name a new one.
 	std::atomic<uint32_t> next_req_id_ {1};
-	// Transport channel epoch at last (re)connect; if the reactor moved past it the host reset us (wasm only).
-	// Atomic rather than part of ConnState: it is compared against Reactor::Epoch(), which is read
-	// without this lock, so pairing it with the handshake fields would buy no extra consistency.
-	std::atomic<uint64_t> connected_epoch_ {0};
+	// Reactor::Generation() at the last OPEN_ACK.
+	std::atomic<uint64_t> connected_generation_ {0};
 
-	// The reactor signals progress and WaitProgress re-checks the state under this one lock.
 	mutable std::mutex state_mu_;
 	ConnState state_;
+
+	// Inbound callbacks notify after each dispatch; WaitProgress re-checks state under state_mu_.
+	std::mutex progress_mu_;
+	std::condition_variable progress_cv_;
 
 	std::mutex reqs_mu_;
 	std::unordered_map<uint32_t, std::shared_ptr<RequestState>> reqs_;

@@ -35,7 +35,7 @@ backendDescribe(
     await handle?.cleanup();
   });
 
-  test("reconnect(catalog) recovers a dropped socket", async () => {
+  test("reconnect(catalog) drops the socket and the next query redials it", async () => {
     expect(await waitFor(() => dbStatuses().includes("connected"), 5000)).toBe(
       true,
     );
@@ -57,6 +57,7 @@ backendDescribe(
         5000,
       ),
     ).toBe(true);
+    expect(await countUsers(handle.conn)).toBeGreaterThan(0);
     expect(
       await waitFor(
         () =>
@@ -66,7 +67,5 @@ backendDescribe(
         5000,
       ),
     ).toBe(true);
-
-    expect(await countUsers(handle.conn)).toBeGreaterThan(0);
   }, 30_000);
 });
