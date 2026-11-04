@@ -1,6 +1,7 @@
 #include "n6k_connect_function.hpp"
 
 #include "n6k_credentials.hpp"
+#include "n6k_endpoint.hpp"
 #include "n6k_served.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -126,8 +127,13 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	}
 	result->scope = BindString(input, "scope");
 	if (!result->url.empty()) {
+		if (!result->scope.empty()) {
+			throw BinderException("%s: scope only applies to wsFd; with url, secrets are matched against the url",
+			                      FN_NAME);
+		}
 		const auto url = result->url;
 		SplitN6kUrl(url, result->url, result->query);
+		n6k::ParseN6kEndpoint(result->url);
 	} else if (!result->has_token && result->scope.empty()) {
 		throw BinderException("%s requires token or scope: SELECT * FROM %s(wsFd => 7, scope => 'host:port')", FN_NAME,
 		                      FN_NAME);
@@ -155,16 +161,13 @@ static std::shared_ptr<n6k::ConnectionHub> Connect(ClientContext &context, const
 	n6k::ConnectionHub::Options opts;
 	string key;
 	if (!bind_data.url.empty()) {
-		const auto token =
-		    bind_data.has_token
-		        ? bind_data.token
-		        : ResolveAttachToken(context, bind_data.scope.empty() ? bind_data.url : bind_data.scope, "");
+		const auto token = bind_data.has_token ? bind_data.token : ResolveAttachToken(context, bind_data.url, "");
 		const auto ws_url = n6k::WsUrlFromBaseUrl(bind_data.url, bind_data.query);
 		key = n6k::WebSocketKey(ws_url, token);
 		opts = n6k::WebSocketOptions(ws_url, token);
 #ifndef WASM_LOADABLE_EXTENSIONS
 		if (!bind_data.has_token && !token.empty()) {
-			opts.resolve_token = RedialTokenResolver(db, bind_data.scope.empty() ? bind_data.url : bind_data.scope);
+			opts.resolve_token = RedialTokenResolver(db, bind_data.url);
 		}
 #endif
 	} else {

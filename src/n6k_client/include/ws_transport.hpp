@@ -35,6 +35,11 @@ public:
 
 	// Idempotent. Not from within an on_message/on_close callback.
 	virtual void Stop() = 0;
+
+	// Ends the connection without waiting for the transport's threads, so it is safe inside a callback. Stop() is
+	// still required. A transport with no such close (VsockTransport) keeps delivering until Stop().
+	virtual void Shutdown() {
+	}
 };
 
 } // namespace n6k

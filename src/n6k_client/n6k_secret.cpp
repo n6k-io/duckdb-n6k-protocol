@@ -1,21 +1,14 @@
 #include "n6k_secret.hpp"
 #include "n6k_credentials.hpp"
+#include "n6k_endpoint.hpp"
 
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
 
 namespace duckdb {
 
-// normalize scope prefixes to scheme-less form so a bare hostname matches; empty scope = catch-all
 static vector<string> NormalizeScope(const vector<string> &input_scope) {
-	auto scope = input_scope;
-	if (scope.empty()) {
-		scope = {""};
-	}
-	for (auto &prefix : scope) {
-		prefix = StripUrlScheme(prefix);
-	}
-	return scope;
+	return n6k::NormalizeSecretScope(input_scope.empty() ? vector<string> {""} : input_scope);
 }
 
 static unique_ptr<BaseSecret> CreateN6kSecretFromConfig(ClientContext &context, CreateSecretInput &input) {

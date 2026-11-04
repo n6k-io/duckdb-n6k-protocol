@@ -69,6 +69,10 @@ void RawSocketTransport::Stop() {
 	}
 }
 
+void RawSocketTransport::Shutdown() {
+	::shutdown(fd_, SHUT_RDWR);
+}
+
 // Wait until `fd` is ready for `events`; false once Stop fires or poll fails.
 static bool AwaitUnlessStopped(int fd, int16_t events, int wake_fd, const std::atomic<bool> &stopping) {
 	for (;;) {

@@ -1,9 +1,14 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
 
+file(READ ${CMAKE_CURRENT_LIST_DIR}/VERSION N6K_VERSION)
+string(STRIP "${N6K_VERSION}" N6K_VERSION)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/VERSION)
+
 # Extension from this repo
 duckdb_extension_load(n6k_client
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/n6k_client/include
+    EXTENSION_VERSION "v${N6K_VERSION}"
     LOAD_TESTS
 )
 
@@ -15,6 +20,7 @@ if(NOT WIN32)
     duckdb_extension_load(n6k_server
         SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/n6k_server
         INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/n6k_server/include
+        EXTENSION_VERSION "v${N6K_VERSION}"
         LOAD_TESTS
     )
 endif()
@@ -34,6 +40,7 @@ if(NOT WIN32 AND NOT EMSCRIPTEN AND NOT WASM_LOADABLE_EXTENSIONS)
     duckdb_extension_load(n6k_testing
         SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/n6k_testing
         INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/n6k_testing/include
+        EXTENSION_VERSION "v${N6K_VERSION}"
         LOAD_TESTS
     )
 endif()

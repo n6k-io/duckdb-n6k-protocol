@@ -1,0 +1,59 @@
+name: Publish duckdb extensions
+
+# Triggered by pushing a tag like `duckdb/v0.1.0` on a main commit. Copies the build that main
+# already deployed under the commit's short sha to v<major>, v<major>.<minor> and the exact tag.
+
+on:
+  push:
+    tags:
+      - "duckdb/v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag matches VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#duckdb/}"
+          file_version="v$(tr -d '[:space:]' < VERSION)"
+          echo "tag=$tag VERSION=$file_version"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not duckdb/v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          if [[ "$tag" != "$file_version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $file_version"
+            exit 1
+          fi
+
+      - uses: ./.github/actions/setup-gcloud
+
+      - name: Copy main build to release versions
+        env:
+          BUCKET_NAME: n6k-duckdb-release
+        run: |
+          tag="${GITHUB_REF_NAME#duckdb/}"
+          [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\. ]]
+          versions=("$tag" "v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" "v${BASH_REMATCH[1]}")
+          sha="$(git log -1 --format=%h)"
+
+          for name in n6k_client n6k_server; do
+            src="gs://$BUCKET_NAME/$name/$sha"
+            if ! gcloud storage ls "$src/" > /dev/null; then
+              echo "::error::no main build at $src (is $sha on main and deployed?)"
+              exit 1
+            fi
+          done
+
+          for name in n6k_client n6k_server; do
+            for version in "${versions[@]}"; do
+              gcloud storage cp -r "gs://$BUCKET_NAME/$name/$sha/*" "gs://$BUCKET_NAME/$name/$version/"
+            done
+          done

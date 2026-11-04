@@ -2,6 +2,25 @@
 
 DuckDB extensions for remote and in-process data access.
 
+## Install
+
+Requires DuckDB 1.5.6. The extensions aren't signed by DuckDB, so DuckDB must start with unsigned extensions allowed (`duckdb -unsigned`, or
+`duckdb.connect(config={"allow_unsigned_extensions": "true"})` in Python).
+
+```sql
+INSTALL n6k_client FROM 'https://storage.googleapis.com/n6k-duckdb-release';
+LOAD n6k_client;
+```
+
+Pin a release with `VERSION`: `'v0.1.0'` exactly, `'v0.1'` for the latest `0.1.x`, or `'v0'`
+for the latest `0.x`:
+
+```sql
+INSTALL n6k_client FROM 'https://storage.googleapis.com/n6k-duckdb-release' VERSION 'v0.1';
+```
+
+`n6k_server` installs the same way.
+
 ## Extensions
 
 **n6k_server** — serves attached catalogs over the n6k protocol; see [docs/n6k-server.md](docs/n6k-server.md).
@@ -31,7 +50,7 @@ DuckDB secret so it stays out of SQL text and logs (redacted in
 `duckdb_secrets()`):
 
 ```sql
--- store the credential once (SCOPE is the host; scheme is ignored)
+-- store the credential once (SCOPE is the server)
 CREATE SECRET my_n6k (TYPE n6k, TOKEN 'your_token', SCOPE 'host:port');
 
 -- attach with no token in the statement
@@ -42,8 +61,9 @@ CREATE OR REPLACE SECRET my_n6k (TYPE n6k, TOKEN 'new_token', SCOPE 'host:port')
 ```
 
 Precedence: an inline `token '…'` option wins; otherwise a matching `TYPE n6k`
-secret is used; otherwise the connection is anonymous. `SCOPE` is matched as a
-prefix of the host (`'host'` matches any port/path; omit it for a catch-all).
+secret is used; otherwise the connection is anonymous. `SCOPE 'host'` matches
+exactly that host on any port and path, `'host:port'` narrows it, and `'n6ks://…'`
+limits it to TLS. Omit `SCOPE` for a catch-all.
 
 To force an **anonymous** connection — no token, skipping the secret lookup and
 any `n6k_refresh` OAuth mint — pass `anonymous true`:

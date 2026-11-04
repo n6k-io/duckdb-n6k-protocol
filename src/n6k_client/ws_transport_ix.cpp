@@ -68,6 +68,12 @@ void IxWebSocketTransport::Stop() {
 	}
 }
 
+void IxWebSocketTransport::Shutdown() {
+	if (ws_) {
+		ws_->close();
+	}
+}
+
 } // namespace n6k
 } // namespace duckdb
 

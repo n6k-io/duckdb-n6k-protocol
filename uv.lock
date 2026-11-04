@@ -763,7 +763,7 @@ wheels = [
 
 [[package]]
 name = "n6k-duckdb"
-version = "0.12.2"
+version = "0.12.3"
 source = { editable = "packages/python" }
 dependencies = [
     { name = "jsonschema" },

@@ -1,5 +1,6 @@
 #include "connection_hub.hpp"
 
+#include "n6k_external_access.hpp"
 #include "n6k_host_callback.hpp"
 #include "n6k_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
@@ -178,6 +179,9 @@ void ConnectionHub::EnsureConnected(const AbortCheck &should_abort) {
 		if (redialing && !opts_.can_redial) {
 			throw IOException("n6k: connection %s (%s) closed: %s", IdString(), opts_.endpoint, drop_reason_);
 		}
+		if (auto db = db_.lock()) {
+			ThrowIfExternalAccessDisabled(*db);
+		}
 		old = std::move(transport_);
 	}
 	if (old) {
@@ -206,9 +210,19 @@ void ConnectionHub::EnsureConnected(const AbortCheck &should_abort) {
 	}
 	try {
 		// Raw `this`: every path that drops the hub stops this transport first, which joins its callbacks.
-		transport->Start([this, gen](const std::string &bytes, bool binary) { OnMessage(gen, bytes, binary); },
-		                 [this, gen](const std::string &reason) { OnTransportClose(gen, reason); },
-		                 [this, gen]() { OnOpen(gen); });
+		auto *raw_transport = transport.get();
+		transport->Start(
+		    [this, gen, raw_transport](const std::string &bytes, bool binary) {
+			    // An uncaught throw here would run on a transport thread and abort the host process.
+			    try {
+				    OnMessage(gen, bytes, binary);
+			    } catch (const std::exception &e) {
+				    OnBadFrame(gen, *raw_transport, ErrorData(e).Message());
+			    } catch (...) {
+				    OnBadFrame(gen, *raw_transport, "unknown error");
+			    }
+		    },
+		    [this, gen](const std::string &reason) { OnTransportClose(gen, reason); }, [this, gen]() { OnOpen(gen); });
 		// Published only once started, so Disconnect never stops a transport before its Start.
 		{
 			std::lock_guard<std::mutex> lk(mu_);
@@ -234,6 +248,10 @@ void ConnectionHub::Reconnect(const AbortCheck &should_abort) {
 	if (!opts_.can_redial) {
 		throw InvalidInputException("n6k: connection %s (%s) cannot be redialed; open a new one with n6k_connect()",
 		                            IdString(), opts_.endpoint);
+	}
+	// Before the socket below is dropped: a refused reconnect leaves the connection up.
+	if (auto db = db_.lock()) {
+		ThrowIfExternalAccessDisabled(*db);
 	}
 	const std::string reason = "connection " + IdString() + " reconnecting";
 	std::vector<SubscriberPtr> targets;
@@ -362,7 +380,18 @@ void ConnectionHub::OnOpen(uint64_t gen) {
 	cv_.notify_all();
 }
 
+void ConnectionHub::OnBadFrame(uint64_t gen, Transport &transport, const std::string &error) {
+	OnTransportClose(gen, "n6k: " + opts_.endpoint + " sent a bad frame: " + error);
+	transport.Shutdown();
+}
+
 void ConnectionHub::OnMessage(uint64_t gen, const std::string &bytes, bool binary) {
+	{
+		std::lock_guard<std::mutex> lk(mu_);
+		if (gen != gen_ || dropped_) {
+			return;
+		}
+	}
 	if (!binary) {
 		if (!opts_.on_text.empty()) {
 			PostHostEvent(false, bytes);
@@ -688,6 +717,8 @@ void ConnectionHub::HostWorkerLoop(std::shared_ptr<HostQueue> queue, const std::
 			}
 		} catch (const std::exception &e) {
 			DUCKDB_LOG_WARNING(*database, "%s", ErrorData(e).Message());
+		} catch (...) {
+			DUCKDB_LOG_WARNING(*database, "n6k: host callback failed with an unknown error");
 		}
 	}
 }

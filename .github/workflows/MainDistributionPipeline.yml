@@ -58,6 +58,30 @@ jobs:
           .github/scripts/tag-unused.sh "python/v$version"
           .github/scripts/pypi-unreleased.sh n6k-duckdb "$version"
 
+  version-bumped:
+    name: VERSION bumped
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          head="$(tr -d '[:space:]' < VERSION)"
+          base="$(git show "origin/$BASE_REF:VERSION" 2>/dev/null | tr -d '[:space:]')"
+          base="${base:-0.0.0}"
+          echo "base=$base head=$head"
+          if [[ ! "$head" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION '$head' is not <major>.<minor>.<patch>"
+            exit 1
+          fi
+          if [[ "$head" == "$base" || "$(printf '%s\n%s\n' "$base" "$head" | sort -V | tail -1)" != "$head" ]]; then
+            echo "::error::VERSION must be bumped above $base (is $head)"
+            exit 1
+          fi
+
   # Windows (windows_amd64 and windows_amd64_mingw) is not built or shipped.
   # One build per arch compiles EVERY extension declared in
   # extension_config.cmake (n6k_client and — on non-Windows — n6k_server;
@@ -142,8 +166,7 @@ jobs:
         run: |
           DUCKDB_VERSION=$(git -C duckdb tag --points-at HEAD)
           DUCKDB_VERSION=${DUCKDB_VERSION:=$(git -C duckdb log -1 --format=%h)}
-          EXT_VERSION=$(git tag --points-at HEAD)
-          EXT_VERSION=${EXT_VERSION:=$(git log -1 --format=%h)}
+          EXT_VERSION=$(git log -1 --format=%h)
 
           if [[ "$DUCKDB_ARCH" == wasm* ]]; then
             suffix=".duckdb_extension.wasm"

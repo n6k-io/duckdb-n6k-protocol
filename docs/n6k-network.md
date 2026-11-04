@@ -103,11 +103,20 @@ a WebSocket upgrade header) is resolved with this precedence:
    ATTACH 'n6k://host:port/prefix' AS db (TYPE n6k);   -- no token in SQL
    ```
 
-   `SCOPE` is matched as a literal **prefix** of the scheme-stripped base URL
-   (`host[:port][/prefix]`), so `SCOPE 'host'` matches any port/path on that
-   host and an omitted `SCOPE` is a catch-all. The scheme is stripped on both
-   sides, so the bare hostname works regardless of how ATTACH was spelled
-   (`n6k://…` or `(host '…', port '…')`). Use `CREATE OR REPLACE SECRET` to
+   `SCOPE` names a server, and both it and the URL are parsed before matching:
+
+   | `SCOPE` | Matches |
+   | --- | --- |
+   | `host` | exactly that host, any port and path, `n6k://` or `n6ks://` |
+   | `host:443` | that port, any path |
+   | `host:443/prefix` | that path and below |
+   | `n6ks://host:443` | as above, TLS only (`n6k://host:443` is plaintext only) |
+   | omitted | every server |
+
+   The most specific match wins, and hostnames match case-insensitively. `host/prefix` is
+   an error, since a path needs a port. A URL with `user@` in it is refused.
+   `duckdb_secrets()` shows the stored form, such as `n6k://host:443/`. Secrets stored by
+   earlier versions no longer match: recreate them. Use `CREATE OR REPLACE SECRET` to
    rotate; the next ATTACH picks it up.
 
 3. **`TYPE n6k_refresh` secret (native)** — if no valid `n6k` access token is
@@ -224,9 +233,15 @@ SELECT * FROM n6k_disconnect('<id>');   -- a and b keep it open until they are d
 - `wsFd => <fd>`: one end of a socket the host already connected (below). A dropped
   socket cannot be dialed again, and `n6k_reconnect` fails.
 
-and optionally `token` or `scope`, and two host callbacks. A `token`, even an empty
+With `enable_external_access = false`, the extension opens nothing new: `ATTACH`,
+`n6k_connect` (`url` and `wsFd`), `n6k_reconnect`, redials after a drop and OAuth requests
+all fail with a permission error. Connections already open keep working, so open them first.
+
+`n6k_connect` also takes `token` or `scope`, and two host callbacks. A `token`, even an empty
 one, is sent as given with no secret lookup. Without one, secrets are resolved as
-`ATTACH` resolves them, for `scope`, else the URL. `wsFd` requires `token` or `scope`.
+`ATTACH` resolves them: for the URL, or for `scope` with `wsFd`, which has no URL and
+requires `token` or `scope`. `scope` with `url` is an error. A bare `scope` is looked up
+as `n6k://`, so use `n6ks://host:port` to match a TLS-only secret.
 Each callback is the name of a scalar function taking
 `(connection_id UUID, text VARCHAR)`:
 

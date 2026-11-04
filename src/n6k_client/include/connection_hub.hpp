@@ -157,6 +157,7 @@ private:
 	void OnOpen(uint64_t gen);
 	void OnMessage(uint64_t gen, const std::string &bytes, bool binary);
 	void OnTransportClose(uint64_t gen, const std::string &reason);
+	void OnBadFrame(uint64_t gen, Transport &transport, const std::string &error);
 	void Route(const std::string &frame, int64_t ns, int64_t type, int64_t req_id);
 	// Under mu_: counts the subscriber's callback as in flight until Dispatch returns.
 	static void HoldLocked(std::vector<SubscriberPtr> &held, const SubscriberPtr &sub);
