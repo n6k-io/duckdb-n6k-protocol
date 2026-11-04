@@ -11,7 +11,6 @@ import {
 
 const log = createLogger("ws-worker");
 
-// Owns the real WebSocket and moves opaque frames to/from the vsock channel.
 let pumpEndpoint: Endpoint | null = null;
 let pumpStopped = false;
 let pumpDone: Promise<void> = Promise.resolve();

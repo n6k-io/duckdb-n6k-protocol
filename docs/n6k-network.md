@@ -224,9 +224,11 @@ SELECT * FROM n6k_disconnect('<id>');   -- a and b keep it open until they are d
 - `wsFd => <fd>`: one end of a socket the host already connected (below). A dropped
   socket cannot be dialed again, and `n6k_reconnect` fails.
 
-and optionally `token` / `scope` (resolved as `ATTACH` resolves them; `wsFd`
-requires one of the two), and two host callbacks, each the name of a scalar
-function taking `(connection_id UUID, text VARCHAR)`:
+and optionally `token` or `scope`, and two host callbacks. A `token`, even an empty
+one, is sent as given with no secret lookup. Without one, secrets are resolved as
+`ATTACH` resolves them, for `scope`, else the URL. `wsFd` requires `token` or `scope`.
+Each callback is the name of a scalar function taking
+`(connection_id UUID, text VARCHAR)`:
 
 - `on_text`: called with each JSON-RPC text message the server sends; a non-NULL,
   non-empty result is sent back as text. `HELLO` offers `jsonrpc` / `mcp` with it, with

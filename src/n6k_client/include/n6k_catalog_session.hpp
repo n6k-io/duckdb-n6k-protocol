@@ -99,9 +99,8 @@ public:
 	using PushHandler = std::function<void(uint8_t op, const std::string &body)>;
 	virtual void SetPushHandler(PushHandler handler) = 0;
 
-	// Non-blocking: marks the session down if its connection was replaced, so the next request reopens it.
-	// PUSH frames never queue here; they reach the handler as they arrive.
-	virtual void PollPushEvents() = 0;
+	// Non-blocking. The next request reopens a session marked down.
+	virtual void MarkDisconnectedIfConnectionReplaced() = 0;
 
 	// Idempotently close this session and drop its connection lease. Dropping the last shared_ptr instead leaves
 	// the session open: see WsClient::OpenChannelAndHandshake.

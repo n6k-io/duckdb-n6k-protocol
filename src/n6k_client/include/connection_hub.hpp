@@ -40,14 +40,15 @@ public:
 	struct Options {
 		// Builds a fresh, not yet started transport. Called again on each redial.
 		std::function<std::unique_ptr<Transport>()> dial;
-		// A URL can be dialed again after a drop; an inherited socket cannot.
+		// A URL can be dialed again after a drop, and a registered socket bridged again once its host replaces
+		// it; a wsFd cannot.
 		bool can_redial = false;
 		std::string token;
 		// Replaces `token` before each redial; may block on a token refresh. Empty = every dial sends `token`.
 		std::function<std::string()> resolve_token;
 		// Offer jsonrpc/mcp in HELLO, i.e. this side takes JSON-RPC text.
 		bool offer_app_capabilities = false;
-		// Host UDFs: on_text(connection_id UUID, text VARCHAR) -> reply VARCHAR | NULL,
+		// Host UDFs: on_text(connection_id UUID, text VARCHAR) -> reply VARCHAR (NULL or empty sends nothing),
 		// on_close(connection_id UUID, reason VARCHAR). Empty = none.
 		std::string on_text;
 		std::string on_close;
@@ -82,10 +83,12 @@ public:
 	std::string IdString() const;
 
 	// Dial (or redial) and run HELLO; returns at once while the connection is up. Throws when the
-	// endpoint is unusable, the hub was disconnected, or a dropped socket cannot be redialed.
+	// endpoint is unusable, the hub was disconnected, or a dropped socket cannot be redialed; throws
+	// InterruptException once should_abort returns true.
 	void EnsureConnected(const AbortCheck &should_abort);
-	// Drop the current socket, if any, and dial again. Bound sessions get on_close and reopen on their
-	// next request; the host's on_close UDF is not called. Throws for a hub that cannot redial.
+	// Drop the current socket, if any, and dial again. Sessions bound to an open connection get on_close here,
+	// others already got it at the drop; all reopen on their next request. The host's on_close UDF is not called.
+	// Throws as EnsureConnected does, and for a hub that cannot redial.
 	void Reconnect(const AbortCheck &should_abort);
 	bool IsAlive();
 	std::vector<std::string> HelloCapabilities();
@@ -96,11 +99,12 @@ public:
 	// Returns the generation the session bound on. A session bound while the connection is down gets
 	// on_close before this returns.
 	uint64_t BindSession(uint64_t ns, MessageFn on_message, CloseFn on_close);
-	// Returns once no callback for `ns` is running. Not from within one of its own callbacks.
+	// Returns once no callback for `ns` is running. From within one of its own callbacks it deadlocks.
 	void UnbindSession(uint64_t ns);
 	// Connection-scoped requests (e.g. OP_CATALOG_LIST) carry no `ns`; their RESP/ERR frames are routed
 	// by the id returned here.
 	uint32_t BindRequest(MessageFn on_message, CloseFn on_close);
+	// Does not wait for a running callback, so what the callbacks capture must outlive this call.
 	void UnbindRequest(uint32_t req_id);
 
 	// Hands `frame` to the writer, or with queue_sends off to the transport inline (see Transport::Send for what

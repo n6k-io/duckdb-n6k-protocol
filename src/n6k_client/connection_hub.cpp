@@ -802,7 +802,7 @@ std::string WsUrlFromBaseUrl(const std::string &base_url, const std::string &que
 	if (StringUtil::StartsWith(base_url, "http://")) {
 		return "ws://" + base_url.substr(7) + "/ws" + query;
 	}
-	throw IOException("n6k: base URL must be http(s):// or n6k(s)://, got %s", base_url);
+	throw IOException("n6k: base URL must be http(s)://, got %s", base_url);
 }
 
 #ifndef WASM_LOADABLE_EXTENSIONS

@@ -134,11 +134,11 @@ public:
 	OpenAck GetOpenAck() const;
 	std::vector<std::string> GetHelloCapabilities() const;
 
-	// Proactive teardown (idempotent): fail in-flight reqs + close the channel. Never from an inbound callback.
+	// Proactive teardown (idempotent): fail in-flight reqs + close the channel. From an inbound callback it deadlocks.
 	void Close();
 
-	// Non-blocking: mark the connection down if the channel's connection was replaced beneath it.
-	void MarkDisconnectedIfChannelReset();
+	// Non-blocking.
+	void MarkDisconnectedIfConnectionReplaced();
 
 private:
 	//! OPEN_PENDING frames seen before the final reply, and the status the last one carried.
@@ -186,7 +186,7 @@ private:
 
 	// Never stops the reactor, so it is safe from an inbound callback.
 	void FailConnectionAndAllInFlightRequests(const std::string &reason);
-	// Stops the reactor (idempotent). Never from an inbound callback.
+	// Stops the reactor (idempotent). From an inbound callback it deadlocks.
 	void ShutdownFromOwner(const std::string &reason);
 	void OnMessage(const std::string &bytes, bool binary);
 	void OnClose(const std::string &reason);

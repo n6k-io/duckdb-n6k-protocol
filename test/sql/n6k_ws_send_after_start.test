@@ -4,10 +4,10 @@
 
 require n6k_client
 
-# The hub dials asynchronously, and ixwebsocket's WebSocket::sendBinary discards silently while the
-# socket is not yet ReadyState::Open — so a HELLO written before the 101 lands is lost, the server
-# sees zero data frames, and EnsureConnected can only time out. This stands up an in-process
-# ix::WebSocketServer on loopback that answers HELLO, then asserts the next frame also arrives.
+# The hub dials asynchronously, and ixwebsocket's WebSocket::sendBinary refuses a frame while the socket
+# is not yet ReadyState::Open. The hub treats a refused frame as a drop, so a HELLO written before the
+# 101 lands fails the connect. This stands up an in-process ix::WebSocketServer on loopback that answers
+# HELLO, then asserts the next frame also arrives.
 query I
 SELECT probe_received FROM n6k_selftest_send_after_start();
 ----

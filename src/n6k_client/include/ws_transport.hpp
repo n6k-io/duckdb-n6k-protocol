@@ -21,8 +21,9 @@ public:
 
 	virtual ~Transport() = default;
 
-	// Wire callbacks and begin pumping inbound. Non-blocking; callbacks may run on a transport thread.
-	// on_open may fire before Start() returns (an already-connected endpoint) or long after (a dial).
+	// Wire callbacks and begin pumping inbound. Never waits on the peer, but VsockTransport waits on the main
+	// runtime thread. Callbacks may run on a transport thread. on_open may fire before Start() returns or long
+	// after: see OpenFn.
 	virtual void Start(MessageFn on_message, CloseFn on_close, OpenFn on_open) = 0;
 
 	// Send one complete n6k frame. Safe from several threads at once; one message never interleaves with

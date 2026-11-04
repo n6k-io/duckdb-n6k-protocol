@@ -56,7 +56,7 @@ optional_ptr<CatalogEntry> N6kSchemaEntry::LookupEntry(CatalogTransaction transa
 	auto &entry_name = lookup_info.GetEntryName();
 
 	if (entry_type == CatalogType::TABLE_ENTRY || entry_type == CatalogType::VIEW_ENTRY) {
-		session->PollPushEvents();
+		session->MarkDisconnectedIfConnectionReplaced();
 		return Attach().LookupTable(name, *this, entry_name, transaction.transaction);
 	}
 	if (entry_type == CatalogType::TABLE_FUNCTION_ENTRY) {
@@ -93,7 +93,7 @@ optional_ptr<CatalogEntry> N6kSchemaEntry::GetOrCreateTableFunctionEntry(Catalog
 void N6kSchemaEntry::Scan(ClientContext &context, CatalogType type,
                           const std::function<void(CatalogEntry &)> &callback) {
 	if (type == CatalogType::TABLE_ENTRY) {
-		session->PollPushEvents();
+		session->MarkDisconnectedIfConnectionReplaced();
 		case_insensitive_set_t seen;
 		Attach().ScanTables(name, *this, seen, callback, &Transaction::Get(context, catalog));
 	}

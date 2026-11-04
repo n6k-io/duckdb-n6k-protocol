@@ -270,7 +270,7 @@ void WsClient::NotifyProgress() {
 	progress_cv_.notify_all();
 }
 
-void WsClient::MarkDisconnectedIfChannelReset() {
+void WsClient::MarkDisconnectedIfConnectionReplaced() {
 	if (stopping_.load()) {
 		return;
 	}
@@ -385,7 +385,7 @@ void WsClient::OnMessage(const std::string &bytes, bool binary) {
 
 void WsClient::OnClose(const std::string &reason) {
 	// Runs on a transport thread or inside a caller's hub call (ConnectionHub::BindSession, SendOnGeneration,
-	// Reconnect, Disconnect): must not close the channel.
+	// Reconnect, Disconnect): closing the channel here deadlocks, because Reactor::Close waits out this callback.
 	FailConnectionAndAllInFlightRequests(reason.empty() ? "socket closed" : reason);
 }
 

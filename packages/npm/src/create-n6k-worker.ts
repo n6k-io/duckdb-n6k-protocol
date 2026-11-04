@@ -77,7 +77,8 @@ export type N6kWorkerHandle = {
   ) => Promise<RegisteredWebsocket>;
   // Swap the socket behind a wsId and FT_HELLO it; its catalogs reopen on the new socket on their next
   // request. On success, in-flight reqs and rpc calls fail and rpc moves to the new socket. On handshake failure it rethrows and keeps the
-  // previous socket if still OPEN; otherwise the previous socket's close handling runs.
+  // previous socket if still OPEN; otherwise the previous socket's close handling runs. A wsId not currently
+  // registered does not throw: the socket is bridged under it, with no registration or rpc.
   replaceWebsocket: (
     wsId: string,
     socket: WebSocket,

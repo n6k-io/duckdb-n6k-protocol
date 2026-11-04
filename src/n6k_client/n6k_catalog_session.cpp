@@ -288,8 +288,8 @@ public:
 		client_->SetPushHandler(std::move(handler));
 	}
 
-	void PollPushEvents() override {
-		client_->MarkDisconnectedIfChannelReset();
+	void MarkDisconnectedIfConnectionReplaced() override {
+		client_->MarkDisconnectedIfConnectionReplaced();
 	}
 
 	void Detach() override {

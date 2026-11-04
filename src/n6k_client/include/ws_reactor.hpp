@@ -25,7 +25,7 @@ public:
 	virtual void Send(const std::string &frame) = 0;
 
 	// Idempotent. Returns once no callback is running or will run, then releases the session's `ns` on the
-	// server. Not from within on_frame/on_close.
+	// server. From within on_frame/on_close it deadlocks.
 	virtual void Close() = 0;
 
 	// Changes when the connection beneath was replaced: a session opened on an older one must reopen.
