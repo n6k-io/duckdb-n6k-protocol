@@ -18,7 +18,7 @@ npm_db_wasm:
 # The coi (wasm_threads) extension must be built with the emsdk that matches
 # duckdb-wasm's coi runtime. A different emcc silently produces an incompatible
 # side-module, so gate the build on the pinned version.
-EXPECTED_EMCC_VERSION := 3.1.71
+EXPECTED_EMCC_VERSION := 6.0.9
 
 # Preflight: fail fast unless the emcc on PATH is the pinned toolchain.
 .PHONY: wasm-preflight

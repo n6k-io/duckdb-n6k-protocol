@@ -48,8 +48,8 @@
     "ci": "bun run fmt:check && bun run lint && bun run typecheck && BACKEND=skip TEST_SERVER=skip bun run test"
   },
   "peerDependencies": {
-    "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
-    "@duckdb/node-api": "1.5.6-r.2",
+    "@duckdb/duckdb-wasm": "1.33.1-dev114.0",
+    "@duckdb/node-api": "2.0.0-r.1",
     "apache-arrow": "*"
   },
   "peerDependenciesMeta": {
@@ -58,7 +58,8 @@
     }
   },
   "devDependencies": {
-    "@duckdb/node-api": "1.5.6-r.2",
+    "@duckdb/duckdb-wasm": "1.33.1-dev114.0",
+    "@duckdb/node-api": "2.0.0-r.1",
     "@eslint/js": "^10.0.1",
     "@types/bun": "^1.4.4",
     "eslint": "^10.0.3",

@@ -10,9 +10,8 @@ project(${TARGET_NAME})
 # Pin the C++ standard before build_*_extension create the targets (the standard
 # is captured into each target's CXX_STANDARD property at creation time, so setting
 # it afterwards is a no-op). _REQUIRED ON makes an unsupported standard a hard error
-# instead of silently decaying to an older one. Pinned at 14 so a local build fails
-# the same way CI's pre-C++17 toolchain would, catching accidental C++17 usage early.
-set(CMAKE_CXX_STANDARD 14)
+# instead of silently decaying to an older one. DuckDB v2 requires 17.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # src/common/n6k_common.cmake is the single declaration of what `src/common/` holds and how to

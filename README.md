@@ -4,7 +4,7 @@ DuckDB extensions for remote and in-process data access.
 
 ## Install
 
-Requires DuckDB 1.5.6. The extensions aren't signed by DuckDB, so DuckDB must start with unsigned extensions allowed (`duckdb -unsigned`, or
+Requires DuckDB 2.0.0. The extensions aren't signed by DuckDB, so DuckDB must start with unsigned extensions allowed (`duckdb -unsigned`, or
 `duckdb.connect(config={"allow_unsigned_extensions": "true"})` in Python).
 
 ```sql

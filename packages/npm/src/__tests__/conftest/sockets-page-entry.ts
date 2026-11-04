@@ -2,9 +2,9 @@ import { N6kDuckDB } from "../../n6k-duckdb";
 import type { SocketsMount } from "./sockets-types";
 
 const bundle = {
-  mainModule: "/duckdb/duckdb-coi.wasm",
-  mainWorker: "/duckdb/duckdb-browser-coi.worker.js",
-  pthreadWorker: "/duckdb/duckdb-browser-coi.pthread.worker.js",
+  mainModule: "/duckdb/duckdb-threads.wasm",
+  mainWorker: "/duckdb/duckdb-browser-threads.worker.js",
+  pthreadWorker: "/duckdb/duckdb-browser-threads.pthread.worker.js",
 };
 
 function wsBase(): string {
