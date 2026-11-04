@@ -13,17 +13,28 @@ Run:
     uv run pytest integration_tests/test_secret_auth.py -v
 """
 
+import json
 import os
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import duckdb
 import jwt
 import pytest
 
 from _paths import EXT_PATH
-from n6k_server.test_server.oauth import ACCEPTED_SUBJECT_TOKEN, AUDIENCE
+from n6k_server.test_server.oauth import (
+    ACCEPTED_REFRESH_TOKEN,
+    ACCEPTED_SUBJECT_TOKEN,
+    AUDIENCE,
+    ROTATING_REFRESH_SEED,
+    SHORT_JWT_TTL_SECONDS,
+    SHORT_LIVED_REFRESH_TOKEN,
+)
 
 SERVER_PORT = 8099
 SERVER_URL = f"http://localhost:{SERVER_PORT}"
@@ -31,6 +42,7 @@ SERVER_URL = f"http://localhost:{SERVER_PORT}"
 AUTH_TOKEN = "n6k-test-token"
 # The AS that backs the /oauth verifier is mounted on the same server.
 ISSUER = f"http://localhost:{SERVER_PORT}"
+TOKEN_ENDPOINT = f"{ISSUER}/oauth/token"
 
 
 @pytest.fixture(autouse=True)
@@ -165,3 +177,148 @@ def test_n6k_login_device_flow_then_attach(tmp_path):
     # The stored refresh secret now mints on attach and authenticates.
     c.execute(f"ATTACH 'n6k://localhost:{SERVER_PORT}/oauth' AS db (TYPE n6k)")
     assert c.execute("SELECT count(*) FROM db.main.users").fetchone()[0] == 3
+
+
+# ── Phase 4: RFC 6749 §6 refresh-token grant → attach /oauth ──────────────────
+
+
+def _create_refresh_secret(c, refresh_token, persistent=False):
+    c.execute(
+        f"CREATE {'PERSISTENT ' if persistent else ''}SECRET rt (TYPE n6k_refresh, "
+        f"REFRESH_TOKEN '{refresh_token}', TOKEN_ENDPOINT '{TOKEN_ENDPOINT}', CLIENT_ID 'n6k-test', "
+        f"RESOURCE '{AUDIENCE}', SCOPE 'localhost:{SERVER_PORT}')"
+    )
+
+
+def _attach_oauth_and_check(c):
+    c.execute(f"ATTACH 'n6k://localhost:{SERVER_PORT}/oauth' AS db (TYPE n6k)")
+    assert c.execute("SELECT count(*) FROM db.main.users").fetchone()[0] == 3
+
+
+def test_refresh_grant_needs_no_subject_token_or_issuer():
+    c = _connect()
+    _create_refresh_secret(c, ACCEPTED_REFRESH_TOKEN)
+    _attach_oauth_and_check(c)
+
+
+def test_refresh_grant_without_new_token_keeps_stored_token(tmp_path):
+    c = _connect()
+    c.execute(f"SET secret_directory = '{tmp_path}'")
+    _create_refresh_secret(c, ACCEPTED_REFRESH_TOKEN, persistent=True)
+    _attach_oauth_and_check(c)
+    assert ACCEPTED_REFRESH_TOKEN.encode() in (tmp_path / "rt.duckdb_secret").read_bytes()
+
+
+def test_rotated_refresh_token_replaces_persistent_secret(tmp_path):
+    secret_file = tmp_path / "rt.duckdb_secret"
+    first = _connect()
+    first.execute(f"SET secret_directory = '{tmp_path}'")
+    _create_refresh_secret(first, ROTATING_REFRESH_SEED, persistent=True)
+    assert ROTATING_REFRESH_SEED.encode() in secret_file.read_bytes()
+    _attach_oauth_and_check(first)
+    rotated_contents = secret_file.read_bytes()
+    assert ROTATING_REFRESH_SEED.encode() not in rotated_contents
+
+    # A fresh instance can only load the rotated single-use token from disk; it rotates again.
+    second = _connect()
+    second.execute(f"SET secret_directory = '{tmp_path}'")
+    _attach_oauth_and_check(second)
+    assert secret_file.read_bytes() != rotated_contents
+
+
+def test_concurrent_attaches_share_one_rotation():
+    c = _connect()
+    _create_refresh_secret(c, ROTATING_REFRESH_SEED)
+    _attach_oauth_and_check(c)
+    minted_name = c.execute("SELECT name FROM duckdb_secrets() WHERE type = 'n6k'").fetchone()[0]
+
+    # The stored refresh token is now single-use, so a thread reading it from a stale snapshot gets invalid_grant.
+    for round_number in range(5):
+        c.execute(f'DROP SECRET "{minted_name}"')
+        cursors = [c.cursor() for _ in range(4)]
+        barrier = threading.Barrier(len(cursors))
+
+        def attach(index):
+            barrier.wait()
+            alias = f"db_{round_number}_{index}"
+            cursors[index].execute(f"ATTACH 'n6k://localhost:{SERVER_PORT}/oauth' AS {alias} (TYPE n6k)")
+
+        with ThreadPoolExecutor(max_workers=len(cursors)) as pool:
+            for future in [pool.submit(attach, index) for index in range(len(cursors))]:
+                future.result(timeout=30)
+
+
+def test_invalid_grant_says_log_in_again():
+    c = _connect()
+    _create_refresh_secret(c, "unknown-refresh-token")
+    with pytest.raises(duckdb.Error, match="log in again"):
+        c.execute(f"ATTACH 'n6k://localhost:{SERVER_PORT}/oauth' AS db (TYPE n6k)")
+
+
+@pytest.mark.parametrize(
+    ("options", "missing"),
+    [
+        ("CLIENT_ID 'n6k-test'", "token_endpoint"),
+        (f"TOKEN_ENDPOINT '{TOKEN_ENDPOINT}'", "client_id"),
+    ],
+)
+def test_refresh_token_requires_endpoint_and_client_id(options, missing):
+    c = _connect()
+    with pytest.raises(duckdb.Error, match=f"requires {missing}"):
+        c.execute(f"CREATE SECRET rt (TYPE n6k_refresh, REFRESH_TOKEN 'x', {options})")
+
+
+def test_refresh_token_is_redacted():
+    c = _connect()
+    _create_refresh_secret(c, ACCEPTED_REFRESH_TOKEN)
+    secret_string = c.execute("SELECT secret_string FROM duckdb_secrets() WHERE name = 'rt'").fetchone()[0]
+    assert ACCEPTED_REFRESH_TOKEN not in secret_string
+
+
+# ── Phase 5: a redial re-resolves a secret-sourced token ──────────────────────
+
+
+def _wait_for_short_jwt_expiry():
+    time.sleep(SHORT_JWT_TTL_SECONDS + 1)
+
+
+def _close_all_server_sockets():
+    urllib.request.urlopen(
+        urllib.request.Request(f"{SERVER_URL}/debug/ws/close_all", method="POST"),
+        timeout=2,
+    ).read()
+
+
+def test_query_after_drop_refreshes_expired_token():
+    c = _connect()
+    _create_refresh_secret(c, SHORT_LIVED_REFRESH_TOKEN)
+    _attach_oauth_and_check(c)
+    _wait_for_short_jwt_expiry()
+    _close_all_server_sockets()
+    assert c.execute("SELECT count(*) FROM db.main.users").fetchone()[0] == 3
+
+
+def test_n6k_reconnect_refreshes_expired_token():
+    c = _connect()
+    _create_refresh_secret(c, SHORT_LIVED_REFRESH_TOKEN)
+    conn_id = c.execute(f"SELECT * FROM n6k_connect(url => 'n6k://localhost:{SERVER_PORT}/oauth')").fetchone()[0]
+    _wait_for_short_jwt_expiry()
+    c.execute("SELECT * FROM n6k_reconnect(?)", [str(conn_id)]).fetchall()
+
+
+def test_inline_token_is_not_refreshed_on_redial():
+    body = urllib.parse.urlencode(
+        {"grant_type": "refresh_token", "refresh_token": SHORT_LIVED_REFRESH_TOKEN, "resource": AUDIENCE}
+    ).encode()
+    with urllib.request.urlopen(urllib.request.Request(TOKEN_ENDPOINT, data=body), timeout=2) as response:
+        inline_token = json.loads(response.read())["access_token"]
+
+    c = _connect()
+    # Would rescue the redial if the inline token were wrongly re-resolved from secrets.
+    _create_refresh_secret(c, ACCEPTED_REFRESH_TOKEN)
+    c.execute(f"ATTACH 'n6k://localhost:{SERVER_PORT}/oauth' AS db (TYPE n6k, TOKEN '{inline_token}')")
+    assert c.execute("SELECT count(*) FROM db.main.users").fetchone()[0] == 3
+    _wait_for_short_jwt_expiry()
+    _close_all_server_sockets()
+    with pytest.raises(duckdb.Error):
+        c.execute("SELECT count(*) FROM db.main.users").fetchone()

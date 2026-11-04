@@ -4,7 +4,7 @@
 export const RING_HEAD = 0;
 export const RING_TAIL = 1;
 export const RING_CLOSED = 2;
-// Reset counter; a lazily-polling peer reads it to notice a reset that restored HEAD/TAIL.
+// Read by N6kIoThread, which retires a channel if it moves. Nothing writes it.
 export const RING_EPOCH = 3;
 export const RING_CTRL_I32 = 4; // HEAD, TAIL, CLOSED, EPOCH; keeps data 8-byte aligned
 export const RING_CTRL_BYTES = RING_CTRL_I32 * 4;
@@ -141,14 +141,6 @@ export function ringBlockingWrite(r: Ring, frame: Uint8Array): void {
 
 export function ringIsClosed(r: Ring): boolean {
   return Atomics.load(r.ctrl, RING_CLOSED) === 1;
-}
-
-// Reset to empty+open for reuse; only safe when both sides idle. Bumps epoch so a polling peer sees reuse.
-export function ringReset(r: Ring): void {
-  Atomics.store(r.ctrl, RING_HEAD, 0);
-  Atomics.store(r.ctrl, RING_TAIL, 0);
-  Atomics.store(r.ctrl, RING_CLOSED, 0);
-  Atomics.add(r.ctrl, RING_EPOCH, 1);
 }
 
 export function ringEpoch(r: Ring): number {

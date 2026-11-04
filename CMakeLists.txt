@@ -35,7 +35,7 @@ if(NOT WASM_LOADABLE_EXTENSIONS)
 endif()
 
 n6k_common_sources(EXTENSION_SOURCES n6k_permissions n6k_describe n6k_catalog_list
-                   n6k_exception_types n6k_arrow_frame_decoder n6k_served n6k_fd_hello n6k_ws_log)
+                   n6k_exception_types n6k_arrow_frame_decoder n6k_served n6k_host_callback n6k_ws_log)
 n6k_nanoarrow_sources(EXTENSION_SOURCES)
 list(APPEND EXTENSION_SOURCES ${CROSSING_SOURCES} ${CROSSING_SUBSTRAIT_SOURCES})
 
@@ -60,8 +60,9 @@ list(
     src/n6k_client/ws_send_after_start_selftest.cpp
     src/n6k_client/open_ns_selftest.cpp
     src/n6k_client/open_pending_selftest.cpp
-    src/n6k_client/ws_fd_hub_selftest.cpp
+    src/n6k_client/connection_hub_selftest.cpp
     src/n6k_client/n6k_connect_function.cpp
+    src/n6k_client/n6k_connection_functions.cpp
     src/n6k_client/n6k_list_catalogs_function.cpp
     src/n6k_client/n6k_parse_sql_get_tables.cpp
     src/n6k_client/n6k_split_statements.cpp
@@ -73,20 +74,20 @@ list(
 # Shared client + session + scan across native and wasm. The catalog session and
 # Arrow stream are transport-agnostic (they drive a WsClient/RequestState).
 list(APPEND EXTENSION_SOURCES src/n6k_client/ws_client.cpp)
-list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_catalog_session_native.cpp)
+list(APPEND EXTENSION_SOURCES src/n6k_client/connection_hub.cpp)
+list(APPEND EXTENSION_SOURCES src/n6k_client/hub_session.cpp)
+list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_catalog_session.cpp)
 list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_ws_arrow_stream.cpp)
 
 if(WASM_LOADABLE_EXTENSIONS)
   list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_http_client_wasm.cpp)
-  list(APPEND EXTENSION_SOURCES src/n6k_client/ws_reactor_wasm.cpp)
+  list(APPEND EXTENSION_SOURCES src/n6k_client/ws_transport_vsock.cpp)
   list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_io_thread.cpp)
 else()
   list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_http_client_native.cpp)
   list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_discovery.cpp)
-  list(APPEND EXTENSION_SOURCES src/n6k_client/ws_reactor_native.cpp)
   list(APPEND EXTENSION_SOURCES src/n6k_client/ws_transport_ix.cpp)
-  list(APPEND EXTENSION_SOURCES src/n6k_client/ws_transport_fd.cpp)
-  list(APPEND EXTENSION_SOURCES src/n6k_client/ws_fd_hub.cpp)
+  list(APPEND EXTENSION_SOURCES src/n6k_client/ws_transport_raw.cpp)
   list(APPEND EXTENSION_SOURCES $<TARGET_OBJECTS:ixwebsocket>)
 endif()
 

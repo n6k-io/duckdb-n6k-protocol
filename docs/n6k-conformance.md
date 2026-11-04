@@ -117,8 +117,10 @@ Only implement it if you intend to run the `/oauth` tests.
 
 ## Catalog-name test hooks
 
-The root, `/auth` and `/oauth` mounts serve the catalog named by the dial URL's
-`?catalog=` (a missing one closes with 4400), and branch on that name:
+The root, `/auth`, `/oauth` and `/rpc` mounts serve each catalog a client opens,
+when it opens it. A dial URL's `?catalog=` instead serves that catalog from
+`FT_HELLO` on, which the HELLO-time hooks (`slowauth_<ms>`) need. Both branch on the
+name:
 
 | Catalog | Effect |
 |---------|--------|

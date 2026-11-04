@@ -100,7 +100,7 @@ Returns a `DuckDBInstance`. Requires a cross-origin-isolated page; throws if the
 - **`maximumThreads`** — see `CreateDuckDBOptions.maximumThreads`.
 - **`duckdbWorkerUrl` / `wsWorkerUrl`** — override the worker script URLs.
 - **`extensionRepository`** — `custom_extension_repository` (default: the page origin).
-- **`onStatus(catalog, status)`** — per-catalog socket status (`WsStatus`).
+- **`onStatus(catalog, status)`** — status of the socket under each catalog (`WsStatus`). Catalogs on one socket report together.
 
 ### `wasmDir: string` (from `@n6k.io/db/node`)
 
@@ -138,9 +138,9 @@ export function Root({ children }) {
 ### `databases` / `sockets`
 
 - `databases: Record<string, DatabaseSpec>` — catalog name → a bare path string (uses `TYPE n6k` by default), `{ path, options? }`, or `{ socket, catalog?, options? }`. Each becomes `ATTACH '<path>' AS <name> (<options>);`; `options` shallow-merges over `{ TYPE: "n6k" }`. `TYPE` is emitted unquoted; other values are single-quoted with `'` escaped to `''`.
-- `sockets: Record<string, SocketSpec>` (browser only). A `{ socket: "<name>", catalog? }` database rides that socket: `ATTACH '' AS <alias> (TYPE n6k, wsId '<id>'[, catalog '<catalog>'])` once it registers. A spec is `{ connect: () => WebSocket, token }`: `N6kDuckDB` opens the socket, and on a drop reopens it with exponential backoff (`MIN_BACKOFF_MS`/`MAX_BACKOFF_MS` in `src/sockets/sockets.ts`) and calls `replaceWebsocket`. It closes the socket on `dispose()`.
+- `sockets: Record<string, SocketSpec>` (browser only). A `{ socket: "<name>", catalog? }` database rides that socket: `ATTACH '' AS <alias> (TYPE n6k, CONNECTION '<id>'[, catalog '<catalog>'])` once it registers. A spec is `{ connect: () => WebSocket, token }`: `N6kDuckDB` opens the socket, and on a drop reopens it with exponential backoff (`MIN_BACKOFF_MS`/`MAX_BACKOFF_MS` in `src/sockets/sockets.ts`) and calls `replaceWebsocket`. It closes the socket on `dispose()`.
 
-  `token` is a string or a `() => string | Promise<string>`, called on every (re)register. A socket that fails to register, or whose reconnect the server refuses (HELLO_ERR), errors its catalogs (`errors[<alias>]` holds the error message). If a socket first registers after boot, its catalogs' error clears but they are never ATTACHed. A `token` or `wsId` option on a socket-backed entry throws.
+  `token` is a string or a `() => string | Promise<string>`, called on every (re)register. A socket that fails to register, or whose reconnect the server refuses (HELLO_ERR), errors its catalogs (`errors[<alias>]` holds the error message). If a socket first registers after boot, its catalogs' error clears but they are never ATTACHed. A `token` or `connection` option on a socket-backed entry throws.
 
 ```ts
 const duckdb = new N6kDuckDB({
@@ -162,13 +162,15 @@ const { conn, registerWebsocket, replaceWebsocket } = await createDuckDB();
 
 const ws = new WebSocket("wss://api.example.com/ws");
 const { wsId } = await registerWebsocket(ws, token);
-await conn.query(`ATTACH '' AS page_db (TYPE n6k, wsId '${wsId}')`); // sends FT_OPEN
+await conn.query(`ATTACH '' AS page_db (TYPE n6k, CONNECTION '${wsId}')`); // sends FT_OPEN
 
 // later, after your app reconnects its own socket:
-await replaceWebsocket(wsId, newWs, token); // re-HELLOs, then re-OPENs page_db without a DETACH/ATTACH
+await replaceWebsocket(wsId, newWs, token); // re-HELLOs; page_db sends FT_OPEN again on its next request
 ```
 
-The driver rides the socket: **binary** frames are n6k, **text** frames are JSON-RPC (see below). It listens with `addEventListener`, so your app can still observe the socket; it never closes a socket it doesn't own. The token rides the HELLO frame, not the socket's upgrade; an inline `token` ATTACH option alongside `wsId` is a bind error. Each ATTACH sends an `FT_OPEN` naming its catalog (the ATTACH alias, or the `catalog` option); an unserved catalog fails that ATTACH with the server's `OPEN_ERR`. On a drop, the catalog's `connStatus` becomes `"disconnected"`; open a fresh socket and call `replaceWebsocket`. With `N6kDuckDB`, declare the socket through `sockets` (above) and, if a database rides it, `connect()` waits for it to register or fail. See [n6k-network.md](../../docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser) for the full contract.
+`wsId` is the connection's id. A plain `ATTACH 'n6k://…'` with the same URL and token also rides the registered socket while it is open.
+
+The driver rides the socket: **binary** frames are n6k, **text** frames are JSON-RPC (see below). It listens with `addEventListener`, so your app can still observe the socket; it never closes a socket it doesn't own. The token rides the HELLO frame, not the socket's upgrade; an inline `token` ATTACH option alongside `CONNECTION` fails the ATTACH with an `IOException`. Each ATTACH sends an `FT_OPEN` naming its catalog (the ATTACH alias, or the `catalog` option); an unserved catalog fails that ATTACH with the server's `OPEN_ERR`. On a drop, the catalog's `connStatus` becomes `"disconnected"`; open a fresh socket and call `replaceWebsocket`, which returns it to `"connected"`. With `N6kDuckDB`, declare the socket through `sockets` (above) and, if a database rides it, `connect()` waits for it to register or fail. See [n6k-network.md](../../docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser) for the full contract.
 
 #### JSON-RPC
 
@@ -185,31 +187,31 @@ s.close();
 - `call(method, params?, { signal?, timeoutMs? })` resolves with the result or rejects with `JsonRpcError { code, message, data }`. The Python `n6k_server` answers `code: -32000` ("server busy") when over its in-flight limit. `timeoutMs` defaults to 60000; a call also fails on abort, socket close or `replaceWebsocket`.
 - `on(method, handler)` receives server notifications; it returns `off`. A server request (with `id`) is answered -32601 and never reaches `on`. The server may notify before the first call; add handlers straight after `await registerWebsocket(...)`, before any other `await`, to receive it.
 - After `replaceWebsocket`, the client sends on the new socket.
-- The registration (and `rpc`) outlives the last `DETACH` on its `wsId`. `close()` fails pending calls and stops handling text; the `wsId` is released once no catalog is attached on it.
+- The registration (and `rpc`) outlives the last `DETACH` on its socket. `close()` fails pending calls and stops handling text; the socket is released once no catalog is attached on it.
 
 #### The `catalog` option
 
 `catalog '<name>'` names the **server-side** catalog a session opens, decoupled from the local ATTACH alias. Without it the session opens a catalog named after the alias; with it, alias and server catalog are independent — so you can attach the same server catalog under different aliases, or (below) several server catalogs over one socket.
 
 ```ts
-ATTACH '' AS foo (TYPE n6k, wsId '${wsId}', catalog 'analytics_prod');
+ATTACH '' AS foo (TYPE n6k, CONNECTION '${wsId}', catalog 'analytics_prod');
 // local catalog `foo` ⇒ server catalog `analytics_prod`
 ```
 
 #### Several catalogs over one socket
 
-One registered socket can back **several** catalog sessions at once — give each ATTACH its own `catalog`:
+One socket can back **several** catalog sessions at once. Two `ATTACH 'n6k://host'` with one token share one by themselves; on a registered socket, give each ATTACH its own `catalog`:
 
 ```ts
 const ws = new WebSocket("wss://api.example.com/ws");
 const { wsId } = await registerWebsocket(ws, token);
-await conn.query(`ATTACH '' AS foo (TYPE n6k, wsId '${wsId}', catalog 'catA')`);
-await conn.query(`ATTACH '' AS bar (TYPE n6k, wsId '${wsId}', catalog 'catB')`);
+await conn.query(`ATTACH '' AS foo (TYPE n6k, CONNECTION '${wsId}', catalog 'catA')`);
+await conn.query(`ATTACH '' AS bar (TYPE n6k, CONNECTION '${wsId}', catalog 'catB')`);
 // foo and bar now run concurrently over the ONE socket.
 await conn.query(`DETACH foo`); // bar keeps working; only foo's session closes
 ```
 
-Each attach is tagged with a session id (`ns`) that the driver stamps on its frames and the server echoes back, so responses are demuxed to the right catalog; req-id spaces are per-session, so they never collide. An `OPEN_ERR` (e.g. a catalog the server does not serve for this token) fails only that ATTACH — siblings and the socket are unaffected. `DETACH` of one catalog closes just its server session (the socket stays open for the others); `replaceWebsocket` re-HELLOs and re-OPENs **every** session riding the socket on the new one. The server serves whichever catalogs it decided to serve for the socket's token; each ATTACH's `FT_OPEN` picks one of them.
+Each attach is tagged with a session id (`ns`) that the driver stamps on its frames and the server echoes back, so responses are demuxed to the right catalog; req-id spaces are per-session, so they never collide. An `OPEN_ERR` (e.g. a catalog the server does not serve for this token) fails only that ATTACH — siblings and the socket are unaffected. `DETACH` of one catalog closes just its server session (the socket stays open for the others); after `replaceWebsocket`, **every** session riding the socket re-OPENs on the new one at its next request. The server serves whichever catalogs it decided to serve for the socket's token; each ATTACH's `FT_OPEN` picks one of them.
 
 ## Server-side rendering (Node, RSC, edge)
 

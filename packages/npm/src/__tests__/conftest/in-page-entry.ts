@@ -76,6 +76,7 @@ declare global {
       heap: boolean;
       ringOffset: number | null;
       canFree: boolean;
+      openRings: number;
     }>;
     // In-page test surface: the wasm driver internals a test needs to exercise
     // that can't cross the page.evaluate boundary (the live `db`, streaming
@@ -101,6 +102,10 @@ declare global {
         token: string,
       ) => Promise<void>;
       listCatalogs: (wsId: string) => Promise<string[]>;
+      reconnect: (catalog: string) => void;
+      openRings: () => Promise<number>;
+      // Polls until at most `target` rings are open, or 3s pass; returns the last count. A free is asynchronous.
+      settleRings: (target: number) => Promise<number>;
       // Every onCatalogsChanged call, in order.
       catalogsChanged: { wsId: string; catalogs: string[] }[];
       // Every onInvalidated call, in order.
@@ -210,6 +215,11 @@ async function boot(): Promise<void> {
       );
     });
 
+  const openRings = async (): Promise<number> => {
+    const { openRings: open } = await globalThis.__n6kVsockSelftest!();
+    return open;
+  };
+
   globalThis.__n6kConnect = createWasmConnect(db);
   globalThis.__n6kTest = {
     serverUrl,
@@ -224,6 +234,17 @@ async function boot(): Promise<void> {
     registerWebsocket,
     replaceWebsocket,
     listCatalogs,
+    reconnect,
+    openRings,
+    settleRings: async (target: number): Promise<number> => {
+      const deadline = Date.now() + 3000;
+      let open = await openRings();
+      while (open > target && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        open = await openRings();
+      }
+      return open;
+    },
     catalogsChanged,
     invalidated,
   };

@@ -5,6 +5,8 @@ import {
   serverUp,
   serverExec,
   pushInvalidate,
+  pushInvalidateSent,
+  socketsAuthenticated,
 } from "./conftest/server";
 import { N6K_URL } from "./_server-gate";
 import type { BackendHandle } from "./conftest/types";
@@ -110,20 +112,44 @@ backendDescribe()(`multi catalog [${backendName}]`, () => {
     }
   }, 30_000);
 
+  test("two URL ATTACHes with one token share one socket", async () => {
+    const token = `shared_${Date.now()}`;
+    const a = `ua_${Date.now()}`;
+    const b = `ub_${Date.now()}`;
+    const before = await socketsAuthenticated();
+    await handle.conn.query(
+      `ATTACH '${N6K_URL}' AS ${a} (TYPE n6k, TOKEN '${token}')`,
+    );
+    await handle.conn.query(
+      `ATTACH '${N6K_URL}' AS ${b} (TYPE n6k, TOKEN '${token}')`,
+    );
+    try {
+      expect(
+        await countN(handle.conn, `SELECT count(*) AS n FROM ${a}.main.users`),
+      ).toBe(3);
+      expect(
+        await countN(handle.conn, `SELECT count(*) AS n FROM ${b}.main.users`),
+      ).toBe(3);
+      expect((await socketsAuthenticated()) - before).toBe(1);
+    } finally {
+      await detach(a, b);
+    }
+  }, 30_000);
+
   teardownTest(
-    "DETACH tears down the catalog (server handler drops)",
+    "DETACH closes the catalog's session on the server",
     async () => {
       const c = `mct_${Date.now()}`;
       await handle.conn.query(`ATTACH '${N6K_URL}' AS ${c} (TYPE n6k)`);
       await handle.conn.query(`SELECT count(*) AS n FROM ${c}.main.users`);
-      expect(await pushInvalidate(c, "main")).toBe(1);
+      expect(await pushInvalidateSent(c, "main")).toBe(1);
 
       await handle.conn.query(`DETACH ${c}`);
 
       let n = -1;
       const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
-        n = await pushInvalidate(c, "main");
+        n = await pushInvalidateSent(c, "main");
         if (n === 0) break;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }

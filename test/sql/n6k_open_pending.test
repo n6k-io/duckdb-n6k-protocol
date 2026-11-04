@@ -58,3 +58,8 @@ query I
 SELECT ok FROM n6k_selftest_open_pending('reconnect_abort');
 ----
 true
+
+query I
+SELECT ok FROM n6k_selftest_open_pending('reopen_after_timeout');
+----
+true

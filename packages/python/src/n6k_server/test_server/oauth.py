@@ -8,6 +8,7 @@ the data WS/HTTP.
 """
 
 import base64
+import secrets
 import time
 from typing import Any
 from urllib.parse import parse_qsl
@@ -23,10 +24,18 @@ AUDIENCE = "n6k-data-service"
 # The (opaque) subject token the device flow would have issued; the token
 # exchange only mints for this value.
 ACCEPTED_SUBJECT_TOKEN = "test-subject-token"
+# Reusable; the response carries no new refresh token.
+ACCEPTED_REFRESH_TOKEN = "test-refresh-token"
+# Reusable across runs against a long-lived server; each use issues a single-use rotated token.
+ROTATING_REFRESH_SEED = "test-rotating-refresh-seed"
+# Reusable; mints a JWT that expires within a test.
+SHORT_LIVED_REFRESH_TOKEN = "test-short-lived-refresh-token"
 JWT_TTL_SECONDS = 900  # 15 min, like production
+SHORT_JWT_TTL_SECONDS = 3
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+REFRESH_TOKEN_GRANT = "refresh_token"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 # Approve a device after this many polls (so the client exercises the
 # authorization_pending → success transition).
@@ -36,6 +45,7 @@ APPROVE_AFTER_POLLS = 1
 class OAuthServer:
     def __init__(self) -> None:
         self._device_polls: dict[str, int] = {}
+        self._live_refresh_tokens: set[str] = set()
         self._key = Ed25519PrivateKey.generate()
         self._priv_pem = self._key.private_bytes(
             serialization.Encoding.PEM,
@@ -53,7 +63,7 @@ class OAuthServer:
             "token_endpoint": f"{issuer}/oauth/token",
             "device_authorization_endpoint": f"{issuer}/oauth/device",
             "jwks_uri": f"{issuer}/jwks",
-            "grant_types_supported": [TOKEN_EXCHANGE_GRANT, DEVICE_CODE_GRANT],
+            "grant_types_supported": [TOKEN_EXCHANGE_GRANT, DEVICE_CODE_GRANT, REFRESH_TOKEN_GRANT],
         }
 
     def jwks(self) -> dict[str, Any]:
@@ -64,9 +74,9 @@ class OAuthServer:
         x = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
         return {"keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "x": x}]}
 
-    def sign(self, audience: str) -> str:
+    def sign(self, audience: str, ttl_seconds: int = JWT_TTL_SECONDS) -> str:
         now = int(time.time())
-        claims = {"sub": "test-user", "aud": audience or AUDIENCE, "iat": now, "exp": now + JWT_TTL_SECONDS}
+        claims = {"sub": "test-user", "aud": audience or AUDIENCE, "iat": now, "exp": now + ttl_seconds}
         return jwt.encode(claims, self._priv_pem, algorithm="EdDSA")
 
     def verify(self, token: str) -> bool:
@@ -96,6 +106,18 @@ class OAuthServer:
         if self._device_polls[device_code] > APPROVE_AFTER_POLLS:
             return ACCEPTED_SUBJECT_TOKEN
         return None
+
+    def redeem_refresh_token(self, token: str) -> tuple[bool, str | None]:
+        """Return (accepted, rotated refresh token to issue, if any)."""
+        if token in (ACCEPTED_REFRESH_TOKEN, SHORT_LIVED_REFRESH_TOKEN):
+            return True, None
+        if token != ROTATING_REFRESH_SEED:
+            if token not in self._live_refresh_tokens:
+                return False, None
+            self._live_refresh_tokens.remove(token)
+        rotated = f"rotated-{secrets.token_urlsafe(16)}"
+        self._live_refresh_tokens.add(rotated)
+        return True, rotated
 
 
 def mount_oauth_as(app: FastAPI) -> OAuthServer:
@@ -142,6 +164,20 @@ def mount_oauth_as(app: FastAPI) -> OAuthServer:
             if subject is None:
                 return JSONResponse({"error": "authorization_pending"}, status_code=400)
             return {"access_token": subject, "token_type": "Bearer", "expires_in": 604800}
+        if grant == REFRESH_TOKEN_GRANT:
+            refresh_token = str(form.get("refresh_token", ""))
+            accepted, rotated = server.redeem_refresh_token(refresh_token)
+            if not accepted:
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            ttl = SHORT_JWT_TTL_SECONDS if refresh_token == SHORT_LIVED_REFRESH_TOKEN else JWT_TTL_SECONDS
+            response: dict[str, Any] = {
+                "access_token": server.sign(str(form.get("resource") or AUDIENCE), ttl),
+                "token_type": "Bearer",
+                "expires_in": ttl,
+            }
+            if rotated is not None:
+                response["refresh_token"] = rotated
+            return response
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
     return server

@@ -5,17 +5,10 @@ import {
   OP,
   HELLO_CAPS,
   N6K_PROTOCOL_VERSION,
-  invalidatedSchemas,
   tryHeader,
   type FrameHeader,
 } from "./ws-framing";
-import { resetChannel } from "./virtual-socket/channel";
-import {
-  bindPump,
-  connectionReplyId,
-  deliverInbound,
-} from "./virtual-socket/ws-demux";
-import { createCatalogRegistry } from "./workers/ws-registry";
+import { connectionReplyId } from "./virtual-socket/ws-demux";
 import { logger as log, isDebugEnabled } from "./logger";
 
 let liveWorkers = 0;
@@ -58,12 +51,13 @@ export class HelloRefusedError extends Error {
 }
 
 export type RegisteredWebsocket = {
+  // The connection id: ATTACH '' AS x (TYPE n6k, CONNECTION '<wsId>').
   wsId: string;
   // From the latest HELLO_ACK; replaceWebsocket updates it.
   capabilities: string[];
   // Throws if the server did not grant `jsonrpc`.
   readonly rpc: JsonRpcClient;
-  // Fails pending calls; the socket stays registered until its last catalog is detached. Idempotent.
+  // Fails pending calls; the socket stays bridged until its last catalog is detached. Idempotent.
   // Trap: a held `rpc` still sends after close() but its replies are dropped, so calls end only by timeout
   // or abort.
   close: () => void;
@@ -71,7 +65,9 @@ export type RegisteredWebsocket = {
 
 export type N6kWorkerHandle = {
   worker: Worker;
-  // Reopen an attached catalog's socket without DETACH/ATTACH; no-op for unknown; status via onStatus.
+  // Close the socket under an attached catalog, and so under every catalog on it, failing their in-flight
+  // requests. It redials on the next request from any of them. Throws for an app-registered socket, which only
+  // replaceWebsocket can swap. Logs and does nothing for an unknown catalog; status via onStatus.
   reconnect: (catalog: string) => void;
   // Resolves on HELLO_ACK; rejects on HELLO_ERR (HelloRefusedError), a protocol_version mismatch, the HELLO
   // send throwing, or the socket closing or erroring first. No deadline. Binary frames are n6k, text frames are JSON-RPC.
@@ -79,9 +75,10 @@ export type N6kWorkerHandle = {
     socket: WebSocket,
     token: string,
   ) => Promise<RegisteredWebsocket>;
-  // Swap the socket behind a wsId, FT_HELLO it, then re-open every attached catalog. On success, in-flight
-  // reqs and rpc calls fail and rpc moves to the new socket. On handshake failure it rethrows and keeps the
-  // previous socket if still OPEN; otherwise the previous socket's close handling runs.
+  // Swap the socket behind a wsId and FT_HELLO it; its catalogs reopen on the new socket on their next
+  // request. On success, in-flight reqs and rpc calls fail and rpc moves to the new socket. On handshake failure it rethrows and keeps the
+  // previous socket if still OPEN; otherwise the previous socket's close handling runs. A wsId not currently
+  // registered does not throw: the socket is bridged under it, with no registration or rpc.
   replaceWebsocket: (
     wsId: string,
     socket: WebSocket,
@@ -93,6 +90,11 @@ export type N6kWorkerHandle = {
   // duckdb `worker` (owned by AsyncDuckDB.terminate()); without it those handles pin the host loop.
   dispose: () => void;
 };
+
+// These helper workers do their work over SAB/Atomics, not the event loop. Under Bun a
+// classic worker that parks on worker_threads' parentPort never releases the parent loop on
+// terminate(), so unref them at spawn; the duckdb worker stays ref'd and db.terminate() frees it.
+const unref = (handle: unknown) => (handle as { unref?: () => void }).unref?.();
 
 export function createN6kWorker({
   mainWorkerUrl,
@@ -129,42 +131,31 @@ export function createN6kWorker({
     ringOffset: m.ringOffset,
     doorbellOffset: m.doorbellOffset,
   });
-  // Reset both rings in place for a reconnect (buffer/offset unchanged; C++ owns the malloc).
-  const resetCarrier = (c: ChannelCarrier): void =>
-    resetChannel(c.wasmMemory.buffer, undefined, c.ringOffset);
 
-  // Byte-pump (vsock) reconnect params per catalog so reconnect() can respawn the pump (external stores wsId).
-  type PumpParams =
-    | ({ external: false; wsUrl: string } & ChannelCarrier)
-    | ({ external: true; wsId: string } & ChannelCarrier);
-  const pumpParams = new Map<string, PumpParams>();
-  const carrierOf = (pp: PumpParams): ChannelCarrier => ({
-    wasmMemory: pp.wasmMemory,
-    ringOffset: pp.ringOffset,
-    doorbellOffset: pp.doorbellOffset,
-  });
+  // Pump ws-worker → its ring, pending a free. Set when C++ closes the transport; the free fires only
+  // when that pump acks it has released the ring ("pump-ring-released"), so we never free a region
+  // still in use.
+  const pendingRingFree = new Map<
+    Worker,
+    { key: string; ringOffset: number }
+  >();
 
-  // Pump ws-worker → wasm-heap ring offset pending a free. Set on detach; the free fires only
-  // when that pump acks it has released the ring ("pump-ring-released"), so we never free a
-  // region still in use. Keyed by pump, not catalog: a re-ATTACH of the same name gets a new pump.
-  const pendingRingFree = new Map<Worker, number>();
-
+  const PUMP_RETIRE_MS = 5000;
   const LIST_TIMEOUT_MS = 10_000;
   type ConnectionRequest = {
     catalogs: string[];
     finish: (error?: Error) => void;
   };
 
-  // App-registered sockets by wsId; inbound listener attached at registration so the HELLO_ACK isn't missed.
+  // App-registered sockets by id; inbound listener attached at registration so the HELLO_ACK isn't missed.
   type ExternalSocket = {
     socket: WebSocket;
+    token: string;
     pendingHello?: (header: FrameHeader) => void;
-    // HELLO_ACK `capabilities`: negotiated here, read by the wasm WsClient via n6k.helloCapabilities.
+    // HELLO_ACK `capabilities`: negotiated here, read by the wasm hub via n6k.helloCapabilities.
     capabilities: string[];
-    // Frames buffered before a pump was bound to route them; replayed on bind.
-    inbound: ArrayBuffer[];
-    // Pumps on this one socket keyed by session ns (multiplex: one socket, N sessions).
-    targets: Map<number, Worker>;
+    // The pump of the connection C++ holds over this socket, while it holds one.
+    pump?: Worker;
     // Connection-scoped requests (no ns) issued from here, keyed by id; never reach a pump.
     requests: Map<number, ConnectionRequest>;
     nextReqId: number;
@@ -172,22 +163,23 @@ export function createN6kWorker({
     onClose: () => void;
   };
   const externalSockets = new Map<string, ExternalSocket>();
-  // Per wsId until close(); outlives replaceWebsocket and keeps the socket registered past the last DETACH.
+  // Per id until close(); outlives replaceWebsocket.
   const rpcClients = new Map<string, JsonRpcEndpoint>();
   const registrations = new Map<string, RegisteredWebsocket>();
-  let nextWsId = 1;
-  // catalog -> wsId, for detaching/reconnecting external catalogs.
-  const externalBindings = new Map<string, string>();
-  // catalog -> its session ns on the shared socket.
-  const catalogNs = new Map<string, number>();
-  // wsId -> catalogs attached on it; refcount so DETACH tears down only on the last catalog.
-  const wsIdToCatalogs = new Map<string, Set<string>>();
+  // Closed while C++ still held a connection over the socket; torn down once it lets go.
+  const closing = new Set<string>();
 
-  // These helper workers do their work over SAB/Atomics, not the event loop. Under Bun a
-  // classic worker that parks on worker_threads' parentPort never releases the parent loop on
-  // terminate(), so unref them at spawn; the duckdb worker stays ref'd and db.terminate() frees it.
-  const unref = (w: Worker) =>
-    (w as unknown as { unref?: () => void }).unref?.();
+  // One pump per connection transport (one C++ dial), by the transport's key.
+  type Channel = {
+    connectionId: string;
+    pump: Worker;
+    ringOffset: number;
+  };
+  const channels = new Map<string, Channel>();
+  // The catalogs riding each connection, as C++ reports them, so status is reported per catalog.
+  const catalogsOf = new Map<string, Set<string>>();
+  const connectionOf = new Map<string, string>();
+  const connectionStatus = new Map<string, WsStatus>();
 
   // Private channel for n6k control frames; keeps them off duckdb-wasm's RPC postMessage binding.
   const n6kChannel = new MessageChannel();
@@ -217,70 +209,70 @@ export function createN6kWorker({
   // ws-workers torn down on purpose; their "closed" message must not report as "disconnected".
   const intentionalClose = new WeakSet<Worker>();
 
-  // One ws-worker per catalog; dispose = graceful WS close then terminate backstop (avoids half-open server conns).
-  const wsWorkers = createCatalogRegistry<Worker>(undefined, function (w, c) {
+  function setConnectionStatus(connectionId: string, status: WsStatus): void {
+    connectionStatus.set(connectionId, status);
+    for (const catalog of catalogsOf.get(connectionId) ?? []) {
+      notifyStatus(catalog, status);
+    }
+  }
+
+  // A ring still pending here is never freed: terminate() is not synchronous, so the pump may still be writing it.
+  function retirePump(w: Worker, label: string): void {
     intentionalClose.add(w);
-    untrackWorker(w, `#${instanceId} ws-worker catalog=${c}`);
+    untrackWorker(w, label);
     try {
       w.postMessage({ type: "close" });
     } catch {
       /* ignore */
     }
-    setTimeout(function () {
-      try {
-        w.terminate();
-      } catch {
-        /* ignore */
-      }
-    }, 100);
-  });
+    unref(
+      setTimeout(function () {
+        if (pendingRingFree.delete(w)) {
+          log.error(`pump never released its ring: ${label}`);
+        }
+        try {
+          w.terminate();
+        } catch {
+          /* ignore */
+        }
+      }, PUMP_RETIRE_MS),
+    );
+  }
 
-  // Byte-pump ws-worker: moves frames WS↔channel; no atomics handshake (protocol is in C++ WsClient).
-  function spawnPumpWsWorker(catalog: string, carrier: ChannelCarrier): Worker {
-    const prev = wsWorkers.get(catalog);
-    if (prev) {
-      intentionalClose.add(prev);
-      untrackWorker(prev, `#${instanceId} ws-worker catalog=${catalog}`);
-      prev.terminate();
-    }
+  // Byte-pump ws-worker: moves frames WS↔channel; the protocol is in the C++ ConnectionHub.
+  function spawnPump(
+    key: string,
+    connectionId: string,
+    carrier: ChannelCarrier,
+  ): Worker {
+    const label = `#${instanceId} ws-worker ${key} connection=${connectionId}`;
     const w = new Worker(wsWorkerUrl, { type: "classic" });
-    trackWorker(w, `#${instanceId} ws-worker catalog=${catalog}`);
+    trackWorker(w, label);
     unref(w);
     w.addEventListener("error", function (ev) {
       log.error("ws-worker (pump) error:", ev.message || ev);
     });
-    w.postMessage({ type: "init-channel", catalog, debug, ...carrier });
-    wsWorkers.set(catalog, w);
+    w.postMessage({ type: "init-channel", label, debug, ...carrier });
 
     let connected = false;
     let disconnectNotified = false;
     w.addEventListener("message", function (ev: MessageEvent) {
       if (!ev.data) return;
       if (ev.data.type === "pump-ring-released") {
-        // The pump finished with its ring; free the heap region iff a detach is pending
-        // for this pump (a plain socket drop leaves it for the reconnect to reuse).
-        const off = pendingRingFree.get(w);
-        if (off !== undefined) {
+        const pending = pendingRingFree.get(w);
+        if (pending !== undefined) {
           pendingRingFree.delete(w);
           try {
-            worker.postMessage({
-              type: "n6k-vsock-free-ring",
-              catalog,
-              ringOffset: off,
-            });
+            worker.postMessage({ type: "n6k-vsock-free-ring", ...pending });
           } catch {
             // duckdb worker already torn down; region goes with the whole heap.
           }
         }
         return;
       }
-      if (ev.data.type === "invalidated") {
-        onInvalidated?.(catalog, ev.data.schemas as string[]);
-        return;
-      }
       if (ev.data.type === "ready") {
         connected = true;
-        notifyStatus(catalog, "connected");
+        setConnectionStatus(connectionId, "connected");
       } else if (
         (ev.data.type === "closed" || ev.data.type === "error") &&
         connected &&
@@ -289,18 +281,19 @@ export function createN6kWorker({
       ) {
         disconnectNotified = true;
         log.error(
-          `ws-worker (pump) disconnected: catalog=${catalog} reason=${ev.data.reason || "(none)"}`,
+          `ws-worker (pump) disconnected: ${label} reason=${ev.data.reason || "(none)"}`,
         );
-        notifyStatus(catalog, "disconnected");
+        setConnectionStatus(connectionId, "disconnected");
       }
     } as EventListener);
     return w;
   }
 
-  // Attach the durable inbound bridge to an app socket under wsId, replacing any prior binding.
+  // Attach the durable inbound bridge to an app socket under its id.
   function createExternalSocket(
     socket: WebSocket,
-    wsId: string,
+    id: string,
+    token: string,
   ): ExternalSocket {
     try {
       socket.binaryType = "arraybuffer";
@@ -309,9 +302,8 @@ export function createN6kWorker({
     }
     const state: ExternalSocket = {
       socket,
+      token,
       capabilities: [],
-      inbound: [],
-      targets: new Map(),
       requests: new Map(),
       nextReqId: 1,
       onMessage: () => {},
@@ -320,13 +312,12 @@ export function createN6kWorker({
     state.onMessage = function (ev: MessageEvent) {
       const d = ev.data;
       if (typeof d === "string") {
-        rpcClients.get(wsId)?.receive(d);
+        rpcClients.get(id)?.receive(d);
         return;
       }
       if (!(d instanceof ArrayBuffer)) return;
       const header = tryHeader(d);
       if (header?.t === FT.PING) {
-        // Untagged PING has no demux target once 2+ sessions share the socket.
         try {
           socket.send(
             packFrame(
@@ -358,7 +349,7 @@ export function createN6kWorker({
       ) {
         const cats = Array.isArray(header.catalogs) ? header.catalogs : [];
         onCatalogsChanged?.(
-          wsId,
+          id,
           cats.filter((c): c is string => typeof c === "string"),
         );
         return;
@@ -384,27 +375,21 @@ export function createN6kWorker({
         }
         return;
       }
-      deliverInbound(state, d);
-      // After delivery, so the engine has the PUSH before anything refetches on this notice.
-      const schemas = invalidatedSchemas(header);
-      if (schemas && typeof header?.ns === "number") {
-        for (const catalog of wsIdToCatalogs.get(wsId) ?? []) {
-          if (catalogNs.get(catalog) === header.ns) {
-            onInvalidated?.(catalog, schemas);
-          }
-        }
-      }
+      // With no connection over the socket nothing awaits these: every session opens after its pump binds.
+      state.pump?.postMessage({ type: "ws-in", data: d }, [d]);
     };
-    // Socket drop -> notify every bound pump; the driver never closes the app's socket.
+    // Socket drop -> the pump over it; the driver never closes the app's socket.
     state.onClose = function () {
       failConnectionRequests(state, "n6k: socket closed");
-      rpcClients.get(wsId)?.fail("n6k: socket closed");
-      for (const w of state.targets.values()) {
-        try {
-          w.postMessage({ type: "ws-closed", reason: "app socket closed" });
-        } catch {
-          // worker already terminated (detach) — nothing to notify.
-        }
+      rpcClients.get(id)?.fail("n6k: socket closed");
+      worker.postMessage({ type: "n6k-socket-down", id });
+      try {
+        state.pump?.postMessage({
+          type: "ws-closed",
+          reason: "app socket closed",
+        });
+      } catch {
+        // worker already terminated — nothing to notify.
       }
     };
     socket.addEventListener("message", state.onMessage as EventListener);
@@ -413,24 +398,43 @@ export function createN6kWorker({
     return state;
   }
 
-  function commitExternalSocket(wsId: string, state: ExternalSocket): void {
-    const prev = externalSockets.get(wsId);
-    if (prev) teardownExternalSocket(prev);
-    externalSockets.set(wsId, state);
+  function commitExternalSocket(id: string, state: ExternalSocket): void {
+    const prev = externalSockets.get(id);
+    if (prev) {
+      setConnectionStatus(id, "reconnecting");
+      if (prev.pump) {
+        // Reported below as a recovery, not a drop. The connection redials onto this socket on its next request.
+        intentionalClose.add(prev.pump);
+        try {
+          prev.pump.postMessage({
+            type: "ws-closed",
+            reason: "websocket replaced",
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+      teardownExternalSocket(prev);
+    }
+    externalSockets.set(id, state);
     // Same port as duckdb-wasm's RPC, so it lands before any ATTACH the app sends after this.
     worker.postMessage({
-      type: "n6k-hello-caps",
-      wsId,
+      type: "n6k-registered",
+      id,
       capabilities: state.capabilities,
+      url: state.socket.url,
+      token: state.token,
     });
+    // Already handshaken, so the socket is up now, whether or not a query has redialed onto it yet.
+    if (prev) setConnectionStatus(id, "connected");
   }
 
   async function handshakeExternalSocket(
-    wsId: string,
+    id: string,
     socket: WebSocket,
     token: string,
   ): Promise<ExternalSocket> {
-    const state = createExternalSocket(socket, wsId);
+    const state = createExternalSocket(socket, id, token);
     try {
       state.capabilities = await helloExternalSocket(state, token);
     } catch (error) {
@@ -443,7 +447,7 @@ export function createN6kWorker({
   // Remove our listeners from an app socket without closing it — the app owns it.
   function teardownExternalSocket(state: ExternalSocket): void {
     failConnectionRequests(state, "n6k: websocket was replaced or detached");
-    state.targets.clear();
+    state.pump = undefined;
     state.socket.removeEventListener(
       "message",
       state.onMessage as EventListener,
@@ -461,21 +465,21 @@ export function createN6kWorker({
     }
   }
 
-  function listCatalogs(wsId: string): Promise<string[]> {
-    const state = externalSockets.get(wsId);
+  function listCatalogs(id: string): Promise<string[]> {
+    const state = externalSockets.get(id);
     if (!state) {
-      return Promise.reject(new Error(`n6k: unknown wsId ${wsId}`));
+      return Promise.reject(new Error(`n6k: unknown wsId ${id}`));
     }
     if (state.socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error(`n6k: socket for ${wsId} is not open`));
+      return Promise.reject(new Error(`n6k: socket for ${id} is not open`));
     }
     return new Promise<string[]>((resolve, reject) => {
-      const id = state.nextReqId++;
+      const reqId = state.nextReqId++;
       const request: ConnectionRequest = {
         catalogs: [],
         finish(error) {
           clearTimeout(timer);
-          state.requests.delete(id);
+          state.requests.delete(reqId);
           if (error) reject(error);
           else resolve(request.catalogs);
         },
@@ -489,51 +493,17 @@ export function createN6kWorker({
           ),
         LIST_TIMEOUT_MS,
       );
-      state.requests.set(id, request);
+      state.requests.set(reqId, request);
       try {
-        state.socket.send(packFrame({ t: FT.REQ, op: OP.CATALOG_LIST, id }));
+        state.socket.send(
+          packFrame({ t: FT.REQ, op: OP.CATALOG_LIST, id: reqId }),
+        );
       } catch (error) {
         request.finish(
           error instanceof Error ? error : new Error(String(error)),
         );
       }
     });
-  }
-
-  function detachExternalBinding(catalog: string): void {
-    const wsId = externalBindings.get(catalog);
-    if (wsId === undefined) return;
-    externalBindings.delete(catalog);
-    const state = externalSockets.get(wsId);
-    const ns = catalogNs.get(catalog);
-    if (state !== undefined && ns !== undefined) state.targets.delete(ns);
-    catalogNs.delete(catalog);
-    const cats = wsIdToCatalogs.get(wsId);
-    if (cats) {
-      cats.delete(catalog);
-      if (cats.size > 0) {
-        // Siblings still ride this socket; ask the server to close just THIS session.
-        if (state !== undefined && ns !== undefined) {
-          sendCloseSession(state.socket, ns);
-        }
-        return;
-      }
-      wsIdToCatalogs.delete(wsId);
-    }
-    if (state && !rpcClients.has(wsId)) {
-      teardownExternalSocket(state);
-      externalSockets.delete(wsId);
-    }
-  }
-
-  // Close one mux session (CANCEL with reserved req id 0) on a socket that stays open for siblings.
-  function sendCloseSession(socket: WebSocket, ns: number): void {
-    if (socket.readyState !== WebSocket.OPEN) return;
-    try {
-      socket.send(packFrame({ t: FT.CANCEL, id: 0, ns }));
-    } catch (error) {
-      log.error("failed to send close-session frame:", error);
-    }
   }
 
   function helloExternalSocket(
@@ -612,57 +582,68 @@ export function createN6kWorker({
     socket: WebSocket,
     token: string,
   ): Promise<RegisteredWebsocket> {
-    const wsId = `ext_${nextWsId++}`;
-    const state = await handshakeExternalSocket(wsId, socket, token);
-    commitExternalSocket(wsId, state);
+    // A connection id: ATTACH ... (CONNECTION '<id>') rides this socket.
+    const id = crypto.randomUUID();
+    const state = await handshakeExternalSocket(id, socket, token);
+    commitExternalSocket(id, state);
     const client = createJsonRpcClient(sendOpen(socket));
-    rpcClients.set(wsId, client);
+    rpcClients.set(id, client);
     const rpc: JsonRpcClient = {
       call: client.call,
       notify: client.notify,
       on: client.on,
     };
     const registration: RegisteredWebsocket = {
-      wsId,
+      wsId: id,
       capabilities: state.capabilities,
       get rpc() {
         if (!registration.capabilities.includes(CAP_JSONRPC)) {
           throw new Error(
-            `n6k: server did not grant "${CAP_JSONRPC}" on ${wsId}`,
+            `n6k: server did not grant "${CAP_JSONRPC}" on ${id}`,
           );
         }
         return rpc;
       },
-      close: () => closeRegistration(wsId, client),
+      close: () => closeRegistration(id, client),
     };
-    registrations.set(wsId, registration);
+    registrations.set(id, registration);
     return registration;
   }
 
-  function closeRegistration(wsId: string, client: JsonRpcEndpoint): void {
-    if (rpcClients.get(wsId) !== client) return;
-    rpcClients.delete(wsId);
-    registrations.delete(wsId);
+  function closeRegistration(id: string, client: JsonRpcEndpoint): void {
+    if (rpcClients.get(id) !== client) return;
+    rpcClients.delete(id);
+    registrations.delete(id);
     client.fail("n6k: registration closed");
-    if (wsIdToCatalogs.has(wsId)) return;
-    const state = externalSockets.get(wsId);
+    worker.postMessage({ type: "n6k-unregistered", id });
+    const state = externalSockets.get(id);
+    if (state?.pump) {
+      closing.add(id);
+      return;
+    }
+    finishClose(id);
+  }
+
+  function finishClose(id: string): void {
+    closing.delete(id);
+    const state = externalSockets.get(id);
     if (state) {
       teardownExternalSocket(state);
-      externalSockets.delete(wsId);
+      externalSockets.delete(id);
     }
   }
 
   async function replaceWebsocket(
-    wsId: string,
+    id: string,
     socket: WebSocket,
     token: string,
   ): Promise<void> {
-    const prev = externalSockets.get(wsId);
+    const prev = externalSockets.get(id);
     prev?.socket.removeEventListener("close", prev.onClose);
     prev?.socket.removeEventListener("error", prev.onClose);
     let state: ExternalSocket;
     try {
-      state = await handshakeExternalSocket(wsId, socket, token);
+      state = await handshakeExternalSocket(id, socket, token);
     } catch (error) {
       if (prev && prev.socket.readyState === WebSocket.OPEN) {
         prev.socket.addEventListener("close", prev.onClose);
@@ -672,53 +653,35 @@ export function createN6kWorker({
       }
       throw error;
     }
-    const cats = [...(wsIdToCatalogs.get(wsId) ?? [])];
-    commitExternalSocket(wsId, state);
-    const client = rpcClients.get(wsId);
+    commitExternalSocket(id, state);
+    const client = rpcClients.get(id);
     if (client) {
       client.fail("n6k: websocket was replaced");
       client.rebind(sendOpen(socket));
     }
-    const registration = registrations.get(wsId);
+    const registration = registrations.get(id);
     if (registration) registration.capabilities = state.capabilities;
-    for (const catalog of cats) reconnect(catalog);
   }
 
-  // Reset the catalog's channel rings and respawn its pump; WsClient re-runs its handshake on next request.
   function reconnect(catalog: string): void {
-    const pp = pumpParams.get(catalog);
-    if (!pp) {
+    const connectionId = connectionOf.get(catalog);
+    if (connectionId === undefined) {
       log.error("reconnect: unknown catalog (not attached):", catalog);
       return;
     }
-    notifyStatus(catalog, "reconnecting");
-    const carrier = carrierOf(pp);
-    resetCarrier(carrier);
-    const w = spawnPumpWsWorker(catalog, carrier);
-    if (pp.external) {
-      const state = externalSockets.get(pp.wsId);
-      const ns = catalogNs.get(catalog);
-      if (state && ns !== undefined) {
-        bindPump(state, ns, w);
-        w.addEventListener("message", function (ev: MessageEvent) {
-          if (ev.data && ev.data.type === "ws-out") {
-            try {
-              state.socket.send(ev.data.data as ArrayBuffer);
-            } catch (error) {
-              log.error("external vsock send failed:", error);
-            }
-          }
-        } as EventListener);
-        const openTransport = () =>
-          w.postMessage({ type: "open-pump-external" });
-        if (state.socket.readyState === WebSocket.OPEN) openTransport();
-        else
-          state.socket.addEventListener("open", openTransport, {
-            once: true,
-          });
+    if (externalSockets.has(connectionId)) {
+      throw new Error(
+        `n6k: catalog ${catalog} rides an app-registered socket; call replaceWebsocket`,
+      );
+    }
+    setConnectionStatus(connectionId, "reconnecting");
+    for (const ch of channels.values()) {
+      if (ch.connectionId !== connectionId) continue;
+      try {
+        ch.pump.postMessage({ type: "close" });
+      } catch {
+        /* ignore */
       }
-    } else {
-      w.postMessage({ type: "open-pump", url: pp.wsUrl });
     }
   }
 
@@ -728,42 +691,36 @@ export function createN6kWorker({
     if (!e.data) return;
 
     switch (e.data.type) {
-      case "n6k-vsock-attach": {
-        // Byte-pump path: spawn a pump ws-worker that dials wsUrl and moves frames WS↔channel.
-        const catalog: string = e.data.catalog || "";
-        const wsUrl: string = e.data.wsUrl || "";
+      case "n6k-vsock-dial": {
+        const key: string = e.data.key;
+        const connectionId: string = e.data.connectionId;
         const carrier = readCarrier(e.data);
-        pumpParams.set(catalog, { external: false, wsUrl, ...carrier });
-        const w = spawnPumpWsWorker(catalog, carrier);
-        w.postMessage({ type: "open-pump", url: wsUrl });
+        const w = spawnPump(key, connectionId, carrier);
+        channels.set(key, {
+          connectionId,
+          pump: w,
+          ringOffset: carrier.ringOffset,
+        });
+        w.postMessage({ type: "open-pump", url: e.data.wsUrl });
         break;
       }
-      case "n6k-vsock-attach-ws": {
+      case "n6k-vsock-adopt": {
         // Byte-pump over an app-registered socket: main thread bridges binary frames to/from the pump.
-        const catalog: string = e.data.catalog || "";
-        const wsId: string = e.data.wsId || "";
-        // Session ns (from C++ WsClient, echoed by server) for demux.
-        const ns = e.data.ns;
+        const key: string = e.data.key;
+        const connectionId: string = e.data.connectionId;
         const carrier = readCarrier(e.data);
-        const state = externalSockets.get(wsId);
-        if (!state || typeof ns !== "number" || ns === 0) {
-          log.error("n6k-vsock-attach-ws: unknown wsId or missing ns:", wsId);
-          notifyStatus(catalog, "error");
+        const w = spawnPump(key, connectionId, carrier);
+        channels.set(key, {
+          connectionId,
+          pump: w,
+          ringOffset: carrier.ringOffset,
+        });
+        const state = externalSockets.get(connectionId);
+        if (!state) {
+          w.postMessage({ type: "ws-closed", reason: "registration closed" });
           break;
         }
-        const w = spawnPumpWsWorker(catalog, carrier);
-        // Route this session's inbound frames (by ns) to its pump, replaying any buffered.
-        bindPump(state, ns, w);
-        externalBindings.set(catalog, wsId);
-        catalogNs.set(catalog, ns);
-        let cats = wsIdToCatalogs.get(wsId);
-        if (!cats) {
-          cats = new Set();
-          wsIdToCatalogs.set(wsId, cats);
-        }
-        cats.add(catalog);
-        pumpParams.set(catalog, { external: true, wsId, ...carrier });
-        // pump worker → app socket: relay outbound frames over the shared socket.
+        state.pump = w;
         w.addEventListener("message", function (ev: MessageEvent) {
           if (ev.data && ev.data.type === "ws-out") {
             try {
@@ -773,29 +730,58 @@ export function createN6kWorker({
             }
           }
         } as EventListener);
-        const openTransport = () =>
-          w.postMessage({ type: "open-pump-external" });
+        // Closed since vsockAdopt checked: no ws-closed here, a drop during the reopen would stop the catalog for
+        // good. The OPEN times out instead, and replaceWebsocket still recovers.
         if (state.socket.readyState === WebSocket.OPEN) {
-          openTransport();
-        } else {
-          state.socket.addEventListener("open", openTransport, { once: true });
+          w.postMessage({ type: "open-pump-external" });
         }
         break;
       }
       case "n6k-vsock-detach": {
-        const catalog: string | undefined = e.data.catalog;
-        if (catalog) {
-          // Schedule the ring-region free, honored once the pump acks release
-          // (pump-ring-released). Set BEFORE closing the pump so the ack isn't missed.
-          const pp = pumpParams.get(catalog);
-          const pump = wsWorkers.get(catalog);
-          if (pp && pump) {
-            pendingRingFree.set(pump, pp.ringOffset);
-          }
-          detachExternalBinding(catalog);
-          wsWorkers.remove(catalog);
-          pumpParams.delete(catalog);
+        const key: string = e.data.key;
+        const ch = channels.get(key);
+        if (!ch) break;
+        channels.delete(key);
+        // Set BEFORE closing the pump so its release ack isn't missed.
+        pendingRingFree.set(ch.pump, { key, ringOffset: ch.ringOffset });
+        retirePump(ch.pump, `#${instanceId} ws-worker ${key}`);
+        const state = externalSockets.get(ch.connectionId);
+        if (state?.pump === ch.pump) state.pump = undefined;
+        if (closing.has(ch.connectionId) && !state?.pump) {
+          finishClose(ch.connectionId);
         }
+        break;
+      }
+      case "n6k-catalog-joined": {
+        const connectionId: string = e.data.connectionId;
+        const catalog: string = e.data.catalog;
+        let cats = catalogsOf.get(connectionId);
+        if (!cats) {
+          cats = new Set();
+          catalogsOf.set(connectionId, cats);
+        }
+        cats.add(catalog);
+        connectionOf.set(catalog, connectionId);
+        const status = connectionStatus.get(connectionId);
+        if (status !== undefined) notifyStatus(catalog, status);
+        break;
+      }
+      case "n6k-catalog-left": {
+        const connectionId: string = e.data.connectionId;
+        const catalog: string = e.data.catalog;
+        const cats = catalogsOf.get(connectionId);
+        cats?.delete(catalog);
+        if (cats?.size === 0) {
+          catalogsOf.delete(connectionId);
+          connectionStatus.delete(connectionId);
+        }
+        if (connectionOf.get(catalog) === connectionId) {
+          connectionOf.delete(catalog);
+        }
+        break;
+      }
+      case "n6k-invalidated": {
+        onInvalidated?.(e.data.catalog as string, e.data.schemas as string[]);
         break;
       }
       // No default
@@ -803,14 +789,17 @@ export function createN6kWorker({
   };
 
   function dispose(): void {
-    wsWorkers.clear(); // graceful WS close + terminate backstop per ws-worker
-    for (const [wsId, client] of rpcClients) closeRegistration(wsId, client);
+    for (const [key, ch] of channels) {
+      retirePump(ch.pump, `#${instanceId} ws-worker ${key}`);
+    }
+    channels.clear();
+    for (const [id, client] of rpcClients) closeRegistration(id, client);
     for (const state of externalSockets.values()) teardownExternalSocket(state);
     externalSockets.clear();
-    externalBindings.clear();
-    catalogNs.clear();
-    wsIdToCatalogs.clear();
-    pumpParams.clear();
+    closing.clear();
+    catalogsOf.clear();
+    connectionOf.clear();
+    connectionStatus.clear();
     pendingRingFree.clear();
     try {
       n6kChannel.port1.close();

@@ -192,7 +192,10 @@ export class N6kDuckDB {
       const reg = this.snapshot.registrations[socket];
       // The socket's own failure is already this alias's error.
       if (!reg) return;
-      withWs = { ...config, options: { ...config.options, wsId: reg.wsId } };
+      withWs = {
+        ...config,
+        options: { ...config.options, connection: reg.wsId },
+      };
     }
     const sinceAttach = stopwatch();
     try {

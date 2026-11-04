@@ -42,17 +42,42 @@ export async function serverExec(sql: string, catalog = "db"): Promise<void> {
   }
 }
 
-export async function pushInvalidate(
+async function postPushInvalidate(
   catalog: string,
   schemas: string,
-): Promise<number> {
+): Promise<{ handlers: number; sent: number }> {
   const r = await fetch(
     `${SERVER}/debug/push_invalidate?catalog=${catalog}&schemas=${schemas}`,
     { method: "POST" },
   );
   if (!r.ok) throw new Error(`push_invalidate failed: ${r.status}`);
-  const body = (await r.json()) as { handlers: number };
-  return body.handlers;
+  return (await r.json()) as { handlers: number; sent: number };
+}
+
+// How many sockets serve `catalog`.
+export async function pushInvalidate(
+  catalog: string,
+  schemas: string,
+): Promise<number> {
+  const { handlers } = await postPushInvalidate(catalog, schemas);
+  return handlers;
+}
+
+// How many open sessions on those sockets got the PUSH.
+export async function pushInvalidateSent(
+  catalog: string,
+  schemas: string,
+): Promise<number> {
+  const { sent } = await postPushInvalidate(catalog, schemas);
+  return sent;
+}
+
+// How many sockets the server has authenticated, ever.
+export async function socketsAuthenticated(): Promise<number> {
+  const r = await fetch(`${SERVER}/debug/bridge_builds`);
+  if (!r.ok) throw new Error(`bridge_builds failed: ${r.status}`);
+  const { builds } = (await r.json()) as { builds: number };
+  return builds;
 }
 
 // Serve `catalog` on every live /tuned socket serving `on`; returns how many sockets.

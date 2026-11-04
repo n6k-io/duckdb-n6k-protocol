@@ -6,6 +6,8 @@ import {
   pushInvalidate,
   addCatalog,
   removeCatalog,
+  socketsAuthenticated,
+  wsCloseAll,
 } from "./conftest/server";
 import { FT } from "../protocol-generated";
 
@@ -35,7 +37,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
         const { wsId: id } = await t.registerWebsocket(ws, "");
         const c = await t.connect();
         try {
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
           const r = await c.query(
             `SELECT id, name FROM ${cat}.main.users ORDER BY id`,
           );
@@ -67,7 +69,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
         const { wsId: id } = await t.registerWebsocket(ws, "");
         const c = await t.connect();
         try {
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
           const r = await c.query(
             `SELECT count(*)::INTEGER AS n FROM ${cat}.main.users`,
           );
@@ -96,7 +98,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
         const { wsId: id } = await t.registerWebsocket(ws, "");
         const c = await t.connect();
         try {
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
           await c.query(`SELECT count(*) FROM ${cat}.main.users`);
           return { onmessageNull: ws.onmessage === null, appSawBinary };
         } finally {
@@ -107,6 +109,277 @@ describeCoi("registerWebsocket [browser coi]", () => {
       }, name("wssplit"));
       expect(res.onmessageNull).toBe(true);
       expect(res.appSawBinary).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a URL ATTACH rides the registered socket for that URL and token",
+    async () => {
+      const before = await socketsAuthenticated();
+      const n = await h.page.evaluate(async (cat: string) => {
+        const t = globalThis.__n6kTest!;
+        const ws = new WebSocket(t.wsUrl);
+        await t.registerWebsocket(ws, "");
+        const c = await t.connect();
+        const url = t.wsUrl.replace(/^ws/, "n6k").replace(/\/ws$/, "");
+        try {
+          await c.query(`ATTACH '${url}' AS ${cat} (TYPE n6k)`);
+          const r = await c.query(
+            `SELECT count(*) AS n FROM ${cat}.main.users`,
+          );
+          return Number(r.toArray()[0]!.toJSON().n);
+        } finally {
+          await c.query(`DETACH ${cat}`).catch(() => {});
+          await c.close();
+          ws.close();
+        }
+      }, name("wsurl"));
+      expect(n).toBe(3);
+      expect((await socketsAuthenticated()) - before).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a URL ATTACH over 512 bytes rides the registered socket for that URL",
+    async () => {
+      const before = await socketsAuthenticated();
+      const n = await h.page.evaluate(async (cat: string) => {
+        const t = globalThis.__n6kTest!;
+        const query = `?catalog=${cat}&pad=${"x".repeat(600)}`;
+        const ws = new WebSocket(`${t.wsUrl}${query}`);
+        await t.registerWebsocket(ws, "");
+        const c = await t.connect();
+        const url = t.wsUrl.replace(/^ws/, "n6k").replace(/\/ws$/, "");
+        try {
+          await c.query(`ATTACH '${url}${query}' AS ${cat} (TYPE n6k)`);
+          const r = await c.query(
+            `SELECT count(*) AS n FROM ${cat}.main.users`,
+          );
+          return Number(r.toArray()[0]!.toJSON().n);
+        } finally {
+          await c.query(`DETACH ${cat}`).catch(() => {});
+          await c.close();
+          ws.close();
+        }
+      }, name("wslongurl"));
+      expect(n).toBe(3);
+      expect((await socketsAuthenticated()) - before).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "DETACH from a registered socket frees its ring",
+    async () => {
+      const res = await h.page.evaluate(async (cat: string) => {
+        const t = globalThis.__n6kTest!;
+        const baseline = await t.openRings();
+        const ws = new WebSocket(`${t.wsUrl}?catalog=${cat}`);
+        const { wsId: id } = await t.registerWebsocket(ws, "");
+        const c = await t.connect();
+        try {
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
+          await c.query(`SELECT count(*) FROM ${cat}.main.users`);
+          await c.query(`DETACH ${cat}`);
+          return { baseline, open: await t.settleRings(baseline) };
+        } finally {
+          await c.close();
+          ws.close();
+        }
+      }, name("wsringdetach"));
+      expect(res.open).toBe(res.baseline);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a dial that never opens frees its ring",
+    async () => {
+      const res = await h.page.evaluate(async (cat: string) => {
+        const t = globalThis.__n6kTest!;
+        const baseline = await t.openRings();
+        const c = await t.connect();
+        try {
+          const error = await c
+            .query(`ATTACH 'n6k://localhost:59999' AS ${cat} (TYPE n6k)`)
+            .then(() => "", String);
+          return { error, baseline, open: await t.settleRings(baseline) };
+        } finally {
+          await c.close();
+        }
+      }, name("wsringfail"));
+      expect(res.error).not.toBe("");
+      expect(res.open).toBe(res.baseline);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a socket drop then a redial frees the old ring",
+    async () => {
+      const cat = name("wsringdrop");
+      const baseline = await h.page.evaluate(async (catalog: string) => {
+        const t = globalThis.__n6kTest!;
+        const open = await t.openRings();
+        const url = t.wsUrl.replace(/^ws/, "n6k").replace(/\/ws$/, "");
+        const c = await t.connect();
+        await c.query(
+          `ATTACH '${url}?catalog=${catalog}' AS ${catalog} (TYPE n6k)`,
+        );
+        await c.query(`SELECT count(*) FROM ${catalog}.main.users`);
+        await c.close();
+        return open;
+      }, cat);
+      await wsCloseAll();
+      const res = await h.page.evaluate(
+        async ({ catalog, target }: { catalog: string; target: number }) => {
+          const t = globalThis.__n6kTest!;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const c = await t.connect();
+          try {
+            const r = await c.query(
+              `SELECT count(*) AS n FROM ${catalog}.main.users`,
+            );
+            const n = Number(r.toArray()[0]!.toJSON().n);
+            const whileAttached = await t.settleRings(target + 1);
+            await c.query(`DETACH ${catalog}`);
+            return {
+              n,
+              whileAttached,
+              open: await t.settleRings(target),
+            };
+          } finally {
+            await c.close();
+          }
+        },
+        { catalog: cat, target: baseline },
+      );
+      expect(res.n).toBe(3);
+      expect(res.whileAttached).toBe(baseline + 1);
+      expect(res.open).toBe(baseline);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "reconnect on a healthy dialed socket drops it, the next query redials, and the old ring is freed",
+    async () => {
+      const res = await h.page.evaluate(async (cat: string) => {
+        const t = globalThis.__n6kTest!;
+        const baseline = await t.openRings();
+        const url = t.wsUrl.replace(/^ws/, "n6k").replace(/\/ws$/, "");
+        const c = await t.connect();
+        const count = async (): Promise<number> => {
+          const r = await c.query(
+            `SELECT count(*) AS n FROM ${cat}.main.users`,
+          );
+          return Number(r.toArray()[0]!.toJSON().n);
+        };
+        try {
+          await c.query(`ATTACH '${url}?catalog=${cat}' AS ${cat} (TYPE n6k)`);
+          await count();
+          t.reconnect(cat);
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const n = await count();
+          const whileAttached = await t.settleRings(baseline + 1);
+          await c.query(`DETACH ${cat}`);
+          return {
+            n,
+            baseline,
+            whileAttached,
+            open: await t.settleRings(baseline),
+          };
+        } finally {
+          await c.close();
+        }
+      }, name("wsreconnect"));
+      expect(res.n).toBe(3);
+      expect(res.whileAttached).toBe(res.baseline + 1);
+      expect(res.open).toBe(res.baseline);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "reconnect throws on a registered socket and leaves its catalog working",
+    async () => {
+      const res = await h.page.evaluate(async (cat: string) => {
+        const t = globalThis.__n6kTest!;
+        const ws = new WebSocket(`${t.wsUrl}?catalog=${cat}`);
+        const { wsId: id } = await t.registerWebsocket(ws, "");
+        const c = await t.connect();
+        try {
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
+          let error = "";
+          try {
+            t.reconnect(cat);
+          } catch (error_) {
+            error = String(error_);
+          }
+          const r = await c.query(
+            `SELECT count(*) AS n FROM ${cat}.main.users`,
+          );
+          return { error, n: Number(r.toArray()[0]!.toJSON().n) };
+        } finally {
+          await c.query(`DETACH ${cat}`).catch(() => {});
+          await c.close();
+          ws.close();
+        }
+      }, name("wsnoreconnect"));
+      expect(res.error).toContain("replaceWebsocket");
+      expect(res.n).toBe(3);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a query on a closed registered socket fails fast, leaks no ring, and replaceWebsocket recovers",
+    async () => {
+      const res = await h.page.evaluate(async (cat: string) => {
+        const t = globalThis.__n6kTest!;
+        const baseline = await t.openRings();
+        const ws = new WebSocket(`${t.wsUrl}?catalog=${cat}`);
+        const { wsId: id } = await t.registerWebsocket(ws, "");
+        const c = await t.connect();
+        const count = async (): Promise<number> => {
+          const r = await c.query(
+            `SELECT count(*) AS n FROM ${cat}.main.users`,
+          );
+          return Number(r.toArray()[0]!.toJSON().n);
+        };
+        let ws2: WebSocket | undefined;
+        try {
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
+          await count();
+          await new Promise((resolve) => {
+            ws.addEventListener("close", resolve, { once: true });
+            ws.close();
+          });
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          const failures: { error: string; ms: number }[] = [];
+          for (let i = 0; i < 2; i++) {
+            const t0 = Date.now();
+            const error = await count().then(() => "", String);
+            failures.push({ error, ms: Date.now() - t0 });
+          }
+          const openWhileDown = await t.openRings();
+          ws2 = new WebSocket(`${t.wsUrl}?catalog=${cat}`);
+          await t.replaceWebsocket(id, ws2, "");
+          return { failures, baseline, openWhileDown, after: await count() };
+        } finally {
+          await c.query(`DETACH ${cat}`).catch(() => {});
+          await c.close();
+          ws2?.close();
+        }
+      }, name("wsclosedquery"));
+      for (const failure of res.failures) {
+        expect(failure.error).toContain("closed");
+        expect(failure.ms).toBeLessThan(3000);
+      }
+      expect(res.openWhileDown).toBeLessThanOrEqual(res.baseline);
+      expect(res.after).toBe(3);
     },
     TIMEOUT,
   );
@@ -127,7 +400,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
         };
         let ws2: WebSocket | undefined;
         try {
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
           const before = await count();
           const inflight = count().catch(() => -1);
           ws.close();
@@ -160,7 +433,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
           const ws = new WebSocket(wsUrlCatalog);
           const { wsId: id } = await t.registerWebsocket(ws, "");
           const c = await t.connect();
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
           await c.query(`SELECT id FROM ${cat}.main.users`);
           const scratch = globalThis as unknown as {
             __pushC?: unknown;
@@ -269,7 +542,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
         const { wsId: id } = await t.registerWebsocket(ws, "n6k-test-token");
         const c = await t.connect();
         try {
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
           const r = await c.query(
             `SELECT count(*) AS n FROM ${cat}.main.users`,
           );
@@ -302,7 +575,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
           return Number(r.toArray()[0]!.toJSON().n);
         };
         try {
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
           let message = "resolved";
           try {
             await t.replaceWebsocket(id, ws2, "wrong-token");
@@ -346,7 +619,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
   );
 
   test(
-    "wsId with an inline token is refused",
+    "CONNECTION with an inline token is refused",
     async () => {
       const message = await h.page.evaluate(async (cat: string) => {
         const t = globalThis.__n6kTest!;
@@ -355,7 +628,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
         const c = await t.connect();
         try {
           await c.query(
-            `ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}', token 'x')`,
+            `ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}', token 'x')`,
           );
           return "attached";
         } catch (error) {
@@ -388,8 +661,8 @@ describeCoi("registerWebsocket [browser coi]", () => {
             return String(r.toArray()[0]!.toJSON().catalog);
           };
           try {
-            await c.query(`ATTACH '' AS ${a} (TYPE n6k, wsId '${id}')`);
-            await c.query(`ATTACH '' AS ${b} (TYPE n6k, wsId '${id}')`);
+            await c.query(`ATTACH '' AS ${a} (TYPE n6k, CONNECTION '${id}')`);
+            await c.query(`ATTACH '' AS ${b} (TYPE n6k, CONNECTION '${id}')`);
             const both = [await marker(a), await marker(b)];
             await c.query(`DETACH ${a}`);
             const after = await marker(b);
@@ -450,7 +723,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
         const { wsId: id } = await t.registerWebsocket(ws, "");
         const c = await t.connect();
         try {
-          await c.query(`ATTACH '' AS ${a} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${a} (TYPE n6k, CONNECTION '${id}')`);
           const [listed, count] = await Promise.all([
             t.listCatalogs(id),
             c.query(`SELECT count(*)::INTEGER AS n FROM ${a}.main.users`),
@@ -531,7 +804,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
           }
           const c = await t.connect();
           try {
-            await c.query(`ATTACH '' AS ${b} (TYPE n6k, wsId '${id}')`);
+            await c.query(`ATTACH '' AS ${b} (TYPE n6k, CONNECTION '${id}')`);
             const r = await c.query(`SELECT catalog FROM ${b}.main.marker`);
             return {
               changes: t.catalogsChanged.filter((e) => e.wsId === id),
@@ -594,7 +867,7 @@ describeCoi("registerWebsocket [browser coi]", () => {
           const ws = new WebSocket(wsUrlCatalog);
           (globalThis as unknown as { __invWs: WebSocket }).__invWs = ws;
           const { wsId: id } = await t.registerWebsocket(ws, "");
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${id}')`);
+          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${id}')`);
         } else {
           await c.query(`ATTACH '${t.serverUrl}' AS ${cat} (TYPE n6k)`);
         }
@@ -674,8 +947,8 @@ describeCoi("registerWebsocket [browser coi]", () => {
           const { wsId: id } = await t.registerWebsocket(ws, "");
           const c = await t.connect();
           try {
-            await c.query(`ATTACH '' AS ${a} (TYPE n6k, wsId '${id}')`);
-            await c.query(`ATTACH '' AS ${b} (TYPE n6k, wsId '${id}')`);
+            await c.query(`ATTACH '' AS ${a} (TYPE n6k, CONNECTION '${id}')`);
+            await c.query(`ATTACH '' AS ${b} (TYPE n6k, CONNECTION '${id}')`);
             counting = true;
             await new Promise((r) => setTimeout(r, 1000));
             return pongs;
@@ -807,7 +1080,9 @@ describeCoi("registerWebsocket [browser coi]", () => {
         const c = await t.connect();
         const ws2 = new WebSocket(url);
         try {
-          await c.query(`ATTACH '' AS ${cat} (TYPE n6k, wsId '${s.wsId}')`);
+          await c.query(
+            `ATTACH '' AS ${cat} (TYPE n6k, CONNECTION '${s.wsId}')`,
+          );
           await t.replaceWebsocket(s.wsId, ws2, "");
           const afterReplace = await s.rpc.call("echo", { x: 1 });
           await c.query(`DETACH ${cat}`);

@@ -28,7 +28,9 @@ backendDescribe()(`open pending [${backendName}]`, () => {
     async () => {
       const cat = `slowopen_${SLOW_MS}`;
       const t0 = Date.now();
-      await handle.conn.query(`ATTACH '${URL}' AS ${cat} (TYPE n6k)`);
+      await handle.conn.query(
+        `ATTACH '${URL}?catalog=${cat}' AS ${cat} (TYPE n6k)`,
+      );
       try {
         expect(Date.now() - t0).toBeGreaterThanOrEqual(SLOW_MS);
         const r = await handle.conn.query(
@@ -47,7 +49,9 @@ backendDescribe()(`open pending [${backendName}]`, () => {
     async () => {
       const cat = `slowauth_${SLOW_MS}`;
       const t0 = Date.now();
-      await handle.conn.query(`ATTACH '${URL}' AS ${cat} (TYPE n6k)`);
+      await handle.conn.query(
+        `ATTACH '${URL}?catalog=${cat}' AS ${cat} (TYPE n6k)`,
+      );
       try {
         expect(Date.now() - t0).toBeGreaterThanOrEqual(SLOW_MS);
         const r = await handle.conn.query(
@@ -66,7 +70,7 @@ backendDescribe()(`open pending [${backendName}]`, () => {
     async () => {
       await expect(
         handle.conn.query(
-          `ATTACH '${URL}' AS slowopen_fail_${SLOW_MS} (TYPE n6k)`,
+          `ATTACH '${URL}?catalog=slowopen_fail_${SLOW_MS}' AS slowopen_fail_${SLOW_MS} (TYPE n6k)`,
         ),
       ).rejects.toThrow(/slowopen backend failed/);
     },

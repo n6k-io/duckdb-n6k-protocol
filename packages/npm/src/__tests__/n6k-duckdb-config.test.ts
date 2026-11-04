@@ -11,8 +11,8 @@ describe("N6kDuckDB sockets/databases", () => {
     ).toThrow("unknown socket 'main'");
   });
 
-  it("rejects token/wsId options on a socket-backed database", () => {
-    for (const key of ["token", "wsId"]) {
+  it("rejects token/connection options on a socket-backed database", () => {
+    for (const key of ["token", "connection"]) {
       expect(
         () =>
           new N6kDuckDB({

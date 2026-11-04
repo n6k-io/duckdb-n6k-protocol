@@ -11,7 +11,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import duckdb
@@ -87,7 +87,7 @@ _live: dict[int, _Live] = {}
 @dataclass
 class _SocketState:
     temp_dir: Optional[str] = None
-    bridge_source: Optional[duckdb.DuckDBPyConnection] = None
+    bridge_sources: list[duckdb.DuckDBPyConnection] = field(default_factory=list)
 
 
 _sockets: dict[int, _SocketState] = {}
@@ -289,9 +289,10 @@ async def debug_ws_close_all() -> dict[str, int]:
 # ── Handlers ────────────────────────────────────────────────────────────────
 
 
-def _open_con(catalog: str) -> duckdb.DuckDBPyConnection:
+def _open_con(catalog: Optional[str]) -> duckdb.DuckDBPyConnection:
+    """`catalog` None: any catalog may be opened on it later, so everything is loaded."""
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-    if catalog == SLOW_CATALOG:
+    if catalog in (None, SLOW_CATALOG):
         load_vcatprovider(con)
     load_n6k(con)
     load_n6k_server(con)
@@ -366,39 +367,26 @@ def _record_bridge(ws: WebSocket, con: duckdb.DuckDBPyConnection, catalogs: list
 
 
 async def _open_db(ws: WebSocket, **_params: str) -> AsyncIterator[duckdb.DuckDBPyConnection]:
-    catalog = ws.query_params.get("catalog")
-    if not catalog:
-        raise WsReject(code=4400, reason="missing required catalog (?catalog= query param)")
     key = id(ws)
     state = _SocketState()
     _sockets[key] = state
     try:
-        yield _open_con(catalog)
+        yield _open_con(ws.query_params.get("catalog"))
     finally:
         _sockets.pop(key, None)
         _live.pop(key, None)
-        if state.bridge_source is not None:
-            state.bridge_source.close()
+        for source in state.bridge_sources:
+            source.close()
         if state.temp_dir:
             shutil.rmtree(state.temp_dir, ignore_errors=True)
 
 
-async def _authenticate(
-    ws: WebSocket, con: duckdb.DuckDBPyConnection, token: str, mode: Optional[str] = None, **_params: str
-) -> list[ServedCatalog]:
-    if mode is not None and not (token and _credential_ok(mode, token)):
-        raise WsReject(code=4401, reason="unauthorized")
-    catalog = ws.query_params["catalog"]
-    if slowauth := _SLOWAUTH.match(catalog):
-        await asyncio.sleep(min(int(slowauth[1]), _SLOWOPEN_MAX_MS) / 1000)
-    slowopen = _slowopen(catalog)
-    if slowopen is not None:
-        _record_bridge(ws, con, [catalog])
-        return [slowopen]
-    state = _sockets[id(ws)]
-    if catalog == SQLITE_CATALOG:
+async def _seed_catalog(con: duckdb.DuckDBPyConnection, catalog: str, state: _SocketState) -> None:
+    if catalog == SQLITE_CATALOG and state.temp_dir is None:
         state.temp_dir = tempfile.mkdtemp(prefix="n6k_sqlite_")
-    state.bridge_source = _seed_into(con, catalog, state.temp_dir)
+    source = _seed_into(con, catalog, state.temp_dir)
+    if source is not None:
+        state.bridge_sources.append(source)
     # Registered here rather than in `_seed_into`: the generators run on this loop, and only an
     # async caller has one to give them. Off the loop thread, because creating the entry in a
     # provider catalog lists that provider's tables, and the provider answers on this loop.
@@ -406,16 +394,60 @@ async def _authenticate(
     if catalog != SQLITE_CATALOG:
         loop = asyncio.get_running_loop()
         await asyncio.to_thread(register_host_rpcs, con, catalog, loop)
+
+
+async def _authenticate(
+    ws: WebSocket, con: duckdb.DuckDBPyConnection, token: str, mode: Optional[str] = None, **_params: str
+) -> list[ServedCatalog]:
+    """`?catalog=` serves that catalog from HELLO on (and runs its HELLO-time hooks); without it, each
+    catalog is served when a client first opens it (`_resolve`)."""
+    if mode is not None and not (token and _credential_ok(mode, token)):
+        raise WsReject(code=4401, reason="unauthorized")
+    catalog = ws.query_params.get("catalog")
+    if not catalog:
+        return list(_record_bridge(ws, con, []))
+    if slowauth := _SLOWAUTH.match(catalog):
+        await asyncio.sleep(min(int(slowauth[1]), _SLOWOPEN_MAX_MS) / 1000)
+    slowopen = _slowopen(catalog)
+    if slowopen is not None:
+        _record_bridge(ws, con, [catalog])
+        return [slowopen]
+    await _seed_catalog(con, catalog, _sockets[id(ws)])
     return list(_record_bridge(ws, con, [catalog]))
 
 
-register(app, prefix="", connect=_open_db, authenticate=_authenticate, on_close=release_providers)
+def _on_serve(ws: WebSocket, handle: LiveServe, **_params: str) -> None:
+    live = _live.get(id(ws))
+    if live is not None:
+        live.handle = handle
+
+
+async def _resolve(handle: LiveServe, name: str) -> None:
+    # `on_serve` records the handle before the client can have sent an OPEN.
+    live = next((live for live in _live.values() if live.handle is handle), None)
+    if live is None or not name.replace("_", "").isalnum():
+        return
+    pending = _slowopen(name)
+    if pending is None:
+        state = _sockets[id(live.ws)]
+
+        async def attach(cur: duckdb.DuckDBPyConnection) -> None:
+            await _seed_catalog(cur, name, state)
+
+        pending = PendingCatalog(name, attach)
+    await handle.add_catalog(pending)
+    live.catalogs.append(name)
+
+
+register(app, prefix="", connect=_open_db, authenticate=_authenticate, on_serve=_on_serve, resolve=_resolve, on_close=release_providers)
 
 register(
     app,
     prefix="/auth",
     connect=_open_db,
     authenticate=lambda ws, con, token, **p: _authenticate(ws, con, token, "token", **p),
+    on_serve=_on_serve,
+    resolve=_resolve,
     on_close=release_providers,
 )
 
@@ -424,6 +456,8 @@ register(
     prefix="/oauth",
     connect=_open_db,
     authenticate=lambda ws, con, token, **p: _authenticate(ws, con, token, "jwt", **p),
+    on_serve=_on_serve,
+    resolve=_resolve,
     on_close=release_providers,
 )
 
@@ -465,10 +499,20 @@ async def ping_me(method: str) -> None:
 
 
 async def _welcome(ws: WebSocket, handle: LiveServe, **_: str) -> None:
+    _on_serve(ws, handle)
     await handle.connection.notify("welcome", {"ok": True})
 
 
-register(app, prefix="/rpc", connect=_open_db, authenticate=_authenticate, on_serve=_welcome, jsonrpc=rpc_api, on_close=release_providers)
+register(
+    app,
+    prefix="/rpc",
+    connect=_open_db,
+    authenticate=_authenticate,
+    on_serve=_welcome,
+    resolve=_resolve,
+    jsonrpc=rpc_api,
+    on_close=release_providers,
+)
 
 
 # ── /tuned: the same reactor, with per-connection knobs ─────────────────────

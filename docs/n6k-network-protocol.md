@@ -191,9 +191,9 @@ This exists because a run-time `NotImplementedException` is too late for some
 clients. The DuckDB driver's crossing optimizer rewrites the query
 plan *before* any request is sent and cannot fall back once it has, so it must
 know the answer at planning time. Capability is read per attached catalog, since
-one client can hold several n6k connections of different vintages. On a
-host-owned socket (`wsFd` / `wsId`) the socket owner sent HELLO, so it hands the
-`HELLO_ACK` capabilities to each catalog that rides the socket.
+one client can hold several n6k connections of different vintages. A
+connection's owner (the client's hub, or a host that registered its socket) sends
+HELLO, and hands the `HELLO_ACK` capabilities to each catalog that rides it.
 
 ## PUSH ops
 
@@ -304,8 +304,8 @@ The client uses `{schema, name}` as the table identity on subsequent
    still sends its own frames and terminal frame, so the client sees that
    `req_id` end twice.
 8. **Drop.** Either side closing fails all in-flight `req_id`s with a
-   transport error. The client must re-ATTACH — session resume is not
-   supported.
+   transport error. The client must `OPEN` its sessions again on a new socket —
+   session resume is not supported.
 
 ### Sessions
 
@@ -319,9 +319,10 @@ fails only its own session. `PING`/`PONG` stay connection-scoped and are never
 session without touching the socket.
 
 The native `n6k_server` extension serves this shape
-([`n6k-server.md`](n6k-server.md#sessions-ns)). On the client side, a native
-`wsFd` may be shared across several `ATTACH`es; a hub owns the fd and
-demultiplexes inbound frames by `ns` ([`n6k-network.md`](n6k-network.md)).
+([`n6k-server.md`](n6k-server.md#sessions-ns)). On the client side, one
+connection may be shared across several `ATTACH`es; it
+demultiplexes inbound frames by `ns` and answers `PING` itself
+([`n6k-network.md`](n6k-network.md#shared-connections)).
 
 ## Text frames
 
@@ -361,6 +362,6 @@ server. See [`n6k-network.md`](n6k-network.md).
 ## See also
 
 - [`n6k-network.md`](n6k-network.md) — the SQL / host-integration side: `ATTACH`,
-  authentication, `wsId`/`wsFd`, and the function registry.
+  authentication, shared connections, and the function registry.
 - [`n6k-conformance.md`](n6k-conformance.md) — what a server must provide *beyond*
   this protocol to be driven by the test suites, and how to register it as a target.

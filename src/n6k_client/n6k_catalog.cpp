@@ -14,6 +14,11 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 
+#ifdef WASM_LOADABLE_EXTENSIONS
+#include "n6k_str_utils.hpp"
+#include "n6k_wasm_main_thread.hpp"
+#endif
+
 namespace duckdb {
 
 N6kCatalog::N6kCatalog(AttachedDatabase &db, string base_url_p, std::shared_ptr<CatalogSession> session_p)
@@ -49,6 +54,15 @@ void N6kCatalog::HandlePushInvalidate(const std::string &body) {
 		return;
 	}
 	InvalidateSchemas(schema_names);
+#ifdef WASM_LOADABLE_EXTENSIONS
+	// After the refresh, so whatever the host refetches on this notice sees it.
+	string joined;
+	for (auto &name : schema_names) {
+		joined += (joined.empty() ? "" : ",") + name;
+	}
+	n6k::RunScriptOnMainAsync("n6k.invalidated('" + n6k::EscapeSingleQuotedJsLiteral(GetName()) + "', '" +
+	                          n6k::EscapeSingleQuotedJsLiteral(joined) + "')");
+#endif
 }
 
 void N6kCatalog::InvalidateSchemas(const std::vector<std::string> &schema_names) {

@@ -1,9 +1,9 @@
-// `n6k_selftest_open_ns_distinct()` — pins the handshake a native dial ATTACH puts on the wire: one
-// FT_HELLO carrying no `ns`, then an FT_OPEN with a nonzero `ns` distinct per attach (a shared wsFd puts
-// several attaches on one socket, where a repeated ns is refused as a duplicate).
+// `n6k_selftest_open_ns_distinct()` — pins what two `ATTACH 'n6k://…'` of one URL put on the wire: they share
+// one connection, so one FT_HELLO carrying no `ns`, then an FT_OPEN per attach with a nonzero `ns` distinct from
+// the other's (a repeated ns on one socket is refused as a duplicate).
 //
-// Drives the REAL CatalogSession::Create against an in-process ix::WebSocketServer that answers
-// HELLO_ACK and OPEN_ACK so Connect() returns immediately instead of burning its timeout.
+// Runs the REAL ATTACH against an in-process ix::WebSocketServer that answers HELLO_ACK and OPEN_ACK so the
+// ATTACH returns immediately instead of burning its timeout.
 //
 // Two build regimes:
 //   - native (!WASM_LOADABLE_EXTENSIONS): the real dial path.
@@ -11,13 +11,14 @@
 
 #include "open_ns_selftest.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <string>
 
 #ifndef WASM_LOADABLE_EXTENSIONS
-#include "n6k_catalog_session.hpp"
+#include "duckdb/main/connection.hpp"
 #include "n6k_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
 
@@ -89,7 +90,7 @@ int CandidateBasePort() {
 	return 41000 + static_cast<int>(tid % 2000);
 }
 
-OpenNsResult RunOpenNsSelftest() {
+OpenNsResult RunOpenNsSelftest(DatabaseInstance &db) {
 	OpenNsResult r;
 	r.mode = "native";
 	const auto t0 = std::chrono::steady_clock::now();
@@ -166,17 +167,12 @@ OpenNsResult RunOpenNsSelftest() {
 		return r;
 	}
 
-	const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-	// Hold the sessions so neither is torn down (and its ns conceptually released) before the second
-	// attach runs — two live attaches is exactly the case a shared socket has to keep apart.
-	std::vector<std::shared_ptr<CatalogSession>> sessions;
+	// Both stay attached until the end: two live attaches is exactly the case a shared socket has to keep apart.
+	Connection con(db);
 	for (int i = 0; i < kAttachCount; ++i) {
-		try {
-			sessions.push_back(CatalogSession::Create(base_url, /*token=*/"", "nstest" + std::to_string(i), "", "", -1,
-			                                          StreamCancelCheck()));
-		} catch (...) {
-			// Connect failure is reported through hellos_seen/ok below, not swallowed silently.
-		}
+		// A failed ATTACH is reported through hellos_seen/ok below.
+		con.Query("ATTACH 'n6k://127.0.0.1:" + std::to_string(port) + "' AS nstest" + std::to_string(i) +
+		          " (TYPE n6k, ANONYMOUS true)");
 	}
 
 	{
@@ -194,18 +190,20 @@ OpenNsResult RunOpenNsSelftest() {
 		r.distinct = ns_values.size() == kAttachCount && ns_values[0] != ns_values[1];
 	}
 
-	sessions.clear();
+	for (int i = 0; i < kAttachCount; ++i) {
+		con.Query("DETACH nstest" + std::to_string(i));
+	}
 	server->stop();
 
-	r.ok = r.listening && r.hellos_seen == kAttachCount && r.hello_has_no_ns && r.opens_seen == kAttachCount &&
-	       r.ns_present && r.ns_first != 0 && r.ns_second != 0 && r.distinct;
+	r.ok = r.listening && r.hellos_seen == 1 && r.hello_has_no_ns && r.opens_seen == kAttachCount && r.ns_present &&
+	       r.ns_first != 0 && r.ns_second != 0 && r.distinct;
 	stamp();
 	return r;
 }
 
 #else
 
-OpenNsResult RunOpenNsSelftest() {
+OpenNsResult RunOpenNsSelftest(DatabaseInstance &) {
 	OpenNsResult r;
 	r.mode = "wasm_no_ix";
 	r.ok = true;
@@ -234,7 +232,7 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 	return make_uniq<N6kOpenNsState>();
 }
 
-void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kOpenNsState>();
 	if (state.emitted) {
 		output.SetCardinality(0);
@@ -242,7 +240,7 @@ void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	}
 	state.emitted = true;
 
-	const OpenNsResult r = RunOpenNsSelftest();
+	const OpenNsResult r = RunOpenNsSelftest(DatabaseInstance::GetDatabase(context));
 	output.SetValue(0, 0, Value(r.mode));
 	output.SetValue(1, 0, Value::BOOLEAN(r.ok));
 	output.SetValue(2, 0, Value::BOOLEAN(r.listening));

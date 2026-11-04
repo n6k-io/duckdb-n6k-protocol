@@ -1,14 +1,14 @@
 #pragma once
 
 // The single shared n6k I/O thread: ONE process-global consumer pthread that drains every
-// attached catalog's RX ring (ring1) in duckdb's shared wasm heap. It parks on one standalone
+// open transport's RX ring (ring1) in duckdb's shared wasm heap. It parks on one standalone
 // doorbell int32 (rung by every pump after it publishes an inbound frame) and, when woken, drains
 // all registered rings and delivers each frame via that channel's callback. Collapsing to one
 // thread keeps n6k's emscripten-pool cost at 1 regardless of catalog count, which is what makes
 // threads>1 viable with multiple catalogs.
 //
 // Lifecycle: a lazily-started singleton (first Instance()), torn down at static destruction. A
-// reactor Registers its channel in Start and Unregisters in Stop/RetireKeepingChannelOpen. Unregister
+// VsockTransport Registers its channel in Start and Unregisters in Stop. Unregister
 // BLOCKS on a quiesce handshake — the I/O thread acks once it has re-snapshotted without the channel
 // and will never touch that ring again — the barrier that gates ring Close + the JS free chain.
 
@@ -36,15 +36,15 @@ public:
 	using ProgressFn = std::function<void()>;
 	using CloseFn = std::function<void(const char *)>;
 
-	// One registered channel's plumbing. The reactor owns the callbacks' targets and keeps the
-	// registration alive (via Unregister's quiesce) until the I/O thread is provably off the rings.
+	// One registered channel's plumbing. The callbacks' targets must stay valid until
+	// UnregisterAndAwaitQuiesce returns, after which the I/O thread is provably off the rings.
 	struct Registration {
 		VsockRing ring0;       // TX (duckdb->ws); the I/O thread is its sole producer (SPSC)
 		VsockRing ring1;       // RX (ws->duckdb); the I/O thread is its sole consumer (SPSC)
-		uint64_t pinned_epoch; // retire this registration if the ring's epoch moves past it
+		uint64_t pinned_epoch; // retire this registration if the ring's epoch moves; nothing writes the epoch
 		FrameFn on_frame;
-		ProgressFn on_progress; // wake the reactor's HELLO/ready gate after a delivery/close
-		CloseFn on_close;       // fired once on -3 (closed), an epoch move (host reset) or a channel fault
+		ProgressFn on_progress;
+		CloseFn on_close; // fired once on -3 (closed), an epoch move or a channel fault
 	};
 
 	static N6kIoThread &Instance();
@@ -76,7 +76,7 @@ private:
 		Registration reg;
 		bool retiring = false;    // Unregister requested; exclude from the next snapshot, then ack
 		bool quiesced = false;    // I/O thread's ack that it re-snapshotted without this channel
-		bool defunct = false;     // closed/reset; skip draining until the reactor Unregisters
+		bool defunct = false;     // retired; skip draining until the transport Unregisters
 		bool close_fired = false; // on_close fires at most once per registration
 
 		// Outbound frames awaiting ring0. Producers (compute threads / the I/O thread's own PONGs)

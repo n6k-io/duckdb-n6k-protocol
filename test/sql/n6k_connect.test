@@ -1,5 +1,5 @@
 # name: test/sql/n6k_connect.test
-# description: binder contract for n6k_connect
+# description: binder contract for n6k_connect and the functions taking its connection_id
 # group: [sql]
 
 require n6k_client
@@ -7,7 +7,27 @@ require n6k_client
 statement error
 SELECT * FROM n6k_connect(token => 'x');
 ----
-requires wsFd
+requires exactly one of url or wsFd
+
+statement error
+SELECT * FROM n6k_connect(url => 'n6k://localhost:1', wsFd => 7, token => 'x');
+----
+requires exactly one of url or wsFd
+
+statement error
+SELECT * FROM n6k_connect(url => 'http://localhost:1');
+----
+url must be n6k://
+
+statement error
+SELECT * FROM n6k_connect(url => 'n6k:///prefix');
+----
+names no host
+
+statement error
+SELECT * FROM n6k_connect(url => 'n6k://?catalog=db');
+----
+names no host
 
 statement error
 SELECT * FROM n6k_connect(wsFd => -1);
@@ -33,3 +53,58 @@ statement error
 SELECT * FROM n6k_connect(wsFd => 7, scope => NULL);
 ----
 scope must not be NULL
+
+statement error
+SELECT * FROM n6k_connect(wsFd => 7, token => 'x', on_text => '');
+----
+on_text must name a scalar function
+
+query I
+SELECT count(*) FROM n6k_connections();
+----
+0
+
+statement error
+SELECT * FROM n6k_disconnect('00000000-0000-4000-8000-000000000001'::UUID);
+----
+no open connection
+
+statement error
+SELECT * FROM n6k_send_text('00000000-0000-4000-8000-000000000001'::UUID, '{}');
+----
+no open connection
+
+statement error
+SELECT * FROM n6k_disconnect('00000000-0000-4000-8000-000000000001');
+----
+no open connection
+
+statement error
+SELECT * FROM n6k_disconnect('not-a-uuid');
+----
+is not a connection id
+
+statement error
+SELECT * FROM n6k_reconnect('00000000-0000-4000-8000-000000000001');
+----
+no open connection
+
+statement error
+ATTACH '' AS x (TYPE n6k, CONNECTION '00000000-0000-4000-8000-000000000001');
+----
+no open connection
+
+statement error
+ATTACH '' AS x (TYPE n6k, CONNECTION 'not-a-uuid');
+----
+is not a connection id
+
+statement error
+ATTACH 'n6k://localhost:1' AS x (TYPE n6k, CONNECTION '00000000-0000-4000-8000-000000000001');
+----
+mutually exclusive
+
+statement error
+ATTACH '' AS x (TYPE n6k, wsFd 7);
+----
+the 'wsFd' option is gone

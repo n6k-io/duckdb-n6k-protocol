@@ -16,8 +16,8 @@ DuckDB extensions for remote and in-process data access.
 - INSERT, UPDATE, DELETE, CREATE TABLE AS, views
 - RPC table functions with dynamic binding
 - WASM/browser support (Emscripten)
-- Attach onto a WebSocket the host app already opened (browser): `await registerWebsocket(ws, token)` (sends the socket's one HELLO) then `ATTACH '' AS db (TYPE n6k, wsId '…')` (sends OPEN); see [n6k-network.md](docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser)
-- Attach onto a connected socket fd the host owns (native): `SELECT * FROM n6k_connect(wsFd => <fileno>, token => '…')` then `ATTACH '' AS db (TYPE n6k, wsFd <fileno>)` — the fd-level analogue of `wsId`, see [n6k-network.md](docs/n6k-network.md#attaching-an-existing-socket-fd-native)
+- Attach onto a WebSocket the host app already opened (browser): `await registerWebsocket(ws, token)` (sends the socket's one HELLO) then `ATTACH '' AS db (TYPE n6k, CONNECTION '<wsId>')` (sends OPEN); see [n6k-network.md](docs/n6k-network.md#attaching-an-existing-websocket-wasmbrowser)
+- One connection across catalogs: every `ATTACH 'n6k://host:port'` with one token shares a socket, closed at the last DETACH. Native can also hold one open itself: `SELECT connection_id FROM n6k_connect(url => 'n6k://host:port')` (or `wsFd => <fileno>, token => '…'` for a socket the host owns) then `ATTACH '' AS db (TYPE n6k, CONNECTION '<id>')`, see [n6k-network.md](docs/n6k-network.md#shared-connections)
 
 The in-process bridge and provider catalogs (`vcatbridge`,
 `vcatprovider`) live in the sibling `duckdb-virtual-catalog` repo. The
@@ -61,6 +61,9 @@ For OAuth deployments, a `TYPE n6k_refresh` secret (native only) holds a durable
 subject token and auto-mints/renews short-lived data-service JWTs via standard
 OAuth discovery + RFC 8693 token exchange — see
 [n6k-network.md](docs/n6k-network.md#oauth-standards-based-native).
+The secret can instead hold a `REFRESH_TOKEN`, `TOKEN_ENDPOINT` and `CLIENT_ID` to
+use the OAuth refresh-token grant; see [docs/n6k-network.md](docs/n6k-network.md).
+
 `n6k_login` runs the interactive device flow and stores that secret for you:
 
 ```sql
@@ -167,7 +170,7 @@ bun run ci  # prettier + eslint + tsc + test
 
 ## Docs
 
-- [n6k-network.md](docs/n6k-network.md) — `TYPE n6k` network extension: `ATTACH`, auth/secrets, `wsId`/`wsFd`, function registry.
+- [n6k-network.md](docs/n6k-network.md) — `TYPE n6k` network extension: `ATTACH`, auth/secrets, shared connections, function registry.
 - [n6k-network-protocol.md](docs/n6k-network-protocol.md) — the on-the-wire protocol for `TYPE n6k` (frame format, ops, lifecycle).
 - [n6k-server.md](docs/n6k-server.md) — the `n6k_server` extension.
 - [n6k-conformance.md](docs/n6k-conformance.md) — the conformance harness.
