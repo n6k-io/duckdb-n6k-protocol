@@ -452,7 +452,7 @@ struct N6kOpenPendingState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"mode", "ok", "connected", "error", "pendings_sent", "elapsed_ms"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BIGINT};

@@ -23,7 +23,7 @@ namespace duckdb {
 
 N6kCatalog::N6kCatalog(AttachedDatabase &db, string base_url_p, std::shared_ptr<CatalogSession> session_p)
     : Catalog(db), base_url(std::move(base_url_p)), session(std::move(session_p)),
-      attach(db, Crossing<N6kSource>::Adapt(make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName()))) {
+      attach(db, Crossing<N6kSource>::Adapt(make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName().GetIdentifierName()))) {
 	session->SetPushHandler([this](uint8_t op, const std::string &body) {
 		if (op == n6k::OP_CATALOG_INVALIDATED) {
 			HandlePushInvalidate(body);
@@ -60,7 +60,7 @@ void N6kCatalog::HandlePushInvalidate(const std::string &body) {
 	for (auto &name : schema_names) {
 		joined += (joined.empty() ? "" : ",") + name;
 	}
-	n6k::RunScriptOnMainAsync("n6k.invalidated('" + n6k::EscapeSingleQuotedJsLiteral(GetName()) + "', '" +
+	n6k::RunScriptOnMainAsync("n6k.invalidated('" + n6k::EscapeSingleQuotedJsLiteral(GetName().GetIdentifierName()) + "', '" +
 	                          n6k::EscapeSingleQuotedJsLiteral(joined) + "')");
 #endif
 }
@@ -86,7 +86,7 @@ N6kSchemaEntry &N6kCatalog::GetOrCreateSchema(CatalogTransaction transaction, co
 	}
 
 	CreateSchemaInfo info;
-	info.schema = schema_name;
+	info.SetQualifiedName(QualifiedName(GetName(), Identifier(schema_name), Identifier()));
 	auto schema_entry = make_uniq<N6kSchemaEntry>(*this, info, session);
 	auto &result = *schema_entry;
 	schemas[schema_name] = std::move(schema_entry);
@@ -108,17 +108,18 @@ void N6kCatalog::LoadSchemasOnce() {
 }
 
 optional_ptr<CatalogEntry> N6kCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+	auto &schema_name = info.GetQualifiedName().Schema().GetIdentifierName();
 	lock_guard<mutex> lock(schemas_lock);
-	auto it = schemas.find(info.schema);
+	auto it = schemas.find(schema_name);
 	if (it != schemas.end()) {
 		if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 			return it->second.get();
 		}
-		throw CatalogException("Schema '%s' already exists", info.schema);
+		throw CatalogException("Schema '%s' already exists", schema_name);
 	}
 	auto schema_entry = make_uniq<N6kSchemaEntry>(*this, info, session);
 	auto result = schema_entry.get();
-	schemas[info.schema] = std::move(schema_entry);
+	schemas[schema_name] = std::move(schema_entry);
 	return result;
 }
 

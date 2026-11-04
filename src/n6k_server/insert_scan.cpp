@@ -117,7 +117,7 @@ struct InsertScanData : public ArrowScanFunctionData {
 } // namespace
 
 static unique_ptr<FunctionData> InsertScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto *bytes = reinterpret_cast<InsertArrowBytes *>(input.inputs[0].GetPointer());
 
 	// Decode twice: one stream feeds the scan, the other yields the schema for bind.
@@ -136,7 +136,9 @@ static unique_ptr<FunctionData> InsertScanBind(ClientContext &context, TableFunc
 		throw InvalidInputException("n6k_server: malformed Arrow IPC insert payload (schema unreadable)");
 	}
 	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, result->schema_root.arrow_schema);
-	names = result->arrow_table.GetNames();
+	for (auto &column_name : result->arrow_table.GetNames()) {
+		names.emplace_back(column_name);
+	}
 	return_types = result->arrow_table.GetTypes();
 	result->all_types = return_types;
 	return std::move(result);

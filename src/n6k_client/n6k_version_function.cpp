@@ -18,7 +18,7 @@ struct N6kVersionState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> N6kVersionBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.push_back("component");
 	names.push_back("version");
 	return_types.push_back(LogicalType::VARCHAR);

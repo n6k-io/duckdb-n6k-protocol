@@ -64,7 +64,7 @@ static void HandleSchemaList(ServeReactor &reactor, Connection &conn, const std:
 	vector<string> schemas;
 	// Direct catalog introspection needs an active transaction (unlike SendQuery).
 	conn.context->RunFunctionInTransaction([&]() {
-		auto &cat = Catalog::GetCatalog(*conn.context, catalog);
+		auto &cat = Catalog::GetCatalog(*conn.context, Identifier(catalog));
 		ListCatalogSchemas(*conn.context, cat, schemas);
 	});
 
@@ -175,7 +175,7 @@ static void HandleTablesList(ServeReactor &reactor, Connection &own, const Sessi
 	vector<TablePermissionRow> rows;
 	vector<SchemaPermissionRow> schemas;
 	conn.context->RunFunctionInTransaction([&]() {
-		auto &cat = Catalog::GetCatalog(*conn.context, catalog);
+		auto &cat = Catalog::GetCatalog(*conn.context, Identifier(catalog));
 		// Dispatching, not the plain collector: a bridge- or provider-backed catalog registers its own
 		// and knows what the catalog metadata cannot express — whether a bridged table is writeable,
 		// and the primary key that survived the hop. Falls back to plain classification otherwise.
@@ -410,7 +410,11 @@ static void HandleTableSchema(ServeReactor &reactor, Connection &own, const Sess
 	if (result->HasError()) {
 		result->ThrowError();
 	}
-	ArrowIpcStreamEncoder enc(*conn.context, result->types, result->names);
+	vector<string> column_names;
+	for (auto &column_name : result->names) {
+		column_names.push_back(column_name.GetIdentifierName());
+	}
+	ArrowIpcStreamEncoder enc(*conn.context, result->types, column_names);
 	reactor.SendForRequest(slot, PackRespSchema(target, enc.SchemaMessage()));
 	reactor.EndRequest(slot, PackRespEnd(target));
 }
@@ -517,7 +521,7 @@ static void HandleCreateView(ServeReactor &reactor, Connection &own, const Sessi
 	auto scope = ConnectionFor(reactor, own, sess, root);
 	auto &conn = *scope.conn;
 
-	auto info = make_uniq<CreateViewInfo>(sess.catalog, schema, name);
+	auto info = make_uniq<CreateViewInfo>(QualifiedName(Identifier(sess.catalog), Identifier(schema), Identifier(name)));
 	info->query = DecodeSubstraitView(conn, sess.catalog, plan, names, PlanCatalogCheck(reactor, slot));
 	info->on_conflict = on_conflict;
 	auto statement = make_uniq<CreateStatement>();
@@ -547,9 +551,7 @@ static void HandleDropView(ServeReactor &reactor, Connection &own, const Session
 
 	auto statement = make_uniq<DropStatement>();
 	statement->info->type = CatalogType::VIEW_ENTRY;
-	statement->info->catalog = sess.catalog;
-	statement->info->schema = schema;
-	statement->info->name = name;
+	statement->info->SetQualifiedName(Identifier(sess.catalog), Identifier(schema), Identifier(name));
 	statement->info->if_not_found =
 	    JsonGetBool(root, "if_exists") ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
 	auto result = conn.Query(std::move(statement));
@@ -749,10 +751,10 @@ static RpcTarget ResolveRpcTarget(Connection &conn, const std::string &catalog, 
 	conn.context->RunFunctionInTransaction([&]() {
 		// One lookup, not one per kind: TABLE_MACRO_ENTRY and TABLE_FUNCTION_ENTRY resolve from the
 		// same catalog set, so asking for either returns whichever is there. Classify after.
-		EntryLookupInfo fn_lookup(CatalogType::TABLE_FUNCTION_ENTRY, function);
-
-		auto &cat = Catalog::GetCatalog(*conn.context, catalog);
-		if (auto local = cat.GetEntry(*conn.context, schema, fn_lookup, OnEntryNotFound::RETURN_NULL)) {
+		(void)Catalog::GetCatalog(*conn.context, Identifier(catalog));
+		EntryLookupInfo local_lookup(CatalogType::TABLE_FUNCTION_ENTRY,
+		                             QualifiedName(Identifier(catalog), Identifier(schema), Identifier(function)));
+		if (auto local = Catalog::GetEntry(*conn.context, local_lookup, OnEntryNotFound::RETURN_NULL)) {
 			target.catalog = catalog;
 			// A macro cannot declare a table parameter at all; only a real table function has a
 			// shape worth inspecting.
@@ -764,8 +766,9 @@ static RpcTarget ResolveRpcTarget(Connection &conn, const std::string &catalog, 
 		}
 		// Not in the served catalog: fall back to the bare name, where an extension's table functions
 		// live. Looked up purely to learn its shape.
-		auto global_fn =
-		    Catalog::GetEntry(*conn.context, SYSTEM_CATALOG, DEFAULT_SCHEMA, fn_lookup, OnEntryNotFound::RETURN_NULL);
+		EntryLookupInfo global_lookup(CatalogType::TABLE_FUNCTION_ENTRY,
+		                              QualifiedName(SYSTEM_CATALOG, DEFAULT_SCHEMA, Identifier(function)));
+		auto global_fn = Catalog::GetEntry(*conn.context, global_lookup, OnEntryNotFound::RETURN_NULL);
 		if (global_fn && global_fn->type == CatalogType::TABLE_FUNCTION_ENTRY) {
 			target.takes_table_arg = DeclaresTableArg(*global_fn);
 		}

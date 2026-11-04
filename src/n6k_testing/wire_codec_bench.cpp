@@ -41,7 +41,9 @@ Rows Materialize(DatabaseInstance &db, const string &sql) {
 	}
 	Rows rows;
 	rows.types = result->types;
-	rows.names = result->names;
+	for (auto &column_name : result->names) {
+		rows.names.push_back(column_name.GetIdentifierName());
+	}
 	while (auto chunk = result->Fetch()) {
 		if (chunk->size() == 0) {
 			break;
@@ -196,7 +198,7 @@ struct BenchState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	auto bind = make_uniq<BenchBind>();
 	bind->sql = input.inputs[0].GetValue<string>();
 	auto reps = input.named_parameters.find("reps");

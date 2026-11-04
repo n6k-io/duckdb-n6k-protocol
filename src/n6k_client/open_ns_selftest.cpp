@@ -219,7 +219,7 @@ struct N6kOpenNsState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"mode",       "ok",       "listening", "hellos_seen", "hello_has_no_ns", "opens_seen",
 	         "ns_present", "ns_first", "ns_second", "ns_distinct", "elapsed_ms"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::INTEGER,

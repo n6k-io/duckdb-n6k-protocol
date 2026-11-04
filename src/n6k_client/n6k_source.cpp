@@ -729,14 +729,14 @@ void N6kSession::Ddl(ClientContext &context, const CrossingDdl &ddl) {
 	if (ddl.verb == CrossingVerb::CREATE && ddl.plan) {
 		auto &view = ddl.create->Cast<CreateViewInfo>();
 		session->RunOp(n6k::OP_CREATE_VIEW,
-		               n6k_body::CreateView(ddl.schema, view.view_name, OnConflictName(view.on_conflict),
+		               n6k_body::CreateView(ddl.schema, view.GetViewName().GetIdentifierName(), OnConflictName(view.on_conflict),
 		                                    CrossingViewColumnNames(view), RenderCrossingPlan(*ddl.plan), Txn()),
 		               cancel);
 		return;
 	}
 	if (ddl.verb == CrossingVerb::DROP && ddl.drop->type == CatalogType::VIEW_ENTRY) {
 		session->RunOp(n6k::OP_DROP_VIEW,
-		               n6k_body::DropView(ddl.schema, ddl.drop->name,
+		               n6k_body::DropView(ddl.schema, ddl.drop->GetQualifiedName().Name().GetIdentifierName(),
 		                                  ddl.drop->if_not_found == OnEntryNotFound::RETURN_NULL, Txn()),
 		               cancel);
 		return;

@@ -57,7 +57,7 @@ optional_ptr<CatalogEntry> N6kSchemaEntry::LookupEntry(CatalogTransaction transa
 
 	if (entry_type == CatalogType::TABLE_ENTRY || entry_type == CatalogType::VIEW_ENTRY) {
 		session->MarkDisconnectedIfConnectionReplaced();
-		return Attach().LookupTable(name, *this, entry_name, transaction.transaction);
+		return Attach().LookupTable(name.GetIdentifierName(), *this, entry_name, transaction.transaction);
 	}
 	if (entry_type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		return GetOrCreateTableFunctionEntry(transaction, entry_name);
@@ -95,7 +95,7 @@ void N6kSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	if (type == CatalogType::TABLE_ENTRY) {
 		session->MarkDisconnectedIfConnectionReplaced();
 		case_insensitive_set_t seen;
-		Attach().ScanTables(name, *this, seen, callback, &Transaction::Get(context, catalog));
+		Attach().ScanTables(name.GetIdentifierName(), *this, seen, callback, &Transaction::Get(context, catalog));
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		lock_guard<mutex> lock(table_functions_lock);
@@ -108,7 +108,7 @@ void N6kSchemaEntry::Scan(ClientContext &context, CatalogType type,
 void N6kSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
 	if (type == CatalogType::TABLE_ENTRY) {
 		case_insensitive_set_t seen;
-		Attach().ScanTables(name, *this, seen, callback, nullptr);
+		Attach().ScanTables(name.GetIdentifierName(), *this, seen, callback, nullptr);
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		lock_guard<mutex> lock(table_functions_lock);
@@ -134,9 +134,11 @@ optional_ptr<CatalogEntry> N6kSchemaEntry::CreateTable(CatalogTransaction transa
 	}
 	auto columns_json = n6k::SerializeJsonDocAndFree(doc);
 
-	session->CreateTable(name, create_info.table, columns_json, InterruptCheckOf(transaction));
-	Attach().Refresh(name);
-	return Attach().LookupTable(name, *this, create_info.table, transaction.transaction);
+	auto &schema_name = name.GetIdentifierName();
+	auto &table_name = create_info.GetTableName().GetIdentifierName();
+	session->CreateTable(schema_name, table_name, columns_json, InterruptCheckOf(transaction));
+	Attach().Refresh(schema_name);
+	return Attach().LookupTable(schema_name, *this, table_name, transaction.transaction);
 }
 
 optional_ptr<CatalogEntry> N6kSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
@@ -186,8 +188,8 @@ void N6kSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	if (info.type == CatalogType::VIEW_ENTRY) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::DROP;
-		ddl.schema = name;
-		ddl.table = info.name;
+		ddl.schema = name.GetIdentifierName();
+		ddl.table = info.GetQualifiedName().Name().GetIdentifierName();
 		ddl.drop = &info;
 		Attach().Ddl(context, Transaction::Get(context, catalog), *this, ddl);
 		return;
@@ -236,8 +238,10 @@ void N6kSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	}
 	auto details_json = n6k::SerializeJsonDocAndFree(doc);
 
-	session->AlterTable(alter.schema, alter.name, kind, details_json, InterruptCheckOf(transaction));
-	Attach().Refresh(name);
+	auto &qualified = alter.GetQualifiedName();
+	session->AlterTable(qualified.Schema().GetIdentifierName(), qualified.Name().GetIdentifierName(), kind, details_json,
+	                    InterruptCheckOf(transaction));
+	Attach().Refresh(name.GetIdentifierName());
 }
 
 } // namespace duckdb

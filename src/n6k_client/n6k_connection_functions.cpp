@@ -69,7 +69,7 @@ static std::shared_ptr<n6k::ConnectionHub> FindOrThrow(ClientContext &context, c
 #endif
 
 unique_ptr<FunctionData> DisconnectBind(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"disconnected"};
 	return_types = {LogicalType::BOOLEAN};
 	n6k::ThrowIfServed(context, DISCONNECT_FN_NAME);
@@ -101,7 +101,7 @@ void DisconnectScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 }
 
 unique_ptr<FunctionData> ReconnectBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"capabilities"};
 	return_types = {LogicalType::LIST(LogicalType::VARCHAR)};
 	n6k::ThrowIfServed(context, RECONNECT_FN_NAME);
@@ -133,7 +133,7 @@ void ReconnectScan(ClientContext &context, TableFunctionInput &data_p, DataChunk
 }
 
 unique_ptr<FunctionData> SendTextBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"sent"};
 	return_types = {LogicalType::BOOLEAN};
 	n6k::ThrowIfServed(context, SEND_TEXT_FN_NAME);
@@ -173,7 +173,7 @@ struct ConnectionsState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ConnectionsBind(ClientContext &context, TableFunctionBindInput &,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"connection_id", "alive", "capabilities", "catalogs", "leases"};
 	return_types = {LogicalType::UUID, LogicalType::BOOLEAN, LogicalType::LIST(LogicalType::VARCHAR),
 	                LogicalType::BIGINT, LogicalType::BIGINT};

@@ -16,7 +16,7 @@ static void CollectRemoteTablePermissionRows(ClientContext &context, N6kCatalog 
                                              optional_ptr<const string> table_filter, vector<TablePermissionRow> &out) {
 	vector<reference<SchemaCatalogEntry>> schemas;
 	catalog.ScanSchemas(context, [&](SchemaCatalogEntry &s) {
-		if (schema_filter && !StringUtil::CIEquals(s.name, *schema_filter)) {
+		if (schema_filter && !StringUtil::CIEquals(s.name.GetIdentifierName(), *schema_filter)) {
 			return;
 		}
 		schemas.push_back(s);
@@ -25,13 +25,13 @@ static void CollectRemoteTablePermissionRows(ClientContext &context, N6kCatalog 
 	auto &source = catalog.Source();
 	auto &transaction = Transaction::Get(context, catalog);
 	for (auto &sref : schemas) {
-		auto &s = sref.get();
-		for (auto &table_name : attach.Tables(s.name, &transaction)) {
+		auto &schema_name = sref.get().name.GetIdentifierName();
+		for (auto &table_name : attach.Tables(schema_name, &transaction)) {
 			if (table_filter && !StringUtil::CIEquals(table_name, *table_filter)) {
 				continue;
 			}
-			auto info = source.Info(s.name, table_name);
-			out.push_back({s.name, table_name, "n6k_remote", info.verbs, info.primary_keys});
+			auto info = source.Info(schema_name, table_name);
+			out.push_back({schema_name, table_name, "n6k_remote", info.verbs, info.primary_keys});
 		}
 	}
 }

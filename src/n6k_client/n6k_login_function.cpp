@@ -152,7 +152,7 @@ static unique_ptr<FunctionData> RunDeviceLoginAndStoreRefreshSecret(ClientContex
 #endif // !WASM_LOADABLE_EXTENSIONS
 
 static unique_ptr<FunctionData> N6kLoginBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("status");
 	names.emplace_back("detail");
 	return_types.emplace_back(LogicalType::VARCHAR);

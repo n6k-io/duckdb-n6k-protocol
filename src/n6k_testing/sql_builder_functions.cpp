@@ -48,7 +48,7 @@ void RunRowWise(DataChunk &args, Vector &result, BUILD build) {
 		args.data[c].Flatten(count);
 	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 
 	std::vector<std::string> row(arity);
 	for (idx_t i = 0; i < count; i++) {

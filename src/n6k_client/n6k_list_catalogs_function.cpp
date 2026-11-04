@@ -120,7 +120,7 @@ static vector<string> ListCatalogs(ClientContext &context, const hugeint_t &conn
 #endif
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"catalog_name"};
 	return_types = {LogicalType::VARCHAR};
 	n6k::ThrowIfServed(context, FN_NAME);

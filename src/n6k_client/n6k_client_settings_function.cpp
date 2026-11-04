@@ -22,7 +22,7 @@ N6kSource &SourceOf(ClientContext &context, const string &db_name, const string 
 	if (!StringUtil::CIEquals(setting, CROSSING_SETTING)) {
 		throw InvalidInputException("%s: unknown setting \"%s\"; expected crossing", fn_name, setting);
 	}
-	auto &catalog = Catalog::GetCatalog(context, db_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(db_name));
 	if (catalog.GetCatalogType() != "n6k") {
 		throw InvalidInputException("%s: \"%s\" is not an n6k database", fn_name, db_name);
 	}
@@ -30,7 +30,7 @@ N6kSource &SourceOf(ClientContext &context, const string &db_name, const string 
 }
 
 unique_ptr<FunctionData> GetBind(ClientContext &context, TableFunctionBindInput &input,
-                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &source =
 	    SourceOf(context, input.inputs[0].GetValue<string>(), input.inputs[1].GetValue<string>(), "n6k_client_get");
 	auto result = make_uniq<N6kClientSettingsBind>();
@@ -41,7 +41,7 @@ unique_ptr<FunctionData> GetBind(ClientContext &context, TableFunctionBindInput 
 }
 
 unique_ptr<FunctionData> SetBind(ClientContext &context, TableFunctionBindInput &input,
-                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &source =
 	    SourceOf(context, input.inputs[0].GetValue<string>(), input.inputs[1].GetValue<string>(), "n6k_client_set");
 	if (input.inputs[2].IsNull() || input.inputs[3].IsNull()) {

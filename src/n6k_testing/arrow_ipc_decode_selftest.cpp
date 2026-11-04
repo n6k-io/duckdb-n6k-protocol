@@ -163,7 +163,7 @@ struct N6kFrameDecodeSelftestState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"id", "name"};
 	return_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
 	return make_uniq<N6kFrameDecodeSelftestBind>();

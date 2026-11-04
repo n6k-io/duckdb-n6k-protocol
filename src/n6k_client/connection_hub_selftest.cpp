@@ -346,7 +346,7 @@ struct N6kHubRoutingState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"mode",
 	         "ok",
 	         "got_ns1",

@@ -123,7 +123,7 @@ struct N6kPushInvalidateBindData : public TableFunctionData {
 
 } // namespace
 
-static void N6kServeReturnSchema(vector<LogicalType> &return_types, vector<string> &names) {
+static void N6kServeReturnSchema(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"connected", "requests_handled", "socket"};
 	return_types = {LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::VARCHAR};
 }
@@ -147,7 +147,7 @@ static hugeint_t BindSessionIdArgument(const TableFunctionBindInput &input, cons
 }
 
 static unique_ptr<FunctionData> N6kServeBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	N6kServeReturnSchema(return_types, names);
 	n6k::ThrowIfServed(context, FN_NAME);
 
@@ -181,7 +181,7 @@ static unique_ptr<FunctionData> N6kServeBind(ClientContext &context, TableFuncti
 
 // Same server, same result row; the fd arrives through a session from n6k_serve_create_session.
 static unique_ptr<FunctionData> N6kServeFdBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	N6kServeReturnSchema(return_types, names);
 	n6k::ThrowIfServed(context, FD_FN_NAME);
 
@@ -200,14 +200,14 @@ static unique_ptr<FunctionData> N6kServeFdBind(ClientContext &context, TableFunc
 
 static void RequireAttached(ClientContext &context, const string &catalog, const char *fn_name) {
 	try {
-		(void)Catalog::GetCatalog(context, catalog);
+		(void)Catalog::GetCatalog(context, Identifier(catalog));
 	} catch (const std::exception &) {
 		throw BinderException("%s: catalog \"%s\" is not attached; ATTACH it before %s", fn_name, catalog, fn_name);
 	}
 }
 
 static unique_ptr<FunctionData> N6kResolveOpenBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names,
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names,
                                                    const char *fn_name, bool ok) {
 	names = {"resolved"};
 	return_types = {LogicalType::BOOLEAN};
@@ -232,12 +232,12 @@ static unique_ptr<FunctionData> N6kResolveOpenBind(ClientContext &context, Table
 }
 
 static unique_ptr<FunctionData> N6kOpenReadyBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kResolveOpenBind(context, input, return_types, names, OPEN_READY_FN_NAME, true);
 }
 
 static unique_ptr<FunctionData> N6kOpenFailedBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kResolveOpenBind(context, input, return_types, names, OPEN_FAILED_FN_NAME, false);
 }
 
@@ -256,7 +256,7 @@ static void N6kResolveOpenScan(ClientContext &context, TableFunctionInput &data_
 }
 
 static unique_ptr<FunctionData> N6kSendTextBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"sent"};
 	return_types = {LogicalType::BOOLEAN};
 	n6k::ThrowIfServed(context, SEND_TEXT_FN_NAME);
@@ -283,7 +283,7 @@ static void N6kSendTextScan(ClientContext &context, TableFunctionInput &data_p, 
 }
 
 static unique_ptr<FunctionData> N6kCloseBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"closed"};
 	return_types = {LogicalType::BOOLEAN};
 	n6k::ThrowIfServed(context, CLOSE_FN_NAME);
@@ -316,7 +316,7 @@ static void N6kCloseScan(ClientContext &context, TableFunctionInput &data_p, Dat
 }
 
 static unique_ptr<FunctionData> N6kSessionStatsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"frames_in",        "bytes_in",    "frames_out",      "bytes_out",
 	         "requests_handled", "duration_ms", "authenticate_ms", "peak_workers"};
 	return_types = vector<LogicalType>(names.size(), LogicalType::BIGINT);
@@ -344,7 +344,7 @@ static void N6kSessionStatsScan(ClientContext &context, TableFunctionInput &data
 }
 
 static unique_ptr<FunctionData> N6kUpstreamHelloBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"catalogs", "capabilities"};
 	return_types = {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
 	n6k::ThrowIfServed(context, UPSTREAM_HELLO_FN_NAME);
@@ -409,7 +409,7 @@ static void N6kUpstreamHelloScan(ClientContext &context, TableFunctionInput &dat
 }
 
 static unique_ptr<FunctionData> N6kUpstreamBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names,
+                                                vector<LogicalType> &return_types, vector<Identifier> &names,
                                                 const char *fn_name, UpstreamOp op) {
 	switch (op) {
 	case UpstreamOp::ADD:
@@ -463,22 +463,22 @@ static unique_ptr<FunctionData> N6kUpstreamBind(ClientContext &context, TableFun
 }
 
 static unique_ptr<FunctionData> N6kAddUpstreamBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kUpstreamBind(context, input, return_types, names, ADD_UPSTREAM_FN_NAME, UpstreamOp::ADD);
 }
 
 static unique_ptr<FunctionData> N6kSetUpstreamRankBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kUpstreamBind(context, input, return_types, names, SET_UPSTREAM_RANK_FN_NAME, UpstreamOp::SET_RANK);
 }
 
 static unique_ptr<FunctionData> N6kRemoveUpstreamBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kUpstreamBind(context, input, return_types, names, REMOVE_UPSTREAM_FN_NAME, UpstreamOp::REMOVE);
 }
 
 static unique_ptr<FunctionData> N6kUpstreamStatusBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kUpstreamBind(context, input, return_types, names, UPSTREAM_STATUS_FN_NAME, UpstreamOp::STATUS);
 }
 
@@ -519,7 +519,7 @@ static void N6kUpstreamScan(ClientContext &context, TableFunctionInput &data_p, 
 }
 
 static unique_ptr<FunctionData> N6kServedCatalogBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names,
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names,
                                                      const char *fn_name, ServedCatalogOp op) {
 	switch (op) {
 	case ServedCatalogOp::ADD:
@@ -567,38 +567,38 @@ static unique_ptr<FunctionData> N6kServedCatalogBind(ClientContext &context, Tab
 }
 
 static unique_ptr<FunctionData> N6kAddCatalogBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kServedCatalogBind(context, input, return_types, names, ADD_CATALOG_FN_NAME, ServedCatalogOp::ADD);
 }
 
 static unique_ptr<FunctionData> N6kAddLazyCatalogBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kServedCatalogBind(context, input, return_types, names, ADD_LAZY_CATALOG_FN_NAME,
 	                            ServedCatalogOp::ADD_LAZY);
 }
 
 static unique_ptr<FunctionData> N6kRemoveCatalogBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kServedCatalogBind(context, input, return_types, names, REMOVE_CATALOG_FN_NAME, ServedCatalogOp::REMOVE);
 }
 
 static unique_ptr<FunctionData> N6kPauseBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kServedCatalogBind(context, input, return_types, names, PAUSE_FN_NAME, ServedCatalogOp::PAUSE);
 }
 
 static unique_ptr<FunctionData> N6kResumeBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kServedCatalogBind(context, input, return_types, names, RESUME_FN_NAME, ServedCatalogOp::RESUME);
 }
 
 static unique_ptr<FunctionData> N6kInflightBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kServedCatalogBind(context, input, return_types, names, INFLIGHT_FN_NAME, ServedCatalogOp::INFLIGHT);
 }
 
 static unique_ptr<FunctionData> N6kCancelInflightBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return N6kServedCatalogBind(context, input, return_types, names, CANCEL_INFLIGHT_FN_NAME,
 	                            ServedCatalogOp::CANCEL_INFLIGHT);
 }
@@ -648,7 +648,7 @@ static void N6kServedCatalogScan(ClientContext &context, TableFunctionInput &dat
 }
 
 static unique_ptr<FunctionData> N6kCreateSessionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"session_id"};
 	return_types = {LogicalType::UUID};
 	n6k::ThrowIfServed(context, CREATE_SESSION_FN_NAME);
@@ -753,7 +753,7 @@ void RegisterN6kServeFunction(ExtensionLoader &loader) {
 // refetches instead of serving a stale cache. The server never decides on its own that a catalog has
 // changed — the host says so.
 static unique_ptr<FunctionData> N6kPushInvalidateBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	n6k::ThrowIfServed(context, PUSH_FN_NAME);
 	names = {"notified"};
 	return_types = {LogicalType::BIGINT};
@@ -792,7 +792,7 @@ static void N6kPushInvalidateScan(ClientContext &context, TableFunctionInput &da
 }
 
 static unique_ptr<FunctionData> N6kServeStatsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	n6k::ThrowIfServed(context, STATS_FN_NAME);
 	names = {"connections", "requests_handled", "credit_pauses", "cancels"};
 	return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};

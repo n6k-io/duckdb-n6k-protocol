@@ -94,7 +94,7 @@ static void SplitN6kUrl(const string &url, string &base_url, string &query) {
 }
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"connection_id", "capabilities"};
 	return_types = {LogicalType::UUID, LogicalType::LIST(LogicalType::VARCHAR)};
 	n6k::ThrowIfServed(context, FN_NAME);

@@ -34,7 +34,7 @@ struct StreamCounterState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> StreamCounterBindFn(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"n"};
 	return_types = {LogicalType::BIGINT};
 
@@ -75,12 +75,12 @@ void StreamCounterScan(ClientContext &context, TableFunctionInput &data_p, DataC
 		}
 	}
 
-	auto values = FlatVector::GetData<int64_t>(output.data[0]);
+	output.SetChildCardinality(want);
+	auto values = FlatVector::GetDataMutable<int64_t>(output.data[0]);
 	for (idx_t i = 0; i < want; i++) {
 		values[i] = state.emitted + static_cast<int64_t>(i);
 	}
 	state.emitted += static_cast<int64_t>(want);
-	output.SetCardinality(want);
 }
 
 // n6k_testing_sum_table(TABLE) -> (total BIGINT)
@@ -96,7 +96,7 @@ struct SumTableState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> SumTableBindFn(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"total"};
 	return_types = {LogicalType::BIGINT};
 	return make_uniq<SumTableBind>();
@@ -130,7 +130,7 @@ OperatorFinalizeResultType SumTableFinal(ExecutionContext &context, TableFunctio
 		return OperatorFinalizeResultType::FINISHED;
 	}
 	state.done = true;
-	FlatVector::GetData<int64_t>(output.data[0])[0] = state.total;
+	FlatVector::GetDataMutable<int64_t>(output.data[0])[0] = state.total;
 	output.SetCardinality(1);
 	return OperatorFinalizeResultType::FINISHED;
 }
@@ -149,7 +149,7 @@ struct ServedCatalogsState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ServedCatalogsBindFn(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"catalog"};
 	return_types = {LogicalType::VARCHAR};
 

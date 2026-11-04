@@ -63,7 +63,7 @@ unique_ptr<GlobalTableFunctionState> ExceptionTypesInitGlobal(ClientContext &, T
 }
 
 unique_ptr<FunctionData> ExceptionTypesBind(ClientContext &, TableFunctionBindInput &,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"exception_type", "duckdb_name", "message_prefix", "retriable"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
 	return make_uniq<ExceptionTypesBindData>();

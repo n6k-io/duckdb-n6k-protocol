@@ -189,7 +189,7 @@ static string MintViaRefreshGrant(ClientContext &context, const string &key, con
 		replacement->secret_map["refresh_token"] = Value(rotated);
 		CommitSecretReplacement(context, std::move(replacement), match.secret_entry->persist_type,
 		                        match.secret_entry->storage_mode);
-		DUCKDB_LOG_INFO(context, "n6k auth: stored rotated refresh token in secret '" + kv.GetName() + "'");
+		DUCKDB_LOG_INFO(context, "n6k auth: stored rotated refresh token in secret '" + kv.GetName().GetIdentifierName() + "'");
 	}
 
 	StoreMintedAccessSecret(context, key, minted);

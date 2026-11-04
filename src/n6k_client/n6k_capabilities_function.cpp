@@ -16,9 +16,9 @@ struct N6kCapabilitiesState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	auto db_name = input.inputs[0].GetValue<string>();
-	auto &catalog = Catalog::GetCatalog(context, db_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(db_name));
 	auto &n6k_catalog = catalog.Cast<N6kCatalog>();
 
 	auto result = make_uniq<N6kCapabilitiesBind>();

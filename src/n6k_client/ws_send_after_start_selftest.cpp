@@ -146,7 +146,7 @@ struct N6kWsSendAfterStartState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"mode", "ok", "listening", "probe_received", "port", "elapsed_ms"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
 	                LogicalType::BOOLEAN, LogicalType::INTEGER, LogicalType::INTEGER};

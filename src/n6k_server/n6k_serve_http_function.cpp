@@ -51,13 +51,13 @@ struct N6kServeHttpState : public GlobalTableFunctionState {
 
 } // namespace
 
-static void N6kServeHttpReturnSchema(vector<LogicalType> &return_types, vector<string> &names) {
+static void N6kServeHttpReturnSchema(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"connections", "requests_handled", "url"};
 	return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR};
 }
 
 static unique_ptr<FunctionData> N6kServeHttpBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	N6kServeHttpReturnSchema(return_types, names);
 	n6k::ThrowIfServed(context, FN_NAME);
 
@@ -182,7 +182,7 @@ static ix::HttpRequestPtr BindUpgradeRequest(const string &json) {
 }
 
 static unique_ptr<FunctionData> N6kServeWsBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"connected",  "requests_handled", "frames_in",   "bytes_in",
 	         "frames_out", "bytes_out",        "duration_ms", "authenticate_ms"};
 	return_types = vector<LogicalType>(names.size(), LogicalType::BIGINT);

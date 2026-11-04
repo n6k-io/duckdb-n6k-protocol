@@ -17,8 +17,9 @@ bool IsSystemSchema(const string &name) {
 void ListCatalogSchemas(ClientContext &context, Catalog &catalog, vector<string> &out) {
 	const idx_t first = out.size();
 	catalog.ScanSchemas(context, [&](SchemaCatalogEntry &s) {
-		if (!IsSystemSchema(s.name)) {
-			out.push_back(s.name);
+		auto &schema_name = s.name.GetIdentifierName();
+		if (!IsSystemSchema(schema_name)) {
+			out.push_back(schema_name);
 		}
 	});
 	// ScanSchemas has no defined order; sort so both servers answer the op identically.
@@ -36,12 +37,12 @@ unique_ptr<GlobalTableFunctionState> CatalogListInitGlobal(ClientContext &contex
 }
 
 unique_ptr<FunctionData> CatalogListBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"schema_name"};
 	return_types = {LogicalType::VARCHAR};
 
 	auto catalog_name = input.inputs[0].GetValue<string>();
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	auto result = make_uniq<CatalogListBindData>();
 	ListCatalogSchemas(context, catalog, result->schemas);
 	return std::move(result);

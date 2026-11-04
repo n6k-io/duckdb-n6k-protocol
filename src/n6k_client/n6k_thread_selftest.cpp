@@ -136,7 +136,7 @@ struct N6kThreadSelftestState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"mode", "ok", "spawned", "joined", "woke_from_park", "wait_result", "main_proxy_sees_n6k", "elapsed_ms"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
 	                LogicalType::BOOLEAN, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::INTEGER};

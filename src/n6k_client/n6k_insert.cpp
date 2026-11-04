@@ -60,7 +60,7 @@ SinkFinalizeType N6kInsert::Finalize(Pipeline &pipeline, Event &event, ClientCon
 	auto col_types = target.GetTypes();
 	vector<string> col_names;
 	for (auto &col : target.GetColumns().Logical()) {
-		col_names.push_back(col.Name());
+		col_names.push_back(col.Name().GetIdentifierName());
 	}
 
 	ArrowBuffer ipc_buf;
@@ -68,7 +68,8 @@ SinkFinalizeType N6kInsert::Finalize(Pipeline &pipeline, Event &event, ClientCon
 	SerializeChunksToArrowIPC(context, col_types, col_names, gstate.chunks, &ipc_buf);
 
 	auto &schema = const_cast<N6kSchemaEntry &>(*schema_entry); // NOLINT(cppcoreguidelines-pro-type-const-cast)
-	schema.GetN6kCatalog().session->Insert(schema.name, target.name, static_cast<const uint8_t *>(ipc_buf.data),
+	schema.GetN6kCatalog().session->Insert(schema.name.GetIdentifierName(), target.name.GetIdentifierName(),
+	                                       static_cast<const uint8_t *>(ipc_buf.data),
 	                                       static_cast<size_t>(ipc_buf.size_bytes),
 	                                       [&context]() { return context.IsInterrupted(); });
 
