@@ -94,5 +94,37 @@ inline std::vector<std::string> JsonGetStrArray(duckdb_yyjson::yyjson_val *obj, 
 	return out;
 }
 
+inline std::vector<std::vector<std::string>> JsonGetStrArrays(duckdb_yyjson::yyjson_val *obj, const char *key) {
+	std::vector<std::vector<std::string>> out;
+	if (!obj) {
+		return out;
+	}
+	auto *arr = duckdb_yyjson::yyjson_obj_get(obj, key);
+	if (!arr) {
+		return out;
+	}
+	if (!duckdb_yyjson::yyjson_is_arr(arr)) {
+		throw InvalidInputException("n6k: \"%s\" must be an array of string arrays", key);
+	}
+	size_t idx, n;
+	duckdb_yyjson::yyjson_val *inner;
+	yyjson_arr_foreach(arr, idx, n, inner) {
+		if (!duckdb_yyjson::yyjson_is_arr(inner)) {
+			throw InvalidInputException("n6k: \"%s\" must be an array of string arrays", key);
+		}
+		std::vector<std::string> strings;
+		size_t inner_idx, inner_n;
+		duckdb_yyjson::yyjson_val *item;
+		yyjson_arr_foreach(inner, inner_idx, inner_n, item) {
+			if (!duckdb_yyjson::yyjson_is_str(item)) {
+				throw InvalidInputException("n6k: \"%s\" must be an array of string arrays", key);
+			}
+			strings.emplace_back(duckdb_yyjson::yyjson_get_str(item), duckdb_yyjson::yyjson_get_len(item));
+		}
+		out.push_back(std::move(strings));
+	}
+	return out;
+}
+
 } // namespace n6k
 } // namespace duckdb

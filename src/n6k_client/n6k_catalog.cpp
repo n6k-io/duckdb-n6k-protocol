@@ -1,7 +1,6 @@
 #include "n6k_catalog.hpp"
 #include "n6k_protocol_generated.hpp"
 #include "n6k_schema_entry.hpp"
-#include "n6k_insert.hpp"
 #include "ws_json.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -158,11 +157,7 @@ void N6kCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 
 PhysicalOperator &N6kCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                 LogicalCreateTable &op, PhysicalOperator &plan) {
-	auto &schema = op.schema.Cast<N6kSchemaEntry>();
-	auto &insert = planner.Make<N6kInsert>(schema, std::move(op.info), vector<LogicalType> {LogicalType::BIGINT},
-	                                       op.estimated_cardinality);
-	insert.children.push_back(plan);
-	return insert;
+	return Attach().PlanCreateTableAs(context, planner, op, plan);
 }
 
 PhysicalOperator &N6kCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,

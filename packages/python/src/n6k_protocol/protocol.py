@@ -157,7 +157,9 @@ _F_ID: Any = ("id", "integer", True)
 _F_NS: Any = ("ns", "integer", False)
 _F_NS_REQUIRED: Any = ("ns", "integer", True)
 _ARRAY_OF_STR: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
-# Each TABLES_LIST entry is a row object ({schema, name, verbs, primary_keys}); each schema entry {name, verbs}.
+_ARRAY_OF_STR_ARRAYS: dict[str, Any] = {"type": "array", "items": _ARRAY_OF_STR}
+# Each TABLES_LIST entry is a row object ({schema, name, verbs, primary_keys, not_null, unique_keys}); each schema
+# entry {name, verbs}.
 _ARRAY_OF_OBJ: dict[str, Any] = {"type": "array", "items": {"type": "object"}}
 
 # variant: {"name", "t", optional "op", "fields": [field, ...], optional
@@ -349,7 +351,15 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         "name": "REQ_CREATE_TABLE",
         "t": FT_REQ,
         "op": OP_CREATE_TABLE,
-        "fields": [_F_ID, ("schema", "string", True), ("name", "string", True), ("columns", "array", True)],
+        "fields": [
+            _F_ID,
+            ("schema", "string", True),
+            ("name", "string", True),
+            ("columns", "array", True),
+            ("primary_key", _ARRAY_OF_STR, False),
+            ("unique_keys", _ARRAY_OF_STR_ARRAYS, False),
+            ("txn", "integer", False),
+        ],
     },
     # `plan` is the view's body as Substrait JSON, floors only; its columns are `names`, in order.
     {
@@ -395,6 +405,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("table", "string", True),
             ("kind", "string", True),
             ("details", "object", False),
+            ("txn", "integer", False),
         ],
     },
 ]
@@ -524,9 +535,10 @@ CAP_JSONRPC: Final = "jsonrpc"
 CAP_MCP: Final = "mcp"
 CAP_CATALOG_PLANS: Final = "catalog_plans"
 CAP_HAS_FUNCTION: Final = "has_function"
+CAP_TABLE_DDL: Final = "table_ddl"
 
 # What this implementation supports at each level; client and server both send their set.
 HELLO_CAPS: Final = (CAP_CROSSING, CAP_JSONRPC, CAP_MCP)
 # The subset of HELLO_CAPS the server grants only when the app serving the socket provides it.
 APP_HELLO_CAPS: Final = (CAP_JSONRPC, CAP_MCP)
-OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION)
+OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_TABLE_DDL)

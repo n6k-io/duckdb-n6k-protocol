@@ -127,13 +127,36 @@ inline std::string Txn(int64_t txn) {
 	return n6k::SerializeJsonDocAndFree(doc);
 }
 
-inline std::string CreateTable(const std::string &schema, const std::string &name, const std::string &columns_json) {
+inline yyjson_mut_val *StringArray(yyjson_mut_doc *doc, const std::vector<std::string> &strings) {
+	auto *out = duckdb_yyjson::yyjson_mut_arr(doc);
+	for (auto &item : strings) {
+		duckdb_yyjson::yyjson_mut_arr_add_strncpy(doc, out, item.c_str(), item.size());
+	}
+	return out;
+}
+
+inline std::string CreateTable(const std::string &schema, const std::string &name, const std::string &columns_json,
+                               const std::vector<std::string> &primary_key,
+                               const std::vector<std::vector<std::string>> &unique_keys, int64_t txn) {
 	auto *doc = yyjson_mut_doc_new(nullptr);
 	auto *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
 	yyjson_mut_obj_add_strncpy(doc, root, "schema", schema.c_str(), schema.size());
 	yyjson_mut_obj_add_strncpy(doc, root, "name", name.c_str(), name.size());
 	AddParsedJsonOrThrowFreeingDoc(doc, root, "columns", columns_json, "[]");
+	if (!primary_key.empty()) {
+		yyjson_mut_obj_add_val(doc, root, "primary_key", StringArray(doc, primary_key));
+	}
+	if (!unique_keys.empty()) {
+		auto *keys = duckdb_yyjson::yyjson_mut_arr(doc);
+		for (auto &unique_key : unique_keys) {
+			duckdb_yyjson::yyjson_mut_arr_append(keys, StringArray(doc, unique_key));
+		}
+		yyjson_mut_obj_add_val(doc, root, "unique_keys", keys);
+	}
+	if (txn >= 0) {
+		duckdb_yyjson::yyjson_mut_obj_add_sint(doc, root, "txn", txn);
+	}
 	return n6k::SerializeJsonDocAndFree(doc);
 }
 
@@ -184,7 +207,7 @@ inline std::string HasFunction(const std::string &name, const std::vector<std::s
 }
 
 inline std::string AlterTable(const std::string &schema, const std::string &table, const std::string &kind,
-                              const std::string &details_json) {
+                              const std::string &details_json, int64_t txn) {
 	auto *doc = yyjson_mut_doc_new(nullptr);
 	auto *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
@@ -192,6 +215,9 @@ inline std::string AlterTable(const std::string &schema, const std::string &tabl
 	yyjson_mut_obj_add_strncpy(doc, root, "table", table.c_str(), table.size());
 	yyjson_mut_obj_add_strncpy(doc, root, "kind", kind.c_str(), kind.size());
 	AddParsedJsonOrThrowFreeingDoc(doc, root, "details", details_json, "{}");
+	if (txn >= 0) {
+		duckdb_yyjson::yyjson_mut_obj_add_sint(doc, root, "txn", txn);
+	}
 	return n6k::SerializeJsonDocAndFree(doc);
 }
 

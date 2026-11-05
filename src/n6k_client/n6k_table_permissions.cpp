@@ -31,7 +31,8 @@ static void CollectRemoteTablePermissionRows(ClientContext &context, N6kCatalog 
 				continue;
 			}
 			auto info = source.Info(schema_name, table_name);
-			out.push_back({schema_name, table_name, "n6k_remote", info.verbs, info.primary_keys});
+			out.push_back({schema_name, table_name, "n6k_remote", info.verbs, info.primary_keys, info.not_null,
+			               info.unique_keys});
 		}
 	}
 }

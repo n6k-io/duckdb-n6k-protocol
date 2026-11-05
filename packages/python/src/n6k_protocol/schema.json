@@ -946,6 +946,24 @@
         "columns": {
           "type": "array"
         },
+        "primary_key": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unique_keys": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "txn": {
+          "type": "integer"
+        },
         "ns": {
           "type": "integer"
         }
@@ -1109,6 +1127,9 @@
         },
         "details": {
           "type": "object"
+        },
+        "txn": {
+          "type": "integer"
         },
         "ns": {
           "type": "integer"

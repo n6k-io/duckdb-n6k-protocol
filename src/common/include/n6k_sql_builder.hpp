@@ -32,10 +32,11 @@ std::string JsonValueToSqlLiteral(duckdb_yyjson::yyjson_val *v);
 // OP_TABLE_SCHEMA: a zero-row select, executed only for its result types.
 std::string BuildTableSchemaSql(const std::string &catalog, const std::string &schema, const std::string &table);
 
-// OP_CREATE_TABLE. `columns` is an array of {"name": ..., "type": ...}; the type is a type
-// EXPRESSION, not a value, and is interpolated verbatim -- only the name is quoted.
+// OP_CREATE_TABLE. `columns` is an array of {"name": ..., "type": ..., "not_null"?: bool}; the type is a
+// type EXPRESSION, not a value, and is interpolated verbatim -- only the name is quoted.
 std::string BuildCreateTableSql(const std::string &catalog, const std::string &schema, const std::string &name,
-                                duckdb_yyjson::yyjson_val *columns);
+                                duckdb_yyjson::yyjson_val *columns, const std::vector<std::string> &primary_key = {},
+                                const std::vector<std::vector<std::string>> &unique_keys = {});
 
 // OP_ALTER_TABLE. `kind` is whitelisted: add_column, drop_column, rename_column.
 std::string BuildAlterSql(const std::string &catalog, const std::string &schema, const std::string &table,

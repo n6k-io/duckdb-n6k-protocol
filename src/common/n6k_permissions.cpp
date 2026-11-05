@@ -8,32 +8,39 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 namespace duckdb {
 
-// A PK is a UNIQUE+IsPrimaryKey constraint; single-column is stored as an index, multi-column by name.
-static vector<string> NativeTablePrimaryKey(TableCatalogEntry &table) {
-	for (auto &constraint : table.GetConstraints()) {
-		if (constraint->type != ConstraintType::UNIQUE) {
-			continue;
-		}
-		auto &unique = constraint->Cast<UniqueConstraint>();
-		if (!unique.IsPrimaryKey()) {
-			continue;
-		}
-		if (unique.HasIndex()) {
-			return {table.GetColumn(unique.GetIndex()).GetName().GetIdentifierName()};
-		}
-		vector<string> column_names;
-		for (auto &column_name : unique.GetColumnNames()) {
-			column_names.push_back(column_name.GetIdentifierName());
-		}
-		return column_names;
+// A UNIQUE constraint on a single column is stored as an index, on several by name.
+static vector<string> UniqueConstraintColumns(TableCatalogEntry &table, const UniqueConstraint &unique) {
+	if (unique.HasIndex()) {
+		return {table.GetColumn(unique.GetIndex()).GetName().GetIdentifierName()};
 	}
-	return {};
+	vector<string> column_names;
+	for (auto &column_name : unique.GetColumnNames()) {
+		column_names.push_back(column_name.GetIdentifierName());
+	}
+	return column_names;
+}
+
+static void AddNativeTableConstraints(TableCatalogEntry &table, TablePermissionRow &row) {
+	for (auto &constraint : table.GetConstraints()) {
+		if (constraint->type == ConstraintType::NOT_NULL) {
+			auto &not_null = constraint->Cast<NotNullConstraint>();
+			row.not_null.push_back(table.GetColumn(not_null.index).GetName().GetIdentifierName());
+		} else if (constraint->type == ConstraintType::UNIQUE) {
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (unique.IsPrimaryKey()) {
+				row.primary_key = UniqueConstraintColumns(table, unique);
+			} else {
+				row.unique_keys.push_back(UniqueConstraintColumns(table, unique));
+			}
+		}
+	}
 }
 
 static vector<string> NativeTableVerbs() {
@@ -60,11 +67,12 @@ static void CollectNativeSchemaPermissions(ClientContext &context, SchemaCatalog
 			}
 			if (e.type == CatalogType::VIEW_ENTRY) {
 				seen.insert(entry_name);
-				out.push_back({schema_name, entry_name, "native_view", NativeViewVerbs(), {}});
+				out.push_back({schema_name, entry_name, "native_view", NativeViewVerbs(), {}, {}, {}});
 			} else if (e.type == CatalogType::TABLE_ENTRY) {
 				seen.insert(entry_name);
-				out.push_back({schema_name, entry_name, "native_table", NativeTableVerbs(),
-				               NativeTablePrimaryKey(e.Cast<TableCatalogEntry>())});
+				TablePermissionRow row {schema_name, entry_name, "native_table", NativeTableVerbs(), {}, {}, {}};
+				AddNativeTableConstraints(e.Cast<TableCatalogEntry>(), row);
+				out.push_back(std::move(row));
 			}
 		});
 	};

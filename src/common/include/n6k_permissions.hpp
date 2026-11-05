@@ -18,6 +18,8 @@ struct TablePermissionRow {
 	// Crossing's spelling: select, insert, update, delete, alter, drop.
 	vector<string> verbs;
 	vector<string> primary_key;
+	vector<string> not_null;
+	std::vector<std::vector<std::string>> unique_keys;
 };
 
 struct SchemaPermissionRow {

@@ -2101,6 +2101,10 @@ int64_t ServeReactor::Run() {
 					{
 						std::lock_guard<std::mutex> lk(slot->mu);
 						slot->cancel.store(true);
+						slot->client_cancelled = true;
+						if (slot->context) {
+							slot->context->Interrupt();
+						}
 					}
 					QueueParked(slot, RequestTask::Kind::CANCEL);
 				}
@@ -2286,8 +2290,17 @@ void ServeReactor::RunRequest(RequestTask &task) {
 		}
 	} catch (const std::exception &e) {
 		ErrorData err(e);
-		EndRequest(slot, PackErr(FrameTarget {task.sess.ns, task.req_id}, n6k::WireExceptionName(err.Type()),
-		                         err.RawMessage(), n6k::IsRetriableExceptionType(err.Type())));
+		bool client_cancelled;
+		{
+			std::lock_guard<std::mutex> lk(slot.mu);
+			client_cancelled = slot.client_cancelled;
+		}
+		if (client_cancelled && err.Type() == ExceptionType::INTERRUPT) {
+			EndRequest(slot, PackRespEndCancelled(FrameTarget {task.sess.ns, task.req_id}));
+		} else {
+			EndRequest(slot, PackErr(FrameTarget {task.sess.ns, task.req_id}, n6k::WireExceptionName(err.Type()),
+			                         err.RawMessage(), n6k::IsRetriableExceptionType(err.Type())));
+		}
 	}
 	// Before the request retires: an RPC stream's close runs the host generator's `finally`.
 	task.stream.reset();

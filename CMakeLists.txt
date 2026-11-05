@@ -54,7 +54,6 @@ list(
   src/n6k_client/n6k_schema_entry.cpp
   src/n6k_client/n6k_source.cpp
   src/n6k_client/n6k_transaction.cpp
-  src/n6k_client/n6k_insert.cpp
   src/n6k_client/n6k_rpc_function.cpp
   src/n6k_client/n6k_version_function.cpp
   src/n6k_client/n6k_capabilities_function.cpp

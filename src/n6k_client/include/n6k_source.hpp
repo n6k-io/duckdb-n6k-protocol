@@ -13,6 +13,8 @@ namespace duckdb {
 struct N6kTableInfo {
 	vector<string> verbs;
 	vector<string> primary_keys;
+	vector<string> not_null;
+	std::vector<std::vector<std::string>> unique_keys;
 };
 
 class DatabaseInstance;
@@ -90,6 +92,7 @@ public:
 
 private:
 	int64_t Txn();
+	void RequireTableDdl(const char *what);
 
 	N6kSource &source;
 	std::shared_ptr<CatalogSession> session;

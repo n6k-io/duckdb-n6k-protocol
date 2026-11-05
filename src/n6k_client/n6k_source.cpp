@@ -7,6 +7,8 @@
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -26,6 +28,10 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 
@@ -182,6 +188,7 @@ struct N6kWriteState {
 	~N6kWriteState() {
 		if (req) {
 			req->SetOnFrame({});
+			req->Cancel();
 		}
 	}
 };
@@ -493,6 +500,8 @@ void N6kSource::ListIfNeeded() {
 		N6kTableInfo info;
 		info.verbs = row.verbs;
 		info.primary_keys = row.primary_keys;
+		info.not_null = row.not_null;
+		info.unique_keys = row.unique_keys;
 		tables[row.schema][row.name] = std::move(info);
 	}
 	for (auto &row : listing.schemas) {
@@ -552,6 +561,50 @@ CrossingTable N6kSource::Describe(const string &schema, const string &name) {
 	return DescribeIn(schema, name, -1);
 }
 
+static optional_idx ColumnPosition(const CrossingTable &table, const string &column) {
+	for (idx_t i = 0; i < table.column_names.size(); i++) {
+		if (StringUtil::CIEquals(table.column_names[i], column)) {
+			return i;
+		}
+	}
+	return optional_idx();
+}
+
+// The listing can predate the description, so a constraint on a column no longer described is skipped.
+static void DeclareUnique(CrossingTable &table, const std::vector<std::string> &columns, bool is_primary_key) {
+	vector<Identifier> names;
+	for (auto &column : columns) {
+		if (!ColumnPosition(table, column).IsValid()) {
+			return;
+		}
+		names.emplace_back(column);
+	}
+	if (!names.empty()) {
+		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(names), is_primary_key));
+	}
+}
+
+static void DeclareConstraints(CrossingTable &table, const N6kTableInfo &info) {
+	set<idx_t> not_null;
+	auto add_not_null = [&](const vector<string> &columns) {
+		for (auto &column : columns) {
+			auto position = ColumnPosition(table, column);
+			if (position.IsValid()) {
+				not_null.insert(position.GetIndex());
+			}
+		}
+	};
+	add_not_null(info.not_null);
+	add_not_null(info.primary_keys);
+	for (auto position : not_null) {
+		table.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(position)));
+	}
+	DeclareUnique(table, info.primary_keys, true);
+	for (auto &unique_key : info.unique_keys) {
+		DeclareUnique(table, unique_key, false);
+	}
+}
+
 CrossingTable N6kSource::DescribeIn(const string &schema, const string &name, int64_t txn) {
 	ArrowArrayStream schema_stream;
 	schema_stream.release = nullptr;
@@ -597,12 +650,15 @@ CrossingTable N6kSource::DescribeIn(const string &schema, const string &name, in
 			if (StringUtil::CIEquals(row.schema, schema) && StringUtil::CIEquals(row.name, name)) {
 				info.verbs = row.verbs;
 				info.primary_keys = row.primary_keys;
+				info.not_null = row.not_null;
+				info.unique_keys = row.unique_keys;
 			}
 		}
 	}
 	table.verbs = CrossingVerbsNamed(info.verbs);
 	table.key = info.primary_keys;
 	table.key_unique = !table.key.empty();
+	DeclareConstraints(table, info);
 	return table;
 }
 
@@ -769,6 +825,12 @@ int64_t N6kSession::Txn() {
 	return txn;
 }
 
+void N6kSession::RequireTableDdl(const char *what) {
+	if (!session->HasCapability(n6k::CAP_TABLE_DDL)) {
+		throw BinderException("n6k[%s]: the server does not support %s", catalog_name, what);
+	}
+}
+
 vector<string> N6kSession::Tables(const string &schema) {
 	return source.TablesIn(schema, Txn());
 }
@@ -791,11 +853,147 @@ static const char *OnConflictName(OnCreateConflict on_conflict) {
 	}
 }
 
-// Only views reach here: n6k's schema entry sends tables over its own ops.
+static vector<string> UniqueConstraintColumns(const ColumnList &columns, const UniqueConstraint &unique) {
+	vector<string> names;
+	if (unique.HasIndex()) {
+		names.push_back(columns.GetColumn(unique.GetIndex()).Name().GetIdentifierName());
+		return names;
+	}
+	for (auto &column : unique.GetColumnNames()) {
+		names.push_back(column.GetIdentifierName());
+	}
+	return names;
+}
+
+struct N6kTableDefinition {
+	string columns_json;
+	vector<string> primary_key;
+	std::vector<std::vector<std::string>> unique_keys;
+	bool constrained = false;
+};
+
+static N6kTableDefinition TableDefinitionOf(const CreateTableInfo &create) {
+	N6kTableDefinition definition;
+	set<idx_t> not_null;
+	for (auto &constraint : create.constraints) {
+		if (constraint->type == ConstraintType::NOT_NULL) {
+			not_null.insert(constraint->Cast<NotNullConstraint>().index.index);
+		} else if (constraint->type == ConstraintType::UNIQUE) {
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (unique.IsPrimaryKey()) {
+				definition.primary_key = UniqueConstraintColumns(create.columns, unique);
+			} else {
+				definition.unique_keys.push_back(UniqueConstraintColumns(create.columns, unique));
+			}
+		} else {
+			throw BinderException("n6k: CREATE TABLE with the constraint '%s' is not supported on an attached database",
+			                      constraint->ToString());
+		}
+	}
+	definition.constrained = !create.constraints.empty();
+
+	auto *doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
+	auto *columns = duckdb_yyjson::yyjson_mut_arr(doc);
+	duckdb_yyjson::yyjson_mut_doc_set_root(doc, columns);
+	for (auto &column : create.columns.Logical()) {
+		const auto &column_name = column.Name().GetIdentifierName();
+		if (column.Generated() || column.HasDefaultValue()) {
+			duckdb_yyjson::yyjson_mut_doc_free(doc);
+			throw BinderException(
+			    "n6k: CREATE TABLE with a default or generated column '%s' is not supported on an attached database",
+			    column_name);
+		}
+		auto type = column.Type().ToString();
+		auto *entry = duckdb_yyjson::yyjson_mut_obj(doc);
+		duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, entry, "name", column_name.c_str(), column_name.size());
+		duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, entry, "type", type.c_str(), type.size());
+		if (not_null.count(column.Logical().index) != 0) {
+			duckdb_yyjson::yyjson_mut_obj_add_bool(doc, entry, "not_null", true);
+		}
+		duckdb_yyjson::yyjson_mut_arr_append(columns, entry);
+	}
+	definition.columns_json = n6k::SerializeJsonDocAndFree(doc);
+	return definition;
+}
+
+static string AlterBodyOf(const CrossingDdl &ddl, int64_t txn) {
+	if (ddl.alter->type != AlterType::ALTER_TABLE) {
+		throw BinderException("Only ALTER TABLE is supported on n6k attached databases");
+	}
+	auto &alter = ddl.alter->Cast<AlterTableInfo>();
+	string kind;
+	string first_key;
+	string first_value;
+	string second_key;
+	string second_value;
+	switch (alter.alter_table_type) {
+	case AlterTableType::ADD_COLUMN: {
+		auto &add = alter.Cast<AddColumnInfo>();
+		if (add.new_column.HasDefaultValue()) {
+			throw BinderException("ALTER TABLE ADD COLUMN with a default is not supported on n6k attached databases");
+		}
+		kind = "add_column";
+		first_key = "name";
+		first_value = add.new_column.Name().GetIdentifierName();
+		second_key = "type";
+		second_value = add.new_column.Type().ToString();
+		break;
+	}
+	case AlterTableType::REMOVE_COLUMN:
+		kind = "drop_column";
+		first_key = "name";
+		first_value = alter.Cast<RemoveColumnInfo>().removed_column.GetIdentifierName();
+		break;
+	case AlterTableType::RENAME_COLUMN: {
+		auto &rename = alter.Cast<RenameColumnInfo>();
+		kind = "rename_column";
+		first_key = "old_name";
+		first_value = rename.old_name.GetIdentifierName();
+		second_key = "new_name";
+		second_value = rename.new_name.GetIdentifierName();
+		break;
+	}
+	default:
+		throw BinderException(
+		    "ALTER TABLE %s is not supported on n6k attached databases (only ADD COLUMN, DROP COLUMN, RENAME COLUMN)",
+		    alter.ToString());
+	}
+	auto *doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
+	auto *details = duckdb_yyjson::yyjson_mut_obj(doc);
+	duckdb_yyjson::yyjson_mut_doc_set_root(doc, details);
+	duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, details, first_key.c_str(), first_value.c_str(), first_value.size());
+	if (!second_key.empty()) {
+		duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, details, second_key.c_str(), second_value.c_str(),
+		                                          second_value.size());
+	}
+	return n6k_body::AlterTable(ddl.schema, ddl.table, kind, n6k::SerializeJsonDocAndFree(doc), txn);
+}
+
 void N6kSession::Ddl(ClientContext &context, const CrossingDdl &ddl) {
 	StreamCancelCheck cancel = [&context]() {
 		return context.IsInterrupted();
 	};
+	if (ddl.verb == CrossingVerb::CREATE && !ddl.plan) {
+		auto definition = TableDefinitionOf(ddl.create->Cast<CreateTableInfo>());
+		if (definition.constrained) {
+			RequireTableDdl("CREATE TABLE with constraints");
+		}
+		if (!autocommit) {
+			RequireTableDdl("CREATE TABLE in a transaction");
+		}
+		session->RunOp(n6k::OP_CREATE_TABLE,
+		               n6k_body::CreateTable(ddl.schema, ddl.table, definition.columns_json, definition.primary_key,
+		                                     definition.unique_keys, Txn()),
+		               cancel);
+		return;
+	}
+	if (ddl.verb == CrossingVerb::ALTER) {
+		if (!autocommit) {
+			RequireTableDdl("ALTER TABLE in a transaction");
+		}
+		session->RunOp(n6k::OP_ALTER_TABLE, AlterBodyOf(ddl, Txn()), cancel);
+		return;
+	}
 	if (ddl.verb == CrossingVerb::CREATE && ddl.plan) {
 		auto &view = ddl.create->Cast<CreateViewInfo>();
 		session->RunOp(n6k::OP_CREATE_VIEW,

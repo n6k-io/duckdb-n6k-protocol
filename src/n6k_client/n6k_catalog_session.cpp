@@ -37,6 +37,29 @@ namespace {
 // from a clean end-of-stream and throw, or a stalled INSERT/EXEC reports "0 rows, no error".
 constexpr std::chrono::seconds kResponseTimeout {30};
 constexpr std::chrono::seconds kSchemaListTimeout {10};
+constexpr std::chrono::milliseconds kInterruptPoll {100};
+
+// False once the request has finished or kResponseTimeout passes with no frame.
+bool NextFrameOrCancel(n6k::RequestState &state, n6k::Frame &out, const StreamCancelCheck &should_cancel) {
+	if (!should_cancel) {
+		return state.Next(out, kResponseTimeout);
+	}
+	const auto deadline = std::chrono::steady_clock::now() + kResponseTimeout;
+	for (;;) {
+		if (should_cancel()) {
+			state.Cancel();
+			throw InterruptException();
+		}
+		const auto started = std::chrono::steady_clock::now();
+		if (state.Next(out, kInterruptPoll)) {
+			return true;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - started < kInterruptPoll || now >= deadline) {
+			return false;
+		}
+	}
+}
 
 void SendRequestAndCollectResponse(n6k::WsClient &client, const std::string &catalog, uint8_t op,
                                    const std::string &body, std::string &out_arrow, std::string &out_json_chunk,
@@ -44,7 +67,7 @@ void SendRequestAndCollectResponse(n6k::WsClient &client, const std::string &cat
 	auto state = client.AwaitReadySessionAndSendRequest(op, body, should_cancel);
 	n6k::Frame f;
 	bool saw_end = false;
-	while (state->Next(f, kResponseTimeout)) {
+	while (NextFrameOrCancel(*state, f, should_cancel)) {
 		if (f.type == FrameType::ERR) {
 			ThrowN6kError(catalog, op, f.payload);
 		}
@@ -171,6 +194,8 @@ public:
 			row.name = JsonGetStr(item, "name");
 			row.verbs = n6k::JsonGetStrArray(item, "verbs");
 			row.primary_keys = n6k::JsonGetStrArray(item, "primary_keys");
+			row.not_null = n6k::JsonGetStrArray(item, "not_null");
+			row.unique_keys = n6k::JsonGetStrArrays(item, "unique_keys");
 			out.tables.emplace_back(std::move(row));
 		}
 		auto *schemas = duckdb_yyjson::yyjson_obj_get(doc.Root(), "schemas");
@@ -216,14 +241,6 @@ public:
 
 	n6k::NegotiatedCapabilities GetCapabilities() override {
 		return n6k::NegotiatedCapabilities {client_->GetHelloCapabilities(), client_->GetOpenAck().capabilities};
-	}
-
-	int64_t Insert(const string &schema, const string &table, const uint8_t *data, size_t len,
-	               const StreamCancelCheck &should_cancel) override {
-		std::string body = n6k_body::SchemaTable(schema, table);
-		body.push_back('\n');
-		body.append(reinterpret_cast<const char *>(data), len);
-		return SendRequestAndReadRowcount(*client_, catalog_name_, n6k::OP_INSERT, body, should_cancel);
 	}
 
 	int64_t Exec(const string &sql, const StreamCancelCheck &should_cancel) override {
@@ -273,22 +290,6 @@ public:
 		auto req = client_->AwaitReadySessionAndSendRequest(n6k::OP_RPC_TABLE, body, should_cancel);
 		n6k::StartStreamingArrowFromRequestState(catalog_name_, n6k::OP_RPC_TABLE, std::move(req), out,
 		                                         std::move(should_cancel));
-	}
-
-	void CreateTable(const string &schema, const string &name, const string &columns_json,
-	                 const StreamCancelCheck &should_cancel) override {
-		std::string arrow, json_chunk, end_body;
-		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_CREATE_TABLE,
-		                              n6k_body::CreateTable(schema, name, columns_json), arrow, json_chunk, end_body,
-		                              should_cancel);
-	}
-
-	void AlterTable(const string &schema, const string &table, const string &kind, const string &details_json,
-	                const StreamCancelCheck &should_cancel) override {
-		std::string arrow, json_chunk, end_body;
-		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_ALTER_TABLE,
-		                              n6k_body::AlterTable(schema, table, kind, details_json), arrow, json_chunk,
-		                              end_body, should_cancel);
 	}
 
 	void RunOp(uint8_t op, const string &body_json, const StreamCancelCheck &should_cancel) override {

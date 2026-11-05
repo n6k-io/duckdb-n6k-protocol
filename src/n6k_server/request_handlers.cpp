@@ -75,7 +75,7 @@ static void HandleSchemaList(ServeReactor &reactor, Connection &conn, const std:
 	reactor.EndRequest(slot, PackRespEnd(target));
 }
 
-static void PackStrings(msgpack::packer<msgpack::sbuffer> &pk, const vector<string> &strings) {
+static void PackStrings(msgpack::packer<msgpack::sbuffer> &pk, const std::vector<std::string> &strings) {
 	pk.pack_array(static_cast<uint32_t>(strings.size()));
 	for (auto &s : strings) {
 		pk.pack(s);
@@ -91,7 +91,7 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 	PackString(pk, "tables");
 	pk.pack_array(static_cast<uint32_t>(rows.size()));
 	for (auto &r : rows) {
-		pk.pack_map(4);
+		pk.pack_map(6);
 		PackString(pk, "schema");
 		pk.pack(r.schema);
 		PackString(pk, "name");
@@ -100,6 +100,13 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 		PackStrings(pk, r.verbs);
 		PackString(pk, "primary_keys");
 		PackStrings(pk, r.primary_key);
+		PackString(pk, "not_null");
+		PackStrings(pk, r.not_null);
+		PackString(pk, "unique_keys");
+		pk.pack_array(static_cast<uint32_t>(r.unique_keys.size()));
+		for (auto &unique_key : r.unique_keys) {
+			PackStrings(pk, unique_key);
+		}
 	}
 	PackString(pk, "schemas");
 	pk.pack_array(static_cast<uint32_t>(schemas.size()));
@@ -119,17 +126,28 @@ struct TxnScope {
 	TxnScope &operator=(TxnScope &&) = default;
 	~TxnScope() {
 		if (pinned) {
+			StopInterrupts();
 			pinned->Touch();
 		}
 	}
 
+	// Before `guard` lets go of the transaction, so a late CANCEL cannot reach its next statement.
+	void StopInterrupts() {
+		if (slot) {
+			std::lock_guard<std::mutex> lk(slot->mu);
+			slot->context.reset();
+			slot = nullptr;
+		}
+	}
+
+	RequestSlot *slot = nullptr;
 	std::shared_ptr<PinnedTxn> pinned;
 	std::unique_lock<std::mutex> guard;
 	Connection *conn = nullptr;
 };
 
 static TxnScope ConnectionFor(ServeReactor &reactor, Connection &own, const SessionRef &sess,
-                              duckdb_yyjson::yyjson_val *root) {
+                              duckdb_yyjson::yyjson_val *root, RequestSlot &slot) {
 	TxnScope scope;
 	scope.conn = &own;
 	auto *txn_val = root ? duckdb_yyjson::yyjson_obj_get(root, "txn") : nullptr;
@@ -149,6 +167,11 @@ static TxnScope ConnectionFor(ServeReactor &reactor, Connection &own, const Sess
 		throw TransactionException("n6k_server: transaction %lld was already closed", txn);
 	}
 	scope.conn = scope.pinned->conn.get();
+	{
+		std::lock_guard<std::mutex> lk(slot.mu);
+		slot.context = scope.conn->context;
+	}
+	scope.slot = &slot;
 	return scope;
 }
 
@@ -171,7 +194,7 @@ static void HandleTablesList(ServeReactor &reactor, Connection &own, const Sessi
 			has_filter = !schema_filter_str.empty();
 		}
 	}
-	auto scope = ConnectionFor(reactor, own, sess, body_len > 0 ? doc.Root() : nullptr);
+	auto scope = ConnectionFor(reactor, own, sess, body_len > 0 ? doc.Root() : nullptr, slot);
 	auto &conn = *scope.conn;
 	const std::string &catalog = sess.catalog;
 	optional_ptr<const string> schema_filter = has_filter ? &schema_filter_str : nullptr;
@@ -370,7 +393,7 @@ static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::
 		throw InvalidInputException("n6k_server: OP_READ_PLAN requires a \"plan\" field");
 	}
 	const auto batch_rows = RequestedBatchRows(root);
-	auto scope = ConnectionFor(reactor, *own, sess, root);
+	auto scope = ConnectionFor(reactor, *own, sess, root, slot);
 	auto &conn = *scope.conn;
 	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, {}, PlanCatalogCheck(reactor, slot));
 	auto statement = make_uniq<RelationStatement>(rel);
@@ -379,6 +402,7 @@ static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::
 	if (scope.pinned) {
 		// Materialized, so the rows no longer need the transaction's Connection: a slow reader must not
 		// hold its commit back.
+		scope.StopInterrupts();
 		scope.guard.unlock();
 	} else {
 		stream->rel = rel;
@@ -425,7 +449,7 @@ static void HandleTableSchema(ServeReactor &reactor, Connection &own, const Sess
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_TABLE_SCHEMA body is not valid JSON");
 	}
-	auto scope = ConnectionFor(reactor, own, sess, doc.Root());
+	auto scope = ConnectionFor(reactor, own, sess, doc.Root(), slot);
 	auto &conn = *scope.conn;
 	const std::string &catalog = sess.catalog;
 	auto schema = JsonGetStr(doc.Root(), "schema");
@@ -467,7 +491,7 @@ static void HandleExec(ServeReactor &reactor, Connection &conn, const char *body
 	reactor.EndRequest(slot, PackRespEndRowcount(target, rowcount));
 }
 
-static void HandleCreateTable(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
+static void HandleCreateTable(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
                               size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
 	using namespace duckdb_yyjson; // NOLINT
@@ -482,14 +506,17 @@ static void HandleCreateTable(ServeReactor &reactor, Connection &conn, const std
 	if (schema.empty() || name.empty() || !cols || !yyjson_is_arr(cols)) {
 		throw InvalidInputException("n6k_server: OP_CREATE_TABLE requires \"schema\", \"name\", and \"columns\"");
 	}
-	auto result = conn.Query(BuildCreateTableSql(catalog, schema, name, cols));
+	auto sql = BuildCreateTableSql(sess.catalog, schema, name, cols, JsonGetStrArray(root, "primary_key"),
+	                               JsonGetStrArrays(root, "unique_keys"));
+	auto scope = ConnectionFor(reactor, own, sess, root, slot);
+	auto result = scope.conn->Query(sql);
 	if (result->HasError()) {
 		result->ThrowError();
 	}
 	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
-static void HandleAlterTable(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
+static void HandleAlterTable(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
                              size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
@@ -504,7 +531,9 @@ static void HandleAlterTable(ServeReactor &reactor, Connection &conn, const std:
 		throw InvalidInputException("n6k_server: OP_ALTER_TABLE requires \"schema\", \"table\", and \"kind\"");
 	}
 	auto *details = duckdb_yyjson::yyjson_obj_get(root, "details");
-	auto result = conn.Query(BuildAlterSql(catalog, schema, table, kind, details));
+	auto sql = BuildAlterSql(sess.catalog, schema, table, kind, details);
+	auto scope = ConnectionFor(reactor, own, sess, root, slot);
+	auto result = scope.conn->Query(sql);
 	if (result->HasError()) {
 		result->ThrowError();
 	}
@@ -541,7 +570,7 @@ static void HandleCreateView(ServeReactor &reactor, Connection &own, const Sessi
 	auto on_conflict = ViewOnConflict(JsonGetStr(root, "on_conflict"));
 	auto names_json = JsonGetStrArray(root, "names");
 	vector<string> names(names_json.begin(), names_json.end());
-	auto scope = ConnectionFor(reactor, own, sess, root);
+	auto scope = ConnectionFor(reactor, own, sess, root, slot);
 	auto &conn = *scope.conn;
 
 	auto info =
@@ -694,7 +723,7 @@ static void HandleDropView(ServeReactor &reactor, Connection &own, const Session
 	if (schema.empty() || name.empty()) {
 		throw InvalidInputException("n6k_server: OP_DROP_VIEW requires \"schema\" and \"name\"");
 	}
-	auto scope = ConnectionFor(reactor, own, sess, root);
+	auto scope = ConnectionFor(reactor, own, sess, root, slot);
 	auto &conn = *scope.conn;
 
 	auto statement = make_uniq<DropStatement>();
@@ -796,7 +825,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 	if (write.schema.empty() || write.table.empty()) {
 		throw InvalidInputException("n6k_server: OP_WRITE_PLAN requires \"schema\" and \"table\"");
 	}
-	auto scope = ConnectionFor(reactor, own, sess, root);
+	auto scope = ConnectionFor(reactor, own, sess, root, slot);
 	auto &conn = *scope.conn;
 
 	const uint8_t *arrow = reinterpret_cast<const uint8_t *>(body) + header_len + 1;
@@ -1228,10 +1257,10 @@ std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_p
 		HandleExec(reactor, conn, body, body_len, slot);
 		break;
 	case OP_CREATE_TABLE:
-		HandleCreateTable(reactor, conn, catalog, body, body_len, slot);
+		HandleCreateTable(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_ALTER_TABLE:
-		HandleAlterTable(reactor, conn, catalog, body, body_len, slot);
+		HandleAlterTable(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_CREATE_VIEW:
 		HandleCreateView(reactor, conn, sess, body, body_len, slot);
