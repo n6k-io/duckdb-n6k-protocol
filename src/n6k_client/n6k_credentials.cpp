@@ -278,7 +278,7 @@ static string TokenFromSecretMintingIfNearExpiry(ClientContext &context, const s
 
 std::function<string()> RedialTokenResolver(DatabaseInstance &db, const string &base_url) {
 	weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
-	return [weak_db, base_url]() -> string {
+	return [weak_db, base_url = base_url]() -> string {
 		auto database = weak_db.lock();
 		if (!database) {
 			throw IOException("n6k: cannot refresh the token for %s: the database has closed", base_url);

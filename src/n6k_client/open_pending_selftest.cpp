@@ -468,19 +468,19 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kOpenPendingState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
 
 	const OpenPendingResult r = RunOpenPendingSelftest(data_p.bind_data->Cast<N6kOpenPendingBind>().scenario);
-	output.SetValue(0, 0, Value(r.mode));
-	output.SetValue(1, 0, Value::BOOLEAN(r.ok));
-	output.SetValue(2, 0, Value::BOOLEAN(r.connected));
-	output.SetValue(3, 0, Value(r.error));
-	output.SetValue(4, 0, Value::INTEGER(r.pendings_sent));
-	output.SetValue(5, 0, Value::BIGINT(r.elapsed_ms));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value(r.mode));
+	output.data[1].SetValue(0, Value::BOOLEAN(r.ok));
+	output.data[2].SetValue(0, Value::BOOLEAN(r.connected));
+	output.data[3].SetValue(0, Value(r.error));
+	output.data[4].SetValue(0, Value::INTEGER(r.pendings_sent));
+	output.data[5].SetValue(0, Value::BIGINT(r.elapsed_ms));
+	output.SetChildCardinality(1);
 }
 
 } // namespace

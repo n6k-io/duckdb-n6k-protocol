@@ -109,7 +109,7 @@ std::string ArrowIpcStreamEncoder::EncodeChunk(DataChunk &chunk) {
 				VectorOperations::Cast(context_, chunk.data[col], cast_chunk.data[col], chunk.size());
 			}
 		}
-		cast_chunk.SetCardinality(chunk.size());
+		cast_chunk.SetChildCardinality(chunk.size());
 		to_encode = &cast_chunk;
 	}
 

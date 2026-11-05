@@ -111,7 +111,7 @@ idx_t ArrowDecode(ClientContext &context, const vector<string> &frames) {
 			while (scan_state.chunk_offset < len) {
 				out.Reset();
 				auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, len - scan_state.chunk_offset);
-				out.SetCardinality(count);
+				out.SetChildCardinality(count);
 				ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), out);
 				scan_state.chunk_offset += count;
 				rows += count;
@@ -215,19 +215,19 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<BenchState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
 	auto &bind = data_p.bind_data->Cast<BenchBind>();
 	auto measured = RunBench(context, bind.sql, bind.reps);
 	for (idx_t i = 0; i < measured.size(); i++) {
-		output.SetValue(0, i, Value(measured[i].codec));
-		output.SetValue(1, i, Value(measured[i].stage));
-		output.SetValue(2, i, Value::DOUBLE(measured[i].seconds));
-		output.SetValue(3, i, Value::UBIGINT(measured[i].bytes));
+		output.data[0].SetValue(i, Value(measured[i].codec));
+		output.data[1].SetValue(i, Value(measured[i].stage));
+		output.data[2].SetValue(i, Value::DOUBLE(measured[i].seconds));
+		output.data[3].SetValue(i, Value::UBIGINT(measured[i].bytes));
 	}
-	output.SetCardinality(measured.size());
+	output.SetChildCardinality(measured.size());
 }
 
 } // namespace

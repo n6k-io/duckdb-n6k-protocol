@@ -98,7 +98,7 @@ static void N6kServeHttpScan(ClientContext &context, TableFunctionInput &data_p,
 	auto &bind_data = data_p.bind_data->Cast<N6kServeHttpBindData>();
 	auto &state = data_p.global_state->Cast<N6kServeHttpState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -150,12 +150,12 @@ static void N6kServeHttpScan(ClientContext &context, TableFunctionInput &data_p,
 	// Declared, but not reachable in practice: the only way out of the loop above is the
 	// interrupt, and DuckDB aborts an interrupted statement rather than materialising its
 	// result. A table function must still declare a schema, and this is the honest one.
-	output.SetValue(0, 0, Value::BIGINT(connections.load()));
-	output.SetValue(1, 0, Value::BIGINT(handled.load()));
-	output.SetValue(2, 0, Value("ws://" + bind_data.host + ":" + std::to_string(bind_data.port)));
+	output.data[0].SetValue(0, Value::BIGINT(connections.load()));
+	output.data[1].SetValue(0, Value::BIGINT(handled.load()));
+	output.data[2].SetValue(0, Value("ws://" + bind_data.host + ":" + std::to_string(bind_data.port)));
 
 	state.done = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 // Missing or non-string fields read as "", non-string header values are dropped, and a non-object "headers" is ignored.
@@ -206,7 +206,7 @@ static void N6kServeWsScan(ClientContext &context, TableFunctionInput &data_p, D
 	auto &bind_data = data_p.bind_data->Cast<N6kServeWsBindData>();
 	auto &state = data_p.global_state->Cast<N6kServeHttpState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
@@ -253,14 +253,14 @@ static void N6kServeWsScan(ClientContext &context, TableFunctionInput &data_p, D
 	}
 	adopted.join();
 
-	output.SetValue(0, 0, Value::BOOLEAN(transport != nullptr));
+	output.data[0].SetValue(0, Value::BOOLEAN(transport != nullptr));
 	const vector<int64_t> values {stats.requests_handled, stats.frames_in,   stats.bytes_in,       stats.frames_out,
 	                              stats.bytes_out,        stats.duration_ms, stats.authenticate_ms};
 	for (idx_t i = 0; i < values.size(); i++) {
-		output.SetValue(i + 1, 0, Value::BIGINT(values[i]));
+		output.data[i + 1].SetValue(0, Value::BIGINT(values[i]));
 	}
 	state.done = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 void RegisterN6kServeHttpFunction(ExtensionLoader &loader) {

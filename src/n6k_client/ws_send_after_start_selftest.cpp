@@ -160,19 +160,19 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kWsSendAfterStartState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
 
 	const SendAfterStartResult r = RunSendAfterStartSelftest();
-	output.SetValue(0, 0, Value(r.mode));
-	output.SetValue(1, 0, Value::BOOLEAN(r.ok));
-	output.SetValue(2, 0, Value::BOOLEAN(r.listening));
-	output.SetValue(3, 0, Value::BOOLEAN(r.probe_received));
-	output.SetValue(4, 0, Value::INTEGER(r.port));
-	output.SetValue(5, 0, Value::INTEGER(static_cast<int32_t>(r.elapsed_ms)));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value(r.mode));
+	output.data[1].SetValue(0, Value::BOOLEAN(r.ok));
+	output.data[2].SetValue(0, Value::BOOLEAN(r.listening));
+	output.data[3].SetValue(0, Value::BOOLEAN(r.probe_received));
+	output.data[4].SetValue(0, Value::INTEGER(r.port));
+	output.data[5].SetValue(0, Value::INTEGER(static_cast<int32_t>(r.elapsed_ms)));
+	output.SetChildCardinality(1);
 }
 
 } // namespace

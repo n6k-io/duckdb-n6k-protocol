@@ -153,11 +153,11 @@ void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kListCatalogsState>();
 	idx_t count = 0;
 	while (state.offset < state.catalogs.size() && count < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, count, Value(state.catalogs[state.offset]));
+		output.data[0].SetValue(count, Value(state.catalogs[state.offset]));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

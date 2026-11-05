@@ -357,7 +357,7 @@ static void SetStringOrNull(DataChunk &output, idx_t col, idx_t row, const strin
 	if (value.empty()) {
 		FlatVector::SetNull(output.data[col], row, true);
 	} else {
-		output.SetValue(col, row, Value(value));
+		output.data[col].SetValue(row, Value(value));
 	}
 }
 
@@ -369,13 +369,13 @@ static void ParseSqlGetTablesScan(ClientContext &context, TableFunctionInput &da
 		auto &row = bind_data.tables[state.offset];
 		SetStringOrNull(output, 0, count, row.catalog);
 		SetStringOrNull(output, 1, count, row.schema);
-		output.SetValue(2, count, Value(row.table));
-		output.SetValue(3, count, Value(row.ref_type));
-		output.SetValue(4, count, Value(row.privilege));
+		output.data[2].SetValue(count, Value(row.table));
+		output.data[3].SetValue(count, Value(row.ref_type));
+		output.data[4].SetValue(count, Value(row.privilege));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 void RegisterN6kParseSqlGetTables(ExtensionLoader &loader) {

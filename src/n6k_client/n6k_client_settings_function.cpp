@@ -68,11 +68,11 @@ void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 
 	idx_t count = 0;
 	while (state.offset < bind_data.rows.size() && count < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, count, Value(bind_data.rows[state.offset]));
+		output.data[0].SetValue(count, Value(bind_data.rows[state.offset]));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

@@ -146,15 +146,15 @@ static void TablePermissionsScan(ClientContext &context, TableFunctionInput &dat
 	idx_t count = 0;
 	while (state.offset < bind_data.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = bind_data.rows[state.offset];
-		output.SetValue(0, count, Value(row.schema));
-		output.SetValue(1, count, Value(row.name));
-		output.SetValue(2, count, Value(row.kind));
-		output.SetValue(3, count, VarcharList(row.verbs));
-		output.SetValue(4, count, VarcharList(row.primary_key));
+		output.data[0].SetValue(count, Value(row.schema));
+		output.data[1].SetValue(count, Value(row.name));
+		output.data[2].SetValue(count, Value(row.kind));
+		output.data[3].SetValue(count, VarcharList(row.verbs));
+		output.data[4].SetValue(count, VarcharList(row.primary_key));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 namespace {
@@ -218,12 +218,12 @@ static void CollectVirtualCatalogPermissions(ClientContext &context, Catalog &ca
                                              optional_ptr<const string> schema_filter,
                                              optional_ptr<const string> table_filter, vector<TablePermissionRow> &out) {
 	string sql = "SELECT schema, name, kind, primary_key, verbs FROM " + string(function) + "(" +
-	             KeywordHelper::WriteQuoted(catalog.GetName().GetIdentifierName(), '\'');
+	             StringUtil::Format("%s", SQLString(catalog.GetName().GetIdentifierName()));
 	if (schema_filter) {
-		sql += ", schema := " + KeywordHelper::WriteQuoted(*schema_filter, '\'');
+		sql += StringUtil::Format(", schema := %s", SQLString(*schema_filter));
 	}
 	if (table_filter) {
-		sql += ", \"table\" := " + KeywordHelper::WriteQuoted(*table_filter, '\'');
+		sql += StringUtil::Format(", \"table\" := %s", SQLString(*table_filter));
 	}
 	sql += ") ORDER BY schema, name";
 

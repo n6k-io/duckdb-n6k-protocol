@@ -118,6 +118,7 @@ public:
 	// Permanent: the hub never dials again. While the connection is up, every bound session and request gets
 	// on_close here; otherwise each already got it at the drop or when it bound.
 	void Disconnect(const std::string &reason);
+	void LogError(const std::exception &e);
 	bool IsDisconnected();
 	// Disconnected, or dropped with no way to redial.
 	bool IsDead();

@@ -59,13 +59,13 @@ static void SplitStatementsScan(ClientContext &context, TableFunctionInput &data
 	idx_t count = 0;
 	while (state.offset < bind_data.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = bind_data.rows[state.offset];
-		output.SetValue(0, count, Value::BIGINT(NumericCast<int64_t>(state.offset + 1)));
-		output.SetValue(1, count, Value(row.statement));
-		output.SetValue(2, count, Value(row.type));
+		output.data[0].SetValue(count, Value::BIGINT(NumericCast<int64_t>(state.offset + 1)));
+		output.data[1].SetValue(count, Value(row.statement));
+		output.data[2].SetValue(count, Value(row.type));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 void RegisterN6kSplitStatements(ExtensionLoader &loader) {

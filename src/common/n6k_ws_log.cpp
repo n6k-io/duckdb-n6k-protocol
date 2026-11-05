@@ -2,8 +2,12 @@
 
 #include "n6k_msgpack.hpp"
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/logging/log_manager.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
+
+#include <cstdio>
 
 namespace duckdb {
 namespace n6k {
@@ -56,6 +60,17 @@ void RegisterWsLogType(DatabaseInstance &db) {
 	auto &log_manager = db.GetLogManager();
 	if (!log_manager.LookupLogType(WsLogType::NAME)) {
 		log_manager.RegisterLogType(make_uniq<WsLogType>());
+	}
+}
+
+void LogException(const shared_ptr<Logger> &logger, const std::exception &e) {
+	try {
+		if (logger) {
+			DUCKDB_LOG_WARNING(logger, "%s", ErrorData(e).Message());
+		}
+	} catch (...) {
+		std::fputs(e.what(), stderr);
+		std::fputc('\n', stderr);
 	}
 }
 

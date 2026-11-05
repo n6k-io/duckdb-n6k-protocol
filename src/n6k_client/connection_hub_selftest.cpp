@@ -376,28 +376,28 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kHubRoutingState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
 
 	const HubRoutingResult r = RunHubRoutingSelftest();
-	output.SetValue(0, 0, Value(r.mode));
-	output.SetValue(1, 0, Value::BOOLEAN(r.ok));
-	output.SetValue(2, 0, Value::INTEGER(r.got_ns1));
-	output.SetValue(3, 0, Value::INTEGER(r.got_ns2));
-	output.SetValue(4, 0, Value::BOOLEAN(r.ns1_only_own));
-	output.SetValue(5, 0, Value::BOOLEAN(r.ns2_only_own));
-	output.SetValue(6, 0, Value::BOOLEAN(r.untagged_dropped));
-	output.SetValue(7, 0, Value::BOOLEAN(r.unknown_ns_dropped));
-	output.SetValue(8, 0, Value::BOOLEAN(r.single_hub));
-	output.SetValue(9, 0, Value::BOOLEAN(r.request_routed));
-	output.SetValue(10, 0, Value::BOOLEAN(r.pong_not_stolen));
-	output.SetValue(11, 0, Value::BOOLEAN(r.ping_answered));
-	output.SetValue(12, 0, Value::BOOLEAN(r.close_waits));
-	output.SetValue(13, 0, Value::BOOLEAN(r.close_sends_cancel));
-	output.SetValue(14, 0, Value::INTEGER(static_cast<int32_t>(r.elapsed_ms)));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value(r.mode));
+	output.data[1].SetValue(0, Value::BOOLEAN(r.ok));
+	output.data[2].SetValue(0, Value::INTEGER(r.got_ns1));
+	output.data[3].SetValue(0, Value::INTEGER(r.got_ns2));
+	output.data[4].SetValue(0, Value::BOOLEAN(r.ns1_only_own));
+	output.data[5].SetValue(0, Value::BOOLEAN(r.ns2_only_own));
+	output.data[6].SetValue(0, Value::BOOLEAN(r.untagged_dropped));
+	output.data[7].SetValue(0, Value::BOOLEAN(r.unknown_ns_dropped));
+	output.data[8].SetValue(0, Value::BOOLEAN(r.single_hub));
+	output.data[9].SetValue(0, Value::BOOLEAN(r.request_routed));
+	output.data[10].SetValue(0, Value::BOOLEAN(r.pong_not_stolen));
+	output.data[11].SetValue(0, Value::BOOLEAN(r.ping_answered));
+	output.data[12].SetValue(0, Value::BOOLEAN(r.close_waits));
+	output.data[13].SetValue(0, Value::BOOLEAN(r.close_sends_cancel));
+	output.data[14].SetValue(0, Value::INTEGER(static_cast<int32_t>(r.elapsed_ms)));
+	output.SetChildCardinality(1);
 }
 
 } // namespace

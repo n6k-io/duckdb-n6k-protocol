@@ -155,7 +155,7 @@ static void TableDescribeScan(ClientContext &context, TableFunctionInput &data_p
 	auto &bind_data = data_p.bind_data->Cast<TableDescribeBindData>();
 	auto &state = data_p.global_state->Cast<TableDescribeState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -168,10 +168,10 @@ static void TableDescribeScan(ClientContext &context, TableFunctionInput &data_p
 		fields.push_back(make_pair("default", c.has_default ? Value(c.default_value) : Value(LogicalType::VARCHAR)));
 		column_vals.push_back(Value::STRUCT(std::move(fields)));
 	}
-	output.SetValue(0, 0, Value::LIST(ColumnStructType(), std::move(column_vals)));
+	output.data[0].SetValue(0, Value::LIST(ColumnStructType(), std::move(column_vals)));
 
-	output.SetValue(1, 0, VarcharList(bind_data.primary_key));
-	output.SetValue(2, 0, VarcharList(bind_data.verbs));
+	output.data[1].SetValue(0, VarcharList(bind_data.primary_key));
+	output.data[2].SetValue(0, VarcharList(bind_data.verbs));
 
 	vector<Value> enum_keys;
 	vector<Value> enum_values;
@@ -186,12 +186,11 @@ static void TableDescribeScan(ClientContext &context, TableFunctionInput &data_p
 		}
 		enum_values.push_back(Value::LIST(LogicalType::VARCHAR, std::move(labels)));
 	}
-	output.SetValue(3, 0,
-	                Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), std::move(enum_keys),
-	                           std::move(enum_values)));
+	output.data[3].SetValue(0, Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR),
+	                                      std::move(enum_keys), std::move(enum_values)));
 
 	state.done = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 void RegisterTableDescribeFunction(ExtensionLoader &loader) {

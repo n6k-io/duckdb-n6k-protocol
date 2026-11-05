@@ -58,7 +58,7 @@ void StreamCounterScan(ClientContext &context, TableFunctionInput &data_p, DataC
 
 	const bool unbounded = bind_data.count <= 0;
 	if (!unbounded && state.emitted >= bind_data.count) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	if (bind_data.interval_ms > 0) {
@@ -119,19 +119,19 @@ OperatorResultType SumTableInOut(ExecutionContext &context, TableFunctionInput &
 			state.total += value.GetValue<int64_t>();
 		}
 	}
-	output.SetCardinality(0);
+	output.SetChildCardinality(0);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
 OperatorFinalizeResultType SumTableFinal(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<SumTableState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return OperatorFinalizeResultType::FINISHED;
 	}
 	state.done = true;
 	FlatVector::GetDataMutable<int64_t>(output.data[0])[0] = state.total;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	return OperatorFinalizeResultType::FINISHED;
 }
 
@@ -168,11 +168,11 @@ void ServedCatalogsScan(ClientContext &context, TableFunctionInput &data_p, Data
 
 	idx_t count = 0;
 	while (state.emitted < bind_data.catalogs.size() && count < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, count, Value(bind_data.catalogs[state.emitted]));
+		output.data[0].SetValue(count, Value(bind_data.catalogs[state.emitted]));
 		state.emitted++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

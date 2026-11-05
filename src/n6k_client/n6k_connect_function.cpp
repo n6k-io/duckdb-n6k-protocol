@@ -227,7 +227,7 @@ static std::shared_ptr<n6k::ConnectionHub> Connect(ClientContext &context, const
 void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kConnectState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -237,12 +237,12 @@ void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
 	for (auto &cap : hub->HelloCapabilities()) {
 		capabilities.emplace_back(cap);
 	}
-	output.SetValue(0, 0, Value::UUID(hub->Id()));
-	output.SetValue(1, 0, Value::LIST(LogicalType::VARCHAR, std::move(capabilities)));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::UUID(hub->Id()));
+	output.data[1].SetValue(0, Value::LIST(LogicalType::VARCHAR, std::move(capabilities)));
+	output.SetChildCardinality(1);
 #else
 	(void)context;
-	output.SetCardinality(0);
+	output.SetChildCardinality(0);
 #endif
 }
 

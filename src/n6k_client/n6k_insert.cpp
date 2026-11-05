@@ -90,8 +90,8 @@ SourceResultType N6kInsert::GetDataInternal(ExecutionContext &context, DataChunk
 	source_state.done = true;
 
 	auto &gstate = sink_state->Cast<N6kInsertGlobalState>();
-	chunk.SetCardinality(1);
-	chunk.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(gstate.affected_rows)));
+	chunk.SetChildCardinality(1);
+	chunk.data[0].SetValue(0, Value::BIGINT(static_cast<int64_t>(gstate.affected_rows)));
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 

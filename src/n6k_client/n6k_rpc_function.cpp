@@ -416,8 +416,8 @@ static void N6kExecScan(ClientContext &context, TableFunctionInput &data_p, Data
 	}
 	gstate.done = true;
 	auto &bind_data = data_p.bind_data->Cast<N6kExecBindData>();
-	output.SetCardinality(1);
-	output.SetValue(0, 0, Value::BIGINT(bind_data.affected_count));
+	output.SetChildCardinality(1);
+	output.data[0].SetValue(0, Value::BIGINT(bind_data.affected_count));
 }
 
 // drop cached schema metadata; work at bind time, reuses N6kExecBindData/N6kExecScan for the count

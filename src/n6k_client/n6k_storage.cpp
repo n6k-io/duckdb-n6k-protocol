@@ -280,7 +280,7 @@ static unique_ptr<Catalog> N6kStorageAttach(optional_ptr<StorageExtensionInfo> s
 	std::shared_ptr<CatalogSession> session;
 	try {
 		lease->Hub()->EnsureConnected(should_abort);
-		auto on_detach = [lease, name]() {
+		auto on_detach = [lease, name = name]() {
 			AnnounceCatalog(*lease->Hub(), name, false);
 			lease->Release();
 		};

@@ -58,12 +58,12 @@ static void N6kVersionScan(ClientContext &context, TableFunctionInput &data_p, D
 	idx_t count = 0;
 	while (state.offset < bind_data.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = bind_data.rows[state.offset];
-		output.SetValue(0, count, Value(row.first));
-		output.SetValue(1, count, Value(row.second));
+		output.data[0].SetValue(count, Value(row.first));
+		output.data[1].SetValue(count, Value(row.second));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 void RegisterN6kVersion(ExtensionLoader &loader) {

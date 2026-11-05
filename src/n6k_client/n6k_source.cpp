@@ -75,10 +75,10 @@ vector<unique_ptr<DataChunk>> EvaluateFeed(ClientContext &context, LogicalOperat
 				auto &exprs = get.expressions[row];
 				for (idx_t col = 0; col < exprs.size(); col++) {
 					auto value = ExpressionExecutor::EvaluateScalar(context, *exprs[col]);
-					chunk->SetValue(col, row - start, value.DefaultCastAs(get.expr_types[col]));
+					chunk->data[col].SetValue(row - start, value.DefaultCastAs(get.expr_types[col]));
 				}
 			}
-			chunk->SetCardinality(end - start);
+			chunk->SetChildCardinality(end - start);
 			chunks.push_back(std::move(chunk));
 		}
 		return chunks;
@@ -241,7 +241,7 @@ void EmitReadChunk(ClientContext &context, const N6kReadShared &shared, N6kReade
                    idx_t count, const vector<LogicalType> &types) {
 	auto &columns = shared.arrow_table.GetColumns();
 	if (!shared.any_cast) {
-		chunk.SetCardinality(count);
+		chunk.SetChildCardinality(count);
 		ArrowTableFunction::ArrowToDuckDB(reader.scan_state, columns, chunk);
 		chunk.Verify();
 		return;
@@ -251,9 +251,9 @@ void EmitReadChunk(ClientContext &context, const N6kReadShared &shared, N6kReade
 		reader.scratch->Initialize(context, shared.wire_types);
 	}
 	reader.scratch->Reset();
-	reader.scratch->SetCardinality(count);
+	reader.scratch->SetChildCardinality(count);
 	ArrowTableFunction::ArrowToDuckDB(reader.scan_state, columns, *reader.scratch);
-	chunk.SetCardinality(reader.scratch->size());
+	chunk.SetChildCardinality(reader.scratch->size());
 	for (idx_t i = 0; i < types.size(); i++) {
 		if (shared.needs_cast[i]) {
 			VectorOperations::Cast(context, reader.scratch->data[i], chunk.data[i], reader.scratch->size());
@@ -342,7 +342,8 @@ CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const stri
 	CrossingScan scan;
 	scan.partitions = partitions;
 	scan.batch_indexed = true;
-	scan.open = [shared, session, catalog, body, types, partitions](ClientContext &context, idx_t) -> CrossingReader {
+	scan.open = [shared, session, catalog = catalog, body = body, types = types, partitions](ClientContext &context,
+	                                                                                         idx_t) -> CrossingReader {
 		bool started = false;
 		{
 			std::lock_guard<std::mutex> guard(shared->lock);
@@ -365,8 +366,8 @@ CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const stri
 			}
 		}
 		auto reader = std::make_shared<N6kReader>(context);
-		return [shared, reader, catalog, types](ClientContext &ctx, DataChunk &chunk,
-		                                        const CrossingWaker &waker) -> CrossingReadResult {
+		return [shared, reader, catalog = catalog, types = types](ClientContext &ctx, DataChunk &chunk,
+		                                                          const CrossingWaker &waker) -> CrossingReadResult {
 			return PullRead(ctx, *shared, *reader, chunk, waker, types, catalog);
 		};
 	};

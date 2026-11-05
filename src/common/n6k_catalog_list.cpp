@@ -53,11 +53,11 @@ void CatalogListScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 	auto &state = data_p.global_state->Cast<CatalogListState>();
 	idx_t count = 0;
 	while (state.offset < bind_data.schemas.size() && count < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, count, Value(bind_data.schemas[state.offset]));
+		output.data[0].SetValue(count, Value(bind_data.schemas[state.offset]));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

@@ -44,8 +44,16 @@ ConnectionHub::ConnectionHub(const shared_ptr<DatabaseInstance> &db, Options opt
 	}
 }
 
+void ConnectionHub::LogError(const std::exception &e) {
+	LogException(opts_.logger, e);
+}
+
 ConnectionHub::~ConnectionHub() {
-	Disconnect("connection released");
+	try {
+		Disconnect("connection released");
+	} catch (const std::exception &e) {
+		LogError(e);
+	}
 	{
 		std::lock_guard<std::mutex> lk(out_mu_);
 		writer_stop_ = true;
@@ -640,8 +648,13 @@ void ConnectionHub::Disconnect(const std::string &reason) {
 		transport->Stop();
 	}
 	Dispatch(targets, [&](Subscriber &sub) {
-		if (sub.on_close) {
+		if (!sub.on_close) {
+			return;
+		}
+		try {
 			sub.on_close(reason);
+		} catch (const std::exception &e) {
+			LogError(e);
 		}
 	});
 	StopHostWorker();
@@ -814,7 +827,11 @@ ConnectionLease::ConnectionLease(shared_ptr<ConnectionRegistry> registry, std::s
 }
 
 ConnectionLease::~ConnectionLease() {
-	Release();
+	try {
+		Release();
+	} catch (const std::exception &e) {
+		hub_->LogError(e);
+	}
 }
 
 void ConnectionLease::Release() {
@@ -840,7 +857,7 @@ std::string WsUrlFromBaseUrl(const std::string &base_url, const std::string &que
 #ifndef WASM_LOADABLE_EXTENSIONS
 ConnectionHub::Options WebSocketOptions(const std::string &ws_url, const std::string &token) {
 	ConnectionHub::Options opts;
-	opts.dial = [ws_url]() {
+	opts.dial = [ws_url = ws_url]() {
 		return std::unique_ptr<Transport>(new IxWebSocketTransport(ws_url));
 	};
 	opts.can_redial = true;

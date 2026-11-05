@@ -1,12 +1,15 @@
 #pragma once
 
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/logging/log_type.hpp"
 
+#include <exception>
 #include <string>
 
 namespace duckdb {
 
 class DatabaseInstance;
+class Logger;
 
 namespace n6k {
 
@@ -30,6 +33,9 @@ public:
 
 // Idempotent: the client and server extensions may both load into one database.
 void RegisterWsLogType(DatabaseInstance &db);
+
+// For a destructor's catch block: never throws, and falls back to stderr if logging itself fails.
+void LogException(const shared_ptr<Logger> &logger, const std::exception &e);
 
 } // namespace n6k
 } // namespace duckdb

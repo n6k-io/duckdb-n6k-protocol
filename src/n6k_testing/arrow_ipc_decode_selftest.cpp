@@ -176,17 +176,17 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kFrameDecodeSelftestState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
 
 	const std::vector<DecodedRow> rows = RunDecodeSelftest();
 	for (idx_t i = 0; i < rows.size(); i++) {
-		output.SetValue(0, i, Value::INTEGER(rows[i].id));
-		output.SetValue(1, i, Value(rows[i].name));
+		output.data[0].SetValue(i, Value::INTEGER(rows[i].id));
+		output.data[1].SetValue(i, Value(rows[i].name));
 	}
-	output.SetCardinality(rows.size());
+	output.SetChildCardinality(rows.size());
 }
 
 } // namespace
