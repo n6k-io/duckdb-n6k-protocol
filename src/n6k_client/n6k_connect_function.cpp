@@ -213,7 +213,7 @@ static std::shared_ptr<n6k::ConnectionHub> Connect(ClientContext &context, const
 #ifndef _WIN32
 		// The host still holds its fd, so only this tells a pump on the other end that the handshake failed.
 		if (acquired.created && bind_data.fd >= 0) {
-			::shutdown(bind_data.fd, SHUT_RDWR);
+			n6k::ShutdownSocket(bind_data.fd);
 		}
 #endif
 		throw;
