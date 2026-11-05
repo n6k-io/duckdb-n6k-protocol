@@ -81,6 +81,10 @@ globalThis.addEventListener("error", (e: ErrorEvent) => {
   if (e.filename) log.error("at", e.filename + ":" + e.lineno + ":" + e.colno);
 });
 
+if ((globalThis as unknown as { name: string }).name === "em-pthread") {
+  importScripts(decodeURIComponent(globalThis.location.hash.slice(1)));
+}
+
 // The shared-memory data path needs the exact WebAssembly.Memory duckdb-wasm runs
 // on. In the coi build that Memory is created inside the DuckDBModule factory
 // closure (not on any global) and IMPORTED into the wasm instance, so we grab it
