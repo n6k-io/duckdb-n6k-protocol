@@ -802,7 +802,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=2.0.0" },
     { name = "duckdb", marker = "extra == 'test-server'", specifier = ">=2.0.0" },
-    { name = "duckdb-virtual-catalog", marker = "extra == 'test-server'", specifier = ">=0.1.1" },
+    { name = "duckdb-virtual-catalog", marker = "extra == 'test-server'", specifier = ">=0.1.3" },
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.100" },
     { name = "fastapi", marker = "extra == 'test-server'", specifier = ">=0.100" },
     { name = "jsonschema" },

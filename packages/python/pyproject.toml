@@ -22,7 +22,7 @@ mcp = ["mcp>=2.3,<3; python_version >= '3.10'"]
 # watchfiles is not optional for the reload path: without it uvicorn falls back to
 # StatReload, which hardcodes rglob("*.py") and ignores reload_includes entirely —
 # so a rebuilt .duckdb_extension would never trigger a restart.
-test-server = ["fastapi>=0.100", "uvicorn>=0.27", "watchfiles>=0.21", "python-dotenv>=1", "duckdb>=2.0.0", "duckdb-virtual-catalog>=0.1.1"]
+test-server = ["fastapi>=0.100", "uvicorn>=0.27", "watchfiles>=0.21", "python-dotenv>=1", "duckdb>=2.0.0", "duckdb-virtual-catalog>=0.1.3"]
 
 [project.scripts]
 n6k-docs = "n6k_protocol.scripts.docgen:main"
