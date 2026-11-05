@@ -133,6 +133,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		}
 		const auto url = result->url;
 		SplitN6kUrl(url, result->url, result->query);
+		// Throws on a malformed URL; the result is unused.
 		n6k::ParseN6kEndpoint(result->url);
 	} else if (!result->has_token && result->scope.empty()) {
 		throw BinderException("%s requires token or scope: SELECT * FROM %s(wsFd => 7, scope => 'host:port')", FN_NAME,

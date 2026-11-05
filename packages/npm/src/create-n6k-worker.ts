@@ -184,7 +184,8 @@ export function createN6kWorker({
   // Private channel for n6k control frames; keeps them off duckdb-wasm's RPC postMessage binding.
   const n6kChannel = new MessageChannel();
 
-  // Emscripten spawns pthreads from this worker's own URL; the hash tells them which duckdb bundle to run.
+  // Emscripten spawns pthreads from this worker's own URL; the hash tells them which duckdb bundle to run
+  // (loaded in duckdb-worker.ts).
   const workerUrl = new URL(duckdbWorkerUrl, globalThis.location?.href);
   workerUrl.hash = encodeURIComponent(mainWorkerUrl);
   const worker = new Worker(workerUrl, { type: "classic" });

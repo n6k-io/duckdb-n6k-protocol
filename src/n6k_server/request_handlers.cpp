@@ -213,7 +213,7 @@ public:
 			enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, result_->GetTypes(), result_->GetNames());
 		} else {
 			stream_ = make_uniq<QueryResultStream<ChunkFormat>>(std::move(result));
-			// A statement that expands into several has no schema until the one producing the result is bound.
+			// A statement that expands into several has no schema until the one producing the result runs.
 			if (!stream_->MetadataAvailable()) {
 				chunk_ = FetchFromStream();
 			}

@@ -6,7 +6,7 @@ for building a compatible server or an alternate client. For the **SQL / host-in
 authenticate, ride an existing socket, and which functions exist — see
 [`n6k-network.md`](n6k-network.md).
 
-Attached catalogs run over a single WebSocket per ATTACH. Every operation —
+Attached catalogs with the same URL and token share one WebSocket. Every operation —
 schema discovery, scans, inserts, DDL, exec, query, and RPC — is one frame
 multiplexed on that socket. There is no HTTP data path.
 

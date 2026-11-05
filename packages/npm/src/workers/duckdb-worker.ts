@@ -81,6 +81,7 @@ globalThis.addEventListener("error", (e: ErrorEvent) => {
   if (e.filename) log.error("at", e.filename + ":" + e.lineno + ":" + e.colno);
 });
 
+// A pthread spawned from this script: the hash names its duckdb bundle (set in create-n6k-worker.ts).
 if ((globalThis as unknown as { name: string }).name === "em-pthread") {
   importScripts(decodeURIComponent(globalThis.location.hash.slice(1)));
 }

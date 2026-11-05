@@ -8,7 +8,7 @@ frame format the client and server speak, see
 provider catalogs (no network, no server) live in the sibling
 `duckdb-virtual-catalog` repo.
 
-Attached catalogs run over a single WebSocket per ATTACH; every operation —
+Attached catalogs with the same URL and token share one WebSocket; every operation —
 schema discovery, scans, inserts, DDL, exec, query, and RPC — is multiplexed on
 that socket, `CREATE TABLE` included (`OP_CREATE_TABLE`). Catalog-scoped table
 functions use the `n6k_catalog_*` prefix (e.g. `n6k_catalog_exec`,
@@ -111,12 +111,16 @@ a WebSocket upgrade header) is resolved with this precedence:
    | `host:443` | that port, any path |
    | `host:443/prefix` | that path and below |
    | `n6ks://host:443` | that port, any path, TLS only (`n6k://host:443` is plaintext only) |
+   | `/prefix` | a browser-relative URL at that path and below |
    | omitted | every server |
 
-   The most specific match wins, and hostnames match case-insensitively. `host/prefix` is
+   A URL with no port is looked up at its scheme's default, so `n6k://host` matches
+   `host:80` and not `host:8099`. The most specific match wins, and hostnames match
+   case-insensitively. `host/prefix` is
    an error, since a path needs a port. A URL with `user@` in it is refused.
    `duckdb_secrets()` shows the stored form, such as `n6k://host:443/`. Use
-   `CREATE OR REPLACE SECRET` to rotate; the next ATTACH picks it up.
+   `CREATE OR REPLACE SECRET` to rotate; the next ATTACH picks it up (for redials, see
+   the note below).
 
 3. **`TYPE n6k_refresh` secret (native)** — if no valid `n6k` access token is
    present, an on-demand OAuth mint (see *OAuth* above) produces and caches one.

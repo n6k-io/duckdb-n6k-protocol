@@ -256,6 +256,7 @@ static unique_ptr<Catalog> N6kStorageAttach(optional_ptr<StorageExtensionInfo> s
 				                  name, render_options());
 			}
 			base_url = (secure ? "https://" : "http://") + host + (port.empty() ? "" : ":" + port) + prefix;
+			// Throws on a malformed URL; the result is unused.
 			n6k::ParseN6kEndpoint(base_url);
 		}
 	}

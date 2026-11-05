@@ -7,20 +7,14 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-# Pin the C++ standard before build_*_extension create the targets (the standard
-# is captured into each target's CXX_STANDARD property at creation time, so
-# setting it afterwards is a no-op). _REQUIRED ON makes an unsupported standard
-# a hard error instead of silently decaying to an older one. DuckDB v2 requires
-# 17.
+# Before the targets exist: see the root CMakeLists.txt.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# src/common/n6k_common.cmake is the single declaration of what `src/common/`
-# holds and how to consume it. Everything this extension exercises —
-# n6k_sql_builder, serve_bind_common's ResolveServedCatalogs — lives there, so
-# this target never reaches into another extension's private include directory.
+# What this extension exercises lives in src/common, so this target never reaches
+# into another extension's private include directory.
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/n6k_common.cmake)
 n6k_common_includes()
 

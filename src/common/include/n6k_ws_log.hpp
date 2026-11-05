@@ -34,7 +34,8 @@ public:
 // Idempotent: the client and server extensions may both load into one database.
 void RegisterWsLogType(DatabaseInstance &db);
 
-// For a destructor's catch block: never throws, and falls back to stderr if logging itself fails.
+// For a catch block that must not rethrow: never throws. Falls back to stderr if logging throws; a null `logger` drops
+// the error.
 void LogException(const shared_ptr<Logger> &logger, const std::exception &e);
 
 } // namespace n6k

@@ -24,12 +24,9 @@ export type CreateDuckDBOptions = {
 };
 
 // duckdb-wasm's getJsDelivrBundles() ships only base, so its selectBundle() can
-// never return the threaded bundle even on a cross-origin-isolated page. n6k is
-// coi-only: the extension is built solely for shared memory (wasm_threads), so
-// the base bundle cannot load it. We re-add the threads entry so selectBundle
-// picks it when the browser supports wasm threads/SIMD + isolation; createDuckDB
-// then hard-requires it (see below). The dist base is derived from the base URL
-// to stay version-agnostic.
+// never return the threaded bundle, the only one that can load the extension
+// (npm_db_wasm in the Makefile). The dist base is derived from the base URL to
+// stay version-agnostic.
 function jsDelivrBundlesWithThreads(): duckdb.DuckDBBundles {
   const bundles = duckdb.getJsDelivrBundles();
   const distBase = bundles.base.mainModule.replace(/duckdb-base\.wasm$/, "");
@@ -84,11 +81,9 @@ export async function createDuckDB(
     pthreadWorker: bundle.pthreadWorker,
   });
 
-  // n6k is coi-only: the extension is built for shared memory (wasm_threads) and
-  // cannot load into a non-threaded engine. When auto-selecting, a null
-  // pthreadWorker means selectBundle fell back to base (no wasm threads / not
-  // cross-origin isolated) — fail fast instead of loading an engine the extension
-  // can't attach to. An explicit opts.bundle is the caller's responsibility.
+  // A null pthreadWorker means selectBundle fell back to base (no wasm threads /
+  // not cross-origin isolated), which the extension can't load into. An explicit
+  // opts.bundle is the caller's responsibility.
   if (!opts.bundle && bundle.pthreadWorker == null) {
     throw new TypeError(
       "n6k requires the threaded (coi) duckdb-wasm bundle, but selectBundle " +

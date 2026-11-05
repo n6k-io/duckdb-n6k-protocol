@@ -7,17 +7,11 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-# Pin the C++ standard before build_*_extension create the targets (the standard
-# is captured into each target's CXX_STANDARD property at creation time, so
-# setting it afterwards is a no-op). _REQUIRED ON makes an unsupported standard
-# a hard error instead of silently decaying to an older one. DuckDB v2 requires
-# 17.
+# Before build_*_extension create the targets: the standard is captured into each
+# target's CXX_STANDARD property at creation time, so setting it afterwards is a no-op.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# src/common/n6k_common.cmake is the single declaration of what `src/common/`
-# holds and how to consume it; every extension includes it rather than
-# re-spelling the paths.
 include(${CMAKE_CURRENT_SOURCE_DIR}/src/common/n6k_common.cmake)
 n6k_common_includes()
 
@@ -113,9 +107,8 @@ if(WASM_LOADABLE_EXTENSIONS)
   target_compile_definitions(${LOADABLE_EXTENSION_NAME}
                              PRIVATE WASM_LOADABLE_EXTENSIONS=1)
 else()
-  # ixwebsocket is an OBJECT library whose .o files are compiled into both n6k
-  # extension targets via $<TARGET_OBJECTS:ixwebsocket> above. OpenSSL must
-  # still be linked by each consumer.
+  # $<TARGET_OBJECTS:ixwebsocket> above carries no link dependencies, so each of
+  # these targets links OpenSSL itself.
   target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
   target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 endif()
