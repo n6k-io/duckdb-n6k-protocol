@@ -4,6 +4,10 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=n6k_client
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
+# Without this DuckDB v2 stamps local builds with the commit hash, which release
+# clients (Python duckdb, duckdb-wasm) refuse to load.
+export OVERRIDE_GIT_DESCRIBE := v2.0.0
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 

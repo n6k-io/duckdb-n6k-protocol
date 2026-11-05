@@ -4,6 +4,7 @@
 #include "n6k_insert.hpp"
 #include "ws_json.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -23,7 +24,8 @@ namespace duckdb {
 
 N6kCatalog::N6kCatalog(AttachedDatabase &db, string base_url_p, std::shared_ptr<CatalogSession> session_p)
     : Catalog(db), base_url(std::move(base_url_p)), session(std::move(session_p)),
-      attach(db, Crossing<N6kSource>::Adapt(make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName().GetIdentifierName()))) {
+      attach(db, Crossing<N6kSource>::Adapt(
+                     make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName().GetIdentifierName()))) {
 	session->SetPushHandler([this](uint8_t op, const std::string &body) {
 		if (op == n6k::OP_CATALOG_INVALIDATED) {
 			HandlePushInvalidate(body);
@@ -60,8 +62,8 @@ void N6kCatalog::HandlePushInvalidate(const std::string &body) {
 	for (auto &name : schema_names) {
 		joined += (joined.empty() ? "" : ",") + name;
 	}
-	n6k::RunScriptOnMainAsync("n6k.invalidated('" + n6k::EscapeSingleQuotedJsLiteral(GetName().GetIdentifierName()) + "', '" +
-	                          n6k::EscapeSingleQuotedJsLiteral(joined) + "')");
+	n6k::RunScriptOnMainAsync("n6k.invalidated('" + n6k::EscapeSingleQuotedJsLiteral(GetName().GetIdentifierName()) +
+	                          "', '" + n6k::EscapeSingleQuotedJsLiteral(joined) + "')");
 #endif
 }
 

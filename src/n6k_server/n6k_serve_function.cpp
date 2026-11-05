@@ -743,8 +743,9 @@ static void N6kServeScan(ClientContext &context, TableFunctionInput &data_p, Dat
 
 void RegisterN6kServeFunction(ExtensionLoader &loader) {
 	TableFunction func(FN_NAME, {}, N6kServeScan, N6kServeBind, N6kServeInitGlobal);
-	func.varargs = LogicalType::VARCHAR;
-	func.named_parameters["listen"] = LogicalType::VARCHAR;
+	func.GetSignature().AddArgs("args", LogicalType::VARCHAR);
+	func.GetSignature().WithTypedKwargs("options",
+	                                    [](TypedKwargs &options) { options.Add("listen", LogicalType::VARCHAR); });
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));
 }
@@ -823,16 +824,16 @@ void RegisterN6kServeStatsFunction(ExtensionLoader &loader) {
 void RegisterN6kServePushInvalidateFunction(ExtensionLoader &loader) {
 	TableFunction func(PUSH_FN_NAME, {LogicalType::VARCHAR}, N6kPushInvalidateScan, N6kPushInvalidateBind,
 	                   N6kServeInitGlobal);
-	func.varargs = LogicalType::VARCHAR;
+	func.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));
 }
 
 void RegisterN6kServeFdFunction(ExtensionLoader &loader) {
 	TableFunction func(FD_FN_NAME, {LogicalType::UUID}, N6kServeScan, N6kServeFdBind, N6kServeInitGlobal);
-	func.varargs = LogicalType::VARCHAR;
+	func.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	n6k::AddServeOptionParameters(func);
-	func.named_parameters["request"] = LogicalType::VARCHAR;
+	func.GetSignature().ExtendTypedKwargs([](TypedKwargs &options) { options.Add("request", LogicalType::VARCHAR); });
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));
 
@@ -851,7 +852,8 @@ void RegisterN6kServeFdFunction(ExtensionLoader &loader) {
 	TableFunction add_upstream(ADD_UPSTREAM_FN_NAME,
 	                           {LogicalType::UUID, LogicalType::BIGINT, LogicalType::LIST(LogicalType::VARCHAR)},
 	                           N6kUpstreamScan, N6kAddUpstreamBind, N6kServeInitGlobal);
-	add_upstream.named_parameters["rank"] = LogicalType::BIGINT;
+	add_upstream.GetSignature().WithTypedKwargs("options",
+	                                            [](TypedKwargs &options) { options.Add("rank", LogicalType::BIGINT); });
 	loader.RegisterFunction(add_upstream);
 	TableFunction set_upstream_rank(SET_UPSTREAM_RANK_FN_NAME,
 	                                {LogicalType::UUID, LogicalType::BIGINT, LogicalType::BIGINT}, N6kUpstreamScan,
@@ -877,7 +879,8 @@ void RegisterN6kServeFdFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(add);
 	TableFunction add_lazy(ADD_LAZY_CATALOG_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan,
 	                       N6kAddLazyCatalogBind, N6kServeInitGlobal);
-	add_lazy.named_parameters["rank"] = LogicalType::BIGINT;
+	add_lazy.GetSignature().WithTypedKwargs("options",
+	                                        [](TypedKwargs &options) { options.Add("rank", LogicalType::BIGINT); });
 	loader.RegisterFunction(add_lazy);
 	TableFunction remove(REMOVE_CATALOG_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServedCatalogScan,
 	                     N6kRemoveCatalogBind, N6kServeInitGlobal);

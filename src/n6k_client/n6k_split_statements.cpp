@@ -31,7 +31,7 @@ static unique_ptr<FunctionData> SplitStatementsBind(ClientContext &context, Tabl
 
 	auto sql = input.inputs[0].GetValue<string>();
 
-	Parser parser;
+	Parser parser(context);
 	parser.ParseQuery(sql);
 
 	auto result = make_uniq<SplitStatementsBindData>();

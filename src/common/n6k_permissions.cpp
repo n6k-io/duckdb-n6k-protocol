@@ -310,8 +310,10 @@ static unique_ptr<FunctionData> TablePermissionsBind(ClientContext &context, Tab
 void RegisterTablePermissionsFunction(ExtensionLoader &loader) {
 	TableFunction func("n6k_table_permissions", {LogicalType::VARCHAR}, TablePermissionsScan, TablePermissionsBind,
 	                   TablePermissionsInitGlobal);
-	func.named_parameters["schema"] = LogicalType::VARCHAR;
-	func.named_parameters["table"] = LogicalType::VARCHAR;
+	func.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("schema", LogicalType::VARCHAR);
+		options.Add("table", LogicalType::VARCHAR);
+	});
 	CreateTableFunctionInfo info(std::move(func));
 	info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 	loader.RegisterFunction(std::move(info));

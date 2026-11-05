@@ -22,7 +22,7 @@ def _conn() -> duckdb.DuckDBPyConnection:
 
 
 def _describe(conn: duckdb.DuckDBPyConnection, catalog: str, schema: str, table: str) -> dict[str, Any]:
-    row = conn.sql(
+    row = conn.execute(
         "SELECT columns, primary_key, verbs, enums "
         f"FROM n6k_table_describe('{catalog}', schema := '{schema}', \"table\" := '{table}')"
     ).fetchone()

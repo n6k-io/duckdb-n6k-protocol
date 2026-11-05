@@ -49,8 +49,8 @@ def _explain(con, sql: str) -> str:
 
 def _local(con, sql: str) -> str:
     plan = _explain(con, sql)
-    assert "CROSSING_READ" in plan, plan
-    return plan.split("CROSSING_READ")[0]
+    assert "Crossing Read" in plan, plan
+    return plan.split("Crossing Read")[0]
 
 
 def _get(con, name: str = "db") -> list[str]:
@@ -69,15 +69,15 @@ def test_default_allows_every_operator(con):
     operators = _get(con)
     for name in ("filter", "projection", "limit", "order_by", "top_n", "aggregate"):
         assert name in operators
-    assert "FILTER" not in _local(con, QUERY)
+    assert "─ Filter " not in _local(con, QUERY)
 
 
 def test_empty_list_is_scan_only(con):
     assert _set(con, "set", []) == []
     assert _get(con) == []
     local = _local(con, QUERY)
-    assert "FILTER" in local, local
-    assert "TOP_N" in local, local
+    assert "─ Filter " in local, local
+    assert "─ Top N " in local, local
     assert con.execute(QUERY).fetchall() == [("Alice",)]
 
 
@@ -85,8 +85,8 @@ def test_add_filter_only(con):
     _set(con, "set", [])
     assert _set(con, "add", ["filter"]) == ["filter"]
     local = _local(con, QUERY)
-    assert "FILTER" not in local, local
-    assert "TOP_N" in local, local
+    assert "─ Filter " not in local, local
+    assert "─ Top N " in local, local
     assert con.execute(QUERY).fetchall() == [("Alice",)]
 
 
@@ -95,11 +95,11 @@ def test_remove(con):
     assert "filter" not in after
     assert "limit" in after
     assert _get(con) == after
-    assert "FILTER" in _local(con, QUERY)
+    assert "─ Filter " in _local(con, QUERY)
 
 
 def test_names_are_case_insensitive(con):
-    assert _set(con, "SET", ["FILTER"]) == ["filter"]
+    assert _set(con, "SET", ["─ Filter "]) == ["filter"]
 
 
 def test_unknown_operator_raises(con):

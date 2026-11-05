@@ -5,7 +5,10 @@
 #include "n6k_endpoint.hpp"
 #include "n6k_schema_entry.hpp"
 #include "n6k_transaction.hpp"
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
 #include "connection_hub.hpp"

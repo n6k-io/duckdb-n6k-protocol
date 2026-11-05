@@ -333,16 +333,29 @@ wheels = [
 
 [[package]]
 name = "duckdb-virtual-catalog"
-version = "0.1.1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.2"
+source = { editable = "../duckdb-virtual-catalog/python-virtual-catalog" }
 dependencies = [
     { name = "duckdb" },
     { name = "numpy" },
     { name = "pyarrow" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e5/9d/7e91f4197dbec757f89224c90ff41a4390a8149673aa9878bc3a37dc5a82/duckdb_virtual_catalog-0.1.1.tar.gz", hash = "sha256:b3cc0772ce7aa2aca426f3096d0c2c998b3779434dc96af571215f063a652e50", size = 40927, upload-time = "2026-10-31T18:03:36.075Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/e7/e29b7df8f076c2cef8038a8a88b4386c15bb62cb8ea7f3dbd7d357cf2ec2/duckdb_virtual_catalog-0.1.1-py3-none-any.whl", hash = "sha256:6cf2696cac722386ea0e5a5c0fc9eacf8b1f869f23a27def659374dc018ddde5", size = 47773, upload-time = "2026-10-31T18:03:34.656Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "duckdb", specifier = ">=2.0.0" },
+    { name = "numpy" },
+    { name = "pyarrow" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = ">=1.13" },
+    { name = "pyarrow-stubs" },
+    { name = "pytest", specifier = ">=7" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "python-dotenv", specifier = ">=1" },
+    { name = "ruff", specifier = ">=0.8" },
 ]
 
 [[package]]
@@ -802,7 +815,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=2.0.0" },
     { name = "duckdb", marker = "extra == 'test-server'", specifier = ">=2.0.0" },
-    { name = "duckdb-virtual-catalog", marker = "extra == 'test-server'", specifier = ">=0.1.1" },
+    { name = "duckdb-virtual-catalog", marker = "extra == 'test-server'", editable = "../duckdb-virtual-catalog/python-virtual-catalog" },
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.100" },
     { name = "fastapi", marker = "extra == 'test-server'", specifier = ">=0.100" },
     { name = "jsonschema" },
@@ -822,7 +835,7 @@ provides-extras = ["duckdb", "fastapi", "mcp", "test-server"]
 dev = [
     { name = "black", specifier = ">=24" },
     { name = "duckdb", specifier = ">=2.0.0" },
-    { name = "duckdb-virtual-catalog", specifier = ">=0.1.1" },
+    { name = "duckdb-virtual-catalog", editable = "../duckdb-virtual-catalog/python-virtual-catalog" },
     { name = "fastapi", specifier = ">=0.100" },
     { name = "flake8", specifier = ">=7" },
     { name = "httpx", specifier = ">=0.27" },

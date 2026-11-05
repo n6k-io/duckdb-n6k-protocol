@@ -239,8 +239,8 @@ void N6kSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	auto details_json = n6k::SerializeJsonDocAndFree(doc);
 
 	auto &qualified = alter.GetQualifiedName();
-	session->AlterTable(qualified.Schema().GetIdentifierName(), qualified.Name().GetIdentifierName(), kind, details_json,
-	                    InterruptCheckOf(transaction));
+	session->AlterTable(qualified.Schema().GetIdentifierName(), qualified.Name().GetIdentifierName(), kind,
+	                    details_json, InterruptCheckOf(transaction));
 	Attach().Refresh(name.GetIdentifierName());
 }
 

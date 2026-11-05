@@ -180,7 +180,7 @@ void ServedCatalogsScan(ClientContext &context, TableFunctionInput &data_p, Data
 void RegisterN6kTestingFixtures(ExtensionLoader &loader) {
 	TableFunction counter("n6k_testing_stream_counter", {LogicalType::BIGINT}, StreamCounterScan, StreamCounterBindFn,
 	                      StreamCounterInit);
-	counter.varargs = LogicalType::BIGINT;
+	counter.GetSignature().AddArgs("args", LogicalType::BIGINT);
 	loader.RegisterFunction(CreateTableFunctionInfo(std::move(counter)));
 
 	TableFunction sum_table("n6k_testing_sum_table", {LogicalType::TABLE}, nullptr, SumTableBindFn, SumTableInit);
@@ -191,7 +191,7 @@ void RegisterN6kTestingFixtures(ExtensionLoader &loader) {
 	TableFunction served_catalogs("n6k_testing_served_catalogs", {}, ServedCatalogsScan, ServedCatalogsBindFn,
 	                              ServedCatalogsInit);
 	// Same shape as the serve functions: no arguments enumerates, names select.
-	served_catalogs.varargs = LogicalType::VARCHAR;
+	served_catalogs.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	loader.RegisterFunction(CreateTableFunctionInfo(std::move(served_catalogs)));
 }
 

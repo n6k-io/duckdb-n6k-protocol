@@ -38,7 +38,21 @@ LogicalType StripEnums(const LogicalType &type) {
 	}
 }
 
+vector<string> NamesOf(const vector<Identifier> &identifiers) {
+	vector<string> names;
+	names.reserve(identifiers.size());
+	for (auto &identifier : identifiers) {
+		names.push_back(identifier.GetIdentifierName());
+	}
+	return names;
+}
+
 } // namespace
+
+ArrowIpcStreamEncoder::ArrowIpcStreamEncoder(ClientContext &context, const vector<LogicalType> &types,
+                                             const vector<Identifier> &names)
+    : ArrowIpcStreamEncoder(context, types, NamesOf(names)) {
+}
 
 ArrowIpcStreamEncoder::ArrowIpcStreamEncoder(ClientContext &context, const vector<LogicalType> &types,
                                              const vector<string> &names)

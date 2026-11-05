@@ -40,8 +40,8 @@ Rows Materialize(DatabaseInstance &db, const string &sql) {
 		result->ThrowError();
 	}
 	Rows rows;
-	rows.types = result->types;
-	for (auto &column_name : result->names) {
+	rows.types = result->GetTypes();
+	for (auto &column_name : result->GetNames()) {
 		rows.names.push_back(column_name.GetIdentifierName());
 	}
 	while (auto chunk = result->Fetch()) {
@@ -123,9 +123,7 @@ idx_t ArrowDecode(ClientContext &context, const vector<string> &frames) {
 }
 
 SerializationOptions NativeOptions() {
-	SerializationOptions options;
-	options.serialization_compatibility = SerializationCompatibility::FromIndex(7);
-	return options;
+	return SerializationOptions();
 }
 
 vector<string> NativeEncode(Rows &rows) {
@@ -236,7 +234,8 @@ void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
 
 void RegisterN6kTestingWireCodecBench(ExtensionLoader &loader) {
 	TableFunction fn("n6k_testing_wire_codec_bench", {LogicalType::VARCHAR}, Scan, Bind, InitGlobal);
-	fn.named_parameters["reps"] = LogicalType::UBIGINT;
+	fn.GetSignature().WithTypedKwargs("options",
+	                                  [](TypedKwargs &options) { options.Add("reps", LogicalType::UBIGINT); });
 	loader.RegisterFunction(fn);
 }
 

@@ -250,12 +250,14 @@ void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
 
 void RegisterN6kConnect(ExtensionLoader &loader) {
 	TableFunction fn(FN_NAME, {}, Scan, Bind, InitGlobal);
-	fn.named_parameters["url"] = LogicalType::VARCHAR;
-	fn.named_parameters["wsFd"] = LogicalType::BIGINT;
-	fn.named_parameters["token"] = LogicalType::VARCHAR;
-	fn.named_parameters["scope"] = LogicalType::VARCHAR;
-	fn.named_parameters["on_text"] = LogicalType::VARCHAR;
-	fn.named_parameters["on_close"] = LogicalType::VARCHAR;
+	fn.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("url", LogicalType::VARCHAR);
+		options.Add("wsFd", LogicalType::BIGINT);
+		options.Add("token", LogicalType::VARCHAR);
+		options.Add("scope", LogicalType::VARCHAR);
+		options.Add("on_text", LogicalType::VARCHAR);
+		options.Add("on_close", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(fn);
 }
 

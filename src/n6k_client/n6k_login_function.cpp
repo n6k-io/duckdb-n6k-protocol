@@ -195,8 +195,10 @@ static void N6kLoginScan(ClientContext &context, TableFunctionInput &data_p, Dat
 
 void RegisterN6kLogin(ExtensionLoader &loader) {
 	TableFunction fn("n6k_login", {LogicalType::VARCHAR}, N6kLoginScan, N6kLoginBind, N6kLoginInitGlobal);
-	fn.named_parameters["client_id"] = LogicalType::VARCHAR;
-	fn.named_parameters["resource"] = LogicalType::VARCHAR;
+	fn.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("client_id", LogicalType::VARCHAR);
+		options.Add("resource", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(fn);
 }
 

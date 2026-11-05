@@ -37,8 +37,8 @@ void ReplaceColumnRefs(unique_ptr<Expression> &expr, const vector<ColumnBinding>
 	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &ref = expr->Cast<BoundColumnRefExpression>();
 		for (idx_t i = 0; i < bindings.size(); i++) {
-			if (bindings[i] == ref.binding) {
-				expr = make_uniq<BoundReferenceExpression>(ref.return_type, i);
+			if (bindings[i] == ref.Binding()) {
+				expr = make_uniq<BoundReferenceExpression>(ref.GetReturnType(), i);
 				return;
 			}
 		}
@@ -92,7 +92,7 @@ vector<unique_ptr<DataChunk>> EvaluateFeed(ClientContext &context, LogicalOperat
 		for (auto &expr : proj.expressions) {
 			auto copy = expr->Copy();
 			ReplaceColumnRefs(copy, bindings);
-			types.push_back(copy->return_type);
+			types.push_back(copy->GetReturnType());
 			exprs.push_back(std::move(copy));
 		}
 		ExpressionExecutor executor(context, exprs);
@@ -729,8 +729,9 @@ void N6kSession::Ddl(ClientContext &context, const CrossingDdl &ddl) {
 	if (ddl.verb == CrossingVerb::CREATE && ddl.plan) {
 		auto &view = ddl.create->Cast<CreateViewInfo>();
 		session->RunOp(n6k::OP_CREATE_VIEW,
-		               n6k_body::CreateView(ddl.schema, view.GetViewName().GetIdentifierName(), OnConflictName(view.on_conflict),
-		                                    CrossingViewColumnNames(view), RenderCrossingPlan(*ddl.plan), Txn()),
+		               n6k_body::CreateView(ddl.schema, view.GetViewName().GetIdentifierName(),
+		                                    OnConflictName(view.on_conflict), CrossingViewColumnNames(view),
+		                                    RenderCrossingPlan(*ddl.plan), Txn()),
 		               cancel);
 		return;
 	}

@@ -98,7 +98,9 @@ ScalarFunction MakeVarcharFn(const char *name, idx_t arity, scalar_function_t fn
 	for (idx_t i = 0; i < arity; i++) {
 		arg_types.push_back(LogicalType::VARCHAR);
 	}
-	return ScalarFunction(name, arg_types, LogicalType::VARCHAR, std::move(fn));
+	ScalarFunction function(name, arg_types, LogicalType::VARCHAR, std::move(fn));
+	function.SetFallible();
+	return function;
 }
 
 } // namespace

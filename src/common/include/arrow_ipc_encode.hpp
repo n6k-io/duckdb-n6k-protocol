@@ -14,6 +14,7 @@ namespace n6k {
 class ArrowIpcStreamEncoder {
 public:
 	ArrowIpcStreamEncoder(ClientContext &context, const vector<LogicalType> &types, const vector<string> &names);
+	ArrowIpcStreamEncoder(ClientContext &context, const vector<LogicalType> &types, const vector<Identifier> &names);
 	~ArrowIpcStreamEncoder();
 
 	ArrowIpcStreamEncoder(const ArrowIpcStreamEncoder &) = delete;

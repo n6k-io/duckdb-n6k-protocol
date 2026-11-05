@@ -266,9 +266,10 @@ static void N6kServeWsScan(ClientContext &context, TableFunctionInput &data_p, D
 void RegisterN6kServeHttpFunction(ExtensionLoader &loader) {
 	TableFunction func(FN_NAME, {LogicalType::VARCHAR, LogicalType::INTEGER}, N6kServeHttpScan, N6kServeHttpBind,
 	                   N6kServeHttpInitGlobal);
-	func.varargs = LogicalType::VARCHAR;
+	func.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	n6k::AddServeOptionParameters(func);
-	func.named_parameters["max_connections"] = LogicalType::BIGINT;
+	func.GetSignature().ExtendTypedKwargs(
+	    [](TypedKwargs &options) { options.Add("max_connections", LogicalType::BIGINT); });
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));
 }
@@ -276,7 +277,7 @@ void RegisterN6kServeHttpFunction(ExtensionLoader &loader) {
 void RegisterN6kServeWsFunction(ExtensionLoader &loader) {
 	TableFunction func(WS_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServeWsScan, N6kServeWsBind,
 	                   N6kServeHttpInitGlobal);
-	func.varargs = LogicalType::VARCHAR;
+	func.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	n6k::AddServeOptionParameters(func);
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));

@@ -88,7 +88,7 @@ class _Peer:
 @contextmanager
 def _serving(con: duckdb.DuckDBPyConnection, sql_tail: str) -> Iterator[tuple[_Peer, uuid.UUID]]:
     peer_sock, served = socket.socketpair()
-    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchone()[0]
+    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchall()[0][0]
     errors: list[BaseException] = []
 
     def serve() -> None:
@@ -239,7 +239,7 @@ def test_ready_before_the_serve_registers_waits_for_it(con: duckdb.DuckDBPyConne
     side = con.cursor()
     side.execute("ATTACH ':memory:' AS late")
     peer_sock, served = socket.socketpair()
-    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchone()[0]
+    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchall()[0][0]
     resolved: list[BaseException | None] = []
 
     def resolve() -> None:
@@ -282,7 +282,7 @@ def test_pending_only_serves_no_other_attached_catalog(con: duckdb.DuckDBPyConne
 def test_a_pending_name_also_served_ready_is_refused(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("ATTACH ':memory:' AS late")
     peer_sock, served = socket.socketpair()
-    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchone()[0]
+    session_id = con.execute("SELECT session_id FROM n6k_serve_create_session(?)", [served.fileno()]).fetchall()[0][0]
     sql_tail = ", 'late'" + _pending_late(con)
     worker = threading.Thread(
         target=lambda: con.execute(f"CALL n6k_serve_fd('{session_id}'::UUID{sql_tail})").fetchall(), daemon=True

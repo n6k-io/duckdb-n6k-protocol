@@ -117,9 +117,8 @@ static unique_ptr<FunctionData> TableDescribeBind(ClientContext &context, TableF
 	string schema_name = args.has_schema ? args.schema : string(DEFAULT_SCHEMA);
 
 	auto &catalog = Catalog::GetCatalog(context, Identifier(args.catalog));
-	auto entry =
-	    catalog.GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(schema_name), Identifier(args.table),
-	                     OnEntryNotFound::RETURN_NULL);
+	auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(schema_name), Identifier(args.table),
+	                              OnEntryNotFound::RETURN_NULL);
 	if (!entry) {
 		throw CatalogException("n6k_table_describe: table \"%s.%s.%s\" not found", args.catalog, schema_name,
 		                       args.table);
@@ -198,8 +197,10 @@ static void TableDescribeScan(ClientContext &context, TableFunctionInput &data_p
 void RegisterTableDescribeFunction(ExtensionLoader &loader) {
 	TableFunction func("n6k_table_describe", {LogicalType::VARCHAR}, TableDescribeScan, TableDescribeBind,
 	                   TableDescribeInitGlobal);
-	func.named_parameters["schema"] = LogicalType::VARCHAR;
-	func.named_parameters["table"] = LogicalType::VARCHAR;
+	func.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("schema", LogicalType::VARCHAR);
+		options.Add("table", LogicalType::VARCHAR);
+	});
 	CreateTableFunctionInfo info(std::move(func));
 	info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 	loader.RegisterFunction(std::move(info));

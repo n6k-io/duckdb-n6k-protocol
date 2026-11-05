@@ -62,7 +62,7 @@ def big(con):
 
 def _crossed(con, sql: str):
     plan = "\n".join(r[1] for r in con.execute(f"EXPLAIN {sql}").fetchall())
-    assert "CROSSING_READ" in plan, plan
+    assert "Crossing Read" in plan, plan
 
 
 def test_scan_keeps_insertion_order(con, big):

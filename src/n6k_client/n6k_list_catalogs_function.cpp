@@ -164,7 +164,8 @@ void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 
 void RegisterN6kListCatalogs(ExtensionLoader &loader) {
 	TableFunction fn(FN_NAME, {}, Scan, Bind, InitGlobal);
-	fn.named_parameters["connection"] = LogicalType::UUID;
+	fn.GetSignature().WithTypedKwargs("options",
+	                                  [](TypedKwargs &options) { options.Add("connection", LogicalType::UUID); });
 	loader.RegisterFunction(fn);
 }
 

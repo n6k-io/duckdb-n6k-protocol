@@ -44,7 +44,7 @@ def shared(server: int) -> Iterator[duckdb.DuckDBPyConnection]:
 
 def _crossing_reads(con: duckdb.DuckDBPyConnection, sql: str) -> int:
     plan = "\n".join(r[1] for r in con.execute(f"EXPLAIN {sql}").fetchall())
-    return plan.count("CROSSING_READ")
+    return plan.count("Crossing Read")
 
 
 def test_a_join_across_catalogs_is_one_read_of_each_catalog(shared: duckdb.DuckDBPyConnection) -> None:

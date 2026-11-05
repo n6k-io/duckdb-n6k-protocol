@@ -11,8 +11,11 @@
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/alter_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
@@ -65,8 +68,8 @@ static TableRefRow ResolveRef(ClientContext &context, const string &catalog, con
 		if (db_mgr.GetDatabase(context, Identifier(schema))) {
 			return {schema, "", table, ref_type, privilege};
 		}
-		auto &default_cat_id = DatabaseManager::GetDefaultDatabase(context);
-			auto &default_cat = default_cat_id.GetIdentifierName();
+		const auto default_cat_id = DatabaseManager::GetDefaultDatabase(context);
+		auto &default_cat = default_cat_id.GetIdentifierName();
 		if (!default_cat.empty()) {
 			auto sch = Catalog::GetSchema(context, default_cat_id, Identifier(schema), OnEntryNotFound::RETURN_NULL);
 			if (sch) {
@@ -163,8 +166,8 @@ static void CollectFromQueryNode(ClientContext &context, const QueryNode &node, 
                                  vector<TableRefRow> &out) {
 	// recurse CTE bodies with outer alias set, then add this node's CTE names before the main node
 	for (auto &entry : node.cte_map.map) {
-		if (entry.second && entry.second->query && entry.second->query->node) {
-			CollectFromQueryNode(context, *entry.second->query->node, cte_aliases, out);
+		if (entry.second && entry.second->query_node) {
+			CollectFromQueryNode(context, *entry.second->query_node, cte_aliases, out);
 		}
 	}
 	for (auto &entry : node.cte_map.map) {
@@ -329,7 +332,7 @@ static unique_ptr<FunctionData> ParseSqlGetTablesBind(ClientContext &context, Ta
 
 	auto sql = input.inputs[0].GetValue<string>();
 
-	Parser parser;
+	Parser parser(context);
 	parser.ParseQuery(sql);
 
 	vector<TableRefRow> rows;

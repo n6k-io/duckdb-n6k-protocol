@@ -1,6 +1,7 @@
 #include "request_handlers.hpp"
 
 #include "arrow_ipc_encode.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "frame_codec.hpp"
 #include "insert_scan.hpp"
 #include "n6k_catalog_list.hpp"
@@ -203,19 +204,28 @@ public:
 	    : conn(std::move(conn_p)), target_(target), batch_rows_(batch_rows) {
 	}
 
-	void Start(ServeReactor &reactor, RequestSlot &slot, unique_ptr<QueryResult> result) {
+	void Start(ServeReactor &reactor, RequestSlot &slot, unique_ptr<QueryResult> result, bool materialized = false) {
 		if (result->HasError()) {
 			result->ThrowError();
 		}
-		result_ = std::move(result);
-		enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, result_->types, result_->names);
+		if (materialized) {
+			result_ = std::move(result);
+			enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, result_->GetTypes(), result_->GetNames());
+		} else {
+			stream_ = make_uniq<QueryResultStream<ChunkFormat>>(std::move(result));
+			// A statement that expands into several has no schema until the one producing the result is bound.
+			if (!stream_->MetadataAvailable()) {
+				chunk_ = FetchFromStream();
+			}
+			enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, stream_->GetTypes(), stream_->GetNames());
+		}
 		reactor.SendForRequest(slot, PackRespSchema(target_, enc_->SchemaMessage()));
 	}
 
 	PumpResult Pump(ServeReactor &reactor, RequestSlot &slot) override {
 		while (true) {
 			if (!chunk_) {
-				chunk_ = result_->Fetch();
+				chunk_ = stream_ ? FetchFromStream() : result_->Fetch();
 				if (!chunk_) {
 					auto eos = enc_->TakeEndOfStreamMessage();
 					if (!eos.empty()) {
@@ -259,6 +269,19 @@ public:
 	InsertArrowBytes input_bytes {nullptr, 0};
 
 private:
+	unique_ptr<DataChunk> FetchFromStream() {
+		auto chunk = stream_->Fetch();
+		if (!chunk) {
+			// Null also means an execution error, which the stream records rather than throws.
+			if (stream_->HasError()) {
+				stream_->GetErrorObject().Throw();
+			}
+			return chunk;
+		}
+		chunk->Flatten();
+		return chunk;
+	}
+
 	void SendNextFrame(ServeReactor &reactor, RequestSlot &slot) {
 		auto &chunk = *chunk_;
 		if (batch_rows_ == 0 || chunk.size() <= batch_rows_) {
@@ -294,6 +317,7 @@ private:
 	FrameTarget target_;
 	idx_t batch_rows_;
 	unique_ptr<QueryResult> result_;
+	unique_ptr<QueryResultStream<ChunkFormat>> stream_;
 	unique_ptr<ArrowIpcStreamEncoder> enc_;
 	unique_ptr<DataChunk> chunk_;
 	idx_t offset_ = 0;
@@ -305,7 +329,7 @@ static std::unique_ptr<ParkedStream> StreamQuery(ServeReactor &reactor, std::uni
                                                  const std::string &sql, RequestSlot &slot, idx_t batch_rows) {
 	const FrameTarget target {slot.ns, slot.req_id};
 	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(conn), target, batch_rows));
-	stream->Start(reactor, slot, stream->conn->SendQuery(sql));
+	stream->Start(reactor, slot, stream->conn->Submit(sql));
 	return std::move(stream);
 }
 
@@ -347,7 +371,8 @@ static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::
 	auto scope = ConnectionFor(reactor, *own, sess, root);
 	auto &conn = *scope.conn;
 	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, "", PlanCatalogCheck(reactor, slot));
-	auto result = conn.context->Query(make_uniq<RelationStatement>(rel), QueryParameters(!scope.pinned));
+	auto statement = make_uniq<RelationStatement>(rel);
+	auto result = scope.pinned ? conn.Query(std::move(statement)) : conn.Submit(std::move(statement));
 	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(own), target, batch_rows));
 	if (scope.pinned) {
 		// Materialized, so the rows no longer need the transaction's Connection: a slow reader must not
@@ -356,7 +381,7 @@ static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::
 	} else {
 		stream->rel = rel;
 	}
-	stream->Start(reactor, slot, std::move(result));
+	stream->Start(reactor, slot, std::move(result), scope.pinned != nullptr);
 	return std::move(stream);
 }
 
@@ -410,11 +435,7 @@ static void HandleTableSchema(ServeReactor &reactor, Connection &own, const Sess
 	if (result->HasError()) {
 		result->ThrowError();
 	}
-	vector<string> column_names;
-	for (auto &column_name : result->names) {
-		column_names.push_back(column_name.GetIdentifierName());
-	}
-	ArrowIpcStreamEncoder enc(*conn.context, result->types, column_names);
+	ArrowIpcStreamEncoder enc(*conn.context, result->GetTypes(), result->GetNames());
 	reactor.SendForRequest(slot, PackRespSchema(target, enc.SchemaMessage()));
 	reactor.EndRequest(slot, PackRespEnd(target));
 }
@@ -436,7 +457,7 @@ static void HandleExec(ServeReactor &reactor, Connection &conn, const char *body
 	}
 	int64_t rowcount = 0;
 	if (result->RowCount() > 0 && result->ColumnCount() > 0) {
-		auto value = result->GetValue(0, 0);
+		auto value = result->Fetch()->GetValue(0, 0);
 		if (!value.IsNull()) {
 			rowcount = value.GetValue<int64_t>();
 		}
@@ -521,7 +542,8 @@ static void HandleCreateView(ServeReactor &reactor, Connection &own, const Sessi
 	auto scope = ConnectionFor(reactor, own, sess, root);
 	auto &conn = *scope.conn;
 
-	auto info = make_uniq<CreateViewInfo>(QualifiedName(Identifier(sess.catalog), Identifier(schema), Identifier(name)));
+	auto info =
+	    make_uniq<CreateViewInfo>(QualifiedName(Identifier(sess.catalog), Identifier(schema), Identifier(name)));
 	info->query = DecodeSubstraitView(conn, sess.catalog, plan, names, PlanCatalogCheck(reactor, slot));
 	info->on_conflict = on_conflict;
 	auto statement = make_uniq<CreateStatement>();
@@ -586,7 +608,7 @@ static void HandleInsert(ServeReactor &reactor, Connection &conn, const std::str
 
 	InsertArrowBytes bytes {arrow, arrow_len};
 	auto rel = conn.TableFunction(N6K_INSERT_SCAN_FN, {Value::POINTER(reinterpret_cast<uintptr_t>(&bytes))});
-	rel->Insert(catalog, schema, table);
+	rel->Insert(Identifier(catalog), Identifier(schema), Identifier(table));
 
 	reactor.EndRequest(slot, PackRespEndRowcount(target, rowcount));
 }
@@ -724,13 +746,11 @@ static unique_ptr<StreamFunctionInfo> HostStreamOrNull(Connection &conn, const s
 static bool DeclaresTableArg(CatalogEntry &entry) {
 	auto &fn_entry = entry.Cast<TableFunctionCatalogEntry>();
 	for (auto &fn : fn_entry.functions.functions) {
-		for (auto &arg : fn.arguments) {
-			if (arg.id() == LogicalTypeId::TABLE) {
+		auto &signature = fn->GetSignature();
+		for (idx_t i = 0; i < signature.GetParameterCount(); i++) {
+			if (signature.GetParameter(i).GetType().id() == LogicalTypeId::TABLE) {
 				return true;
 			}
-		}
-		if (fn.varargs.id() == LogicalTypeId::TABLE) {
-			return true;
 		}
 	}
 	return false;
@@ -1040,7 +1060,7 @@ static std::unique_ptr<ParkedStream> HandleRpcTable(ServeReactor &reactor, std::
 	                                                  : "'" + std::string(RPC_INPUT_VIEW) + "'";
 	auto sql =
 	    BuildRpcCallSql(rpc.catalog, RPC_SCHEMA, function, duckdb_yyjson::yyjson_obj_get(root, "args"), table_arg);
-	stream->Start(reactor, slot, stream->conn->SendQuery(sql));
+	stream->Start(reactor, slot, stream->conn->Submit(sql));
 	return std::move(stream);
 }
 

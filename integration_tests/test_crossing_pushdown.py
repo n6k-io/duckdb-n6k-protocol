@@ -48,7 +48,7 @@ def _explain(con, sql: str) -> str:
 
 def _crossed(con, sql: str) -> str:
     plan = _explain(con, sql)
-    assert "CROSSING_READ" in plan, plan
+    assert "Crossing Read" in plan, plan
     return plan
 
 
