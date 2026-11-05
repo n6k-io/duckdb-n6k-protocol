@@ -7,8 +7,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-# Before build_*_extension create the targets: the standard is captured into each
-# target's CXX_STANDARD property at creation time, so setting it afterwards is a no-op.
+# Before build_*_extension create the targets: the standard is captured into
+# each target's CXX_STANDARD property at creation time, so setting it afterwards
+# is a no-op.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

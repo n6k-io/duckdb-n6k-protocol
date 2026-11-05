@@ -13,8 +13,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# What this extension exercises lives in src/common, so this target never reaches
-# into another extension's private include directory.
+# What this extension exercises lives in src/common, so this target never
+# reaches into another extension's private include directory.
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/n6k_common.cmake)
 n6k_common_includes()
 
