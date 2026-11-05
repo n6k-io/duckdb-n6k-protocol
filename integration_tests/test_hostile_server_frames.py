@@ -1,8 +1,6 @@
 """A malformed frame from a server closes that connection, not the client process.
 
 The client runs in a subprocess, so an abort fails the test instead of killing pytest.
-
-    uv run pytest integration_tests/test_hostile_server_frames.py -v
 """
 
 from __future__ import annotations

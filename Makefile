@@ -46,7 +46,6 @@ wasm_threads: EXT_FLAGS += -DUSE_WASM_THREADS=1
 # (a lock_guard held across a throw stays locked forever).
 wasm_threads: WASM_COMPILE_TIME_EH_FLAGS = -fwasm-exceptions -DWEBDB_FAST_EXCEPTIONS=1
 
-# Build + stage the coi (wasm_threads) variant. `wasm-all` is an alias.
 .PHONY: wasm wasm-all
 wasm wasm-all: wasm-preflight wasm_threads npm_db_wasm
 

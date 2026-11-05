@@ -19,7 +19,7 @@ as follows:
   - `duckdb==<version>` in the root `pyproject.toml` and `duckdb>=<version>` in `packages/python/pyproject.toml` (then re-lock `uv.lock`)
   - `@duckdb/node-api` and `@duckdb/duckdb-wasm` in `packages/npm/package.json`, in both `peerDependencies` and `devDependencies`. The duckdb-wasm build must bundle the same DuckDB core — check which core version a given `1.33.1-devN.0` carries via the `submodules/duckdb` bump history in `duckdb/duckdb-wasm`, since npm's `latest` tag can lag a DuckDB release.
 
-# Vendored nanoarrow (`third_party/nanoarrow/`, currently 0.9.0)
+# Vendored nanoarrow (`third_party/nanoarrow/`; version: `NANOARROW_VERSION` in `nanoarrow.h`)
 
 The vendored copy is the unmodified output of nanoarrow's own bundler, with the
 include paths flattened. To upgrade:

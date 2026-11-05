@@ -222,7 +222,7 @@ void ConnectionHub::EnsureConnected(const AbortCheck &should_abort) {
 		auto *raw_transport = transport.get();
 		transport->Start(
 		    [this, gen, raw_transport](const std::string &bytes, bool binary) {
-			    // A throw escaping this callback aborts the host process.
+			    // On the native transports, a throw escaping this callback aborts the host process.
 			    try {
 				    OnMessage(gen, bytes, binary);
 			    } catch (const std::exception &e) {

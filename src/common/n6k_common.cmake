@@ -20,7 +20,7 @@ get_filename_component(N6K_REPO_ROOT "${N6K_COMMON_DIR}/../.." REALPATH)
 set(N6K_THIRD_PARTY "${N6K_REPO_ROOT}/third_party")
 
 # Header search paths every extension needs to compile common sources. msgpack-cxx is header-only;
-# -DMSGPACK_NO_BOOST keeps it dependency-free and C++14-clean.
+# -DMSGPACK_NO_BOOST keeps it dependency-free.
 macro(n6k_common_includes)
   include_directories(${N6K_COMMON_DIR}/include)
   include_directories(${N6K_THIRD_PARTY}/nanoarrow)

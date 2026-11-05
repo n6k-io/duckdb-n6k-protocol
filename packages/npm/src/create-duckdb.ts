@@ -81,9 +81,9 @@ export async function createDuckDB(
     pthreadWorker: bundle.pthreadWorker,
   });
 
-  // A null pthreadWorker means selectBundle fell back to base (no wasm threads /
-  // not cross-origin isolated), which the extension can't load into. An explicit
-  // opts.bundle is the caller's responsibility.
+  // A null pthreadWorker means selectBundle fell back to base (no wasm threads or
+  // SIMD / not cross-origin isolated), which the extension can't load into. An
+  // explicit opts.bundle is the caller's responsibility.
   if (!opts.bundle && bundle.pthreadWorker == null) {
     throw new TypeError(
       "n6k requires the threaded (coi) duckdb-wasm bundle, but selectBundle " +

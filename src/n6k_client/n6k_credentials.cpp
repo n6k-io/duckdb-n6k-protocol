@@ -123,7 +123,7 @@ static void CommitSecretReplacement(ClientContext &context, unique_ptr<const Bas
 	con.Commit();
 }
 
-// Store a minted JWT as a per-host TEMPORARY n6k access secret so WS/HTTP pick it up; re-mints replace in place.
+// Store a minted JWT as a TEMPORARY n6k access secret scoped to the lookup key; re-mints replace in place.
 static void StoreMintedAccessSecret(ClientContext &context, const string &key, const string &token) {
 	vector<string> scope {key};
 	auto secret = make_uniq<KeyValueSecret>(scope, "n6k", "config", Identifier("__n6k_minted_" + key));
