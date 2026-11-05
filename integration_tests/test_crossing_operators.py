@@ -99,7 +99,7 @@ def test_remove(con):
 
 
 def test_names_are_case_insensitive(con):
-    assert _set(con, "SET", ["─ Filter "]) == ["filter"]
+    assert _set(con, "SET", ["FILTER"]) == ["filter"]
 
 
 def test_unknown_operator_raises(con):
