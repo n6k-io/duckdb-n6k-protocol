@@ -24,6 +24,7 @@ public:
 	bool Send(const std::string &frame) override;
 	bool SendText(const std::string &text) override;
 	void Stop() override;
+	void Shutdown() override;
 
 private:
 	std::string url_;

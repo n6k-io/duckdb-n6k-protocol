@@ -1,6 +1,7 @@
 #ifndef WASM_LOADABLE_EXTENSIONS
 
 #include "n6k_err_throw.hpp"
+#include "n6k_external_access.hpp"
 #include "n6k_http_client.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -11,6 +12,7 @@ class NativeHttpClient : public N6kHttpClient {
 public:
 	string Get(ClientContext &context, const string &url) override {
 		auto &db = DatabaseInstance::GetDatabase(context);
+		n6k::ThrowIfExternalAccessDisabled(db);
 		auto &http_util = HTTPUtil::Get(db);
 		auto params = http_util.InitializeParameters(context, url);
 
@@ -33,6 +35,7 @@ public:
 
 	string PostForm(ClientContext &context, const string &url, const string &form_body) override {
 		auto &db = DatabaseInstance::GetDatabase(context);
+		n6k::ThrowIfExternalAccessDisabled(db);
 		auto &http_util = HTTPUtil::Get(db);
 		auto params = http_util.InitializeParameters(context, url);
 
@@ -52,6 +55,7 @@ public:
 
 	N6kFormResponse PostFormStatus(ClientContext &context, const string &url, const string &form_body) override {
 		auto &db = DatabaseInstance::GetDatabase(context);
+		n6k::ThrowIfExternalAccessDisabled(db);
 		auto &http_util = HTTPUtil::Get(db);
 		auto params = http_util.InitializeParameters(context, url);
 

@@ -103,12 +103,20 @@ a WebSocket upgrade header) is resolved with this precedence:
    ATTACH 'n6k://host:port/prefix' AS db (TYPE n6k);   -- no token in SQL
    ```
 
-   `SCOPE` is matched as a literal **prefix** of the scheme-stripped base URL
-   (`host[:port][/prefix]`), so `SCOPE 'host'` matches any port/path on that
-   host and an omitted `SCOPE` is a catch-all. The scheme is stripped on both
-   sides, so the bare hostname works regardless of how ATTACH was spelled
-   (`n6k://…` or `(host '…', port '…')`). Use `CREATE OR REPLACE SECRET` to
-   rotate; the next ATTACH picks it up.
+   `SCOPE` names a server, and both it and the URL are parsed before matching:
+
+   | `SCOPE` | Matches |
+   | --- | --- |
+   | `host` | exactly that host, any port and path, `n6k://` or `n6ks://` |
+   | `host:443` | that port, any path |
+   | `host:443/prefix` | that path and below |
+   | `n6ks://host:443` | that port, any path, TLS only (`n6k://host:443` is plaintext only) |
+   | omitted | every server |
+
+   The most specific match wins, and hostnames match case-insensitively. `host/prefix` is
+   an error, since a path needs a port. A URL with `user@` in it is refused.
+   `duckdb_secrets()` shows the stored form, such as `n6k://host:443/`. Use
+   `CREATE OR REPLACE SECRET` to rotate; the next ATTACH picks it up.
 
 3. **`TYPE n6k_refresh` secret (native)** — if no valid `n6k` access token is
    present, an on-demand OAuth mint (see *OAuth* above) produces and caches one.
@@ -224,9 +232,18 @@ SELECT * FROM n6k_disconnect('<id>');   -- a and b keep it open until they are d
 - `wsFd => <fd>`: one end of a socket the host already connected (below). A dropped
   socket cannot be dialed again, and `n6k_reconnect` fails.
 
-and optionally `token` or `scope`, and two host callbacks. A `token`, even an empty
+With `enable_external_access = false`, the extension opens no new connection and sends no
+OAuth request. `ATTACH` and `n6k_connect` (`url` and `wsFd`) that would open a connection,
+`n6k_reconnect`, redials after a drop and OAuth requests fail with a permission error.
+Connections already open keep working and can still be shared by `ATTACH` and `n6k_connect`,
+so open them first.
+
+`n6k_connect` also takes `token` or `scope`, and two host callbacks. A `token`, even an empty
 one, is sent as given with no secret lookup. Without one, secrets are resolved as
-`ATTACH` resolves them, for `scope`, else the URL. `wsFd` requires `token` or `scope`.
+`ATTACH` resolves them: for the URL, or for `scope` with `wsFd`, which has no URL and
+requires `token` or `scope`. `scope` with `url` is an error. `scope` is looked up as a URL:
+no scheme reads as `n6k://` and no port as the scheme's default, so `scope => 'host'` matches
+neither a `host:8099` secret nor a TLS-only one. Use `n6ks://host:port` for a TLS-only secret.
 Each callback is the name of a scalar function taking
 `(connection_id UUID, text VARCHAR)`:
 

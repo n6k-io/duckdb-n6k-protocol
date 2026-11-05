@@ -1,8 +1,8 @@
 """End-to-end: a `TYPE n6k` secret supplies the bearer token to a
-token-protected mount, so ATTACH needs no inline token. Also covers back-compat
-(inline token), rejection without a credential, rotation via CREATE OR REPLACE,
-and scheme-agnostic SCOPE matching. Phase 2/3 cover the OAuth refresh-secret mint
-(discovery + RFC 8693 exchange) and the n6k_login device flow.
+token-protected mount, so ATTACH needs no inline token. Also covers an inline
+token, rejection without a credential, rotation via CREATE OR REPLACE, SCOPE
+matching, the OAuth refresh-secret mint (discovery + RFC 8693 exchange) and the
+n6k_login device flow.
 
 Targets the always-on auth mounts on the running :8099 test server (see
 test_server/app.py): the `/auth` prefix requires the static AUTH_TOKEN and the
@@ -13,8 +13,10 @@ Run:
     uv run pytest integration_tests/test_secret_auth.py -v
 """
 
+import asyncio
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -25,8 +27,11 @@ from concurrent.futures import ThreadPoolExecutor
 import duckdb
 import jwt
 import pytest
+import websockets
 
 from _paths import EXT_PATH
+from n6k_protocol.engine import pack_frame, unpack_frame
+from n6k_protocol.protocol import FT_HELLO_ERR
 from n6k_server.test_server.oauth import (
     ACCEPTED_REFRESH_TOKEN,
     ACCEPTED_SUBJECT_TOKEN,
@@ -107,11 +112,8 @@ def test_create_or_replace_rotates():
     assert c.execute("SELECT count(*) FROM db_ok.main.users").fetchone()[0] == 3
 
 
-def test_scheme_agnostic_scope_option_form():
+def test_bare_host_scope_option_form():
     c = _connect()
-    # Bare-host SCOPE matches even when ATTACH supplies host/port via options
-    # (no n6k:// path) — both sides are scheme-stripped before matching. The
-    # `prefix` option targets the token-gated /auth mount.
     c.execute(f"CREATE SECRET s3 (TYPE n6k, TOKEN '{AUTH_TOKEN}', SCOPE 'localhost')")
     c.execute(f"ATTACH '' AS db (TYPE n6k, host 'localhost', port '{SERVER_PORT}', prefix '/auth')")
     assert c.execute("SELECT count(*) FROM db.main.users").fetchone()[0] == 3
@@ -322,3 +324,146 @@ def test_inline_token_is_not_refreshed_on_redial():
     _close_all_server_sockets()
     with pytest.raises(duckdb.Error):
         c.execute("SELECT count(*) FROM db.main.users").fetchone()
+
+
+# ── SCOPE sends a token only to the server it names ───────────────────────────
+
+
+class TokenListener:
+    """Records the token in every HELLO, then refuses it."""
+
+    def __init__(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        self.tokens = []
+        threading.Thread(target=lambda: asyncio.run(self._serve()), daemon=True).start()
+        time.sleep(0.3)
+
+    async def _handle(self, ws):
+        try:
+            header, _ = unpack_frame(await ws.recv())
+            self.tokens.append(header.get("token"))
+            await ws.send(pack_frame({"t": FT_HELLO_ERR, "exception_type": "x", "exception_message": "refused"}))
+        except websockets.ConnectionClosed:
+            pass
+
+    async def _serve(self):
+        async with websockets.serve(self._handle, "127.0.0.1", self.port):
+            await asyncio.Future()
+
+
+@pytest.fixture(scope="module")
+def token_listener():
+    return TokenListener()
+
+
+def _isolated_connect():
+    c = duckdb.connect(config={"allow_unsigned_extensions": "true", "allow_persistent_secrets": "false"})
+    c.load_extension("httpfs")
+    c.load_extension(EXT_PATH)
+    return c
+
+
+def _token_sent(c, listener, url):
+    listener.tokens.clear()
+    with pytest.raises(duckdb.Error, match="refused"):
+        c.execute(f"ATTACH '{url}' AS x (TYPE n6k)")
+    assert len(listener.tokens) == 1
+    return listener.tokens[0]
+
+
+@pytest.mark.parametrize(
+    "scope, url, expected",
+    [
+        ("127.0.0.1", "n6k://127.0.0.1:{port}", "tok"),
+        ("127.0.0.1:{port}", "n6k://127.0.0.1:{port}", "tok"),
+        ("n6k://127.0.0.1:{port}", "n6k://127.0.0.1:{port}", "tok"),
+        ("127.0.0.1:{port}/app", "n6k://127.0.0.1:{port}/app", "tok"),
+        ("127.0.0.1:{port}/app", "n6k://127.0.0.1:{port}/app/sub", "tok"),
+        ("LOCALHOST", "n6k://localhost:{port}", "tok"),
+        ("local", "n6k://localhost:{port}", ""),
+        ("localhost:{short_port}", "n6k://localhost:{port}", ""),
+        ("n6ks://127.0.0.1:{port}", "n6k://127.0.0.1:{port}", ""),
+        ("127.0.0.1:{port}/app", "n6k://127.0.0.1:{port}/application", ""),
+        ("127.0.0.1:{port}/app", "n6k://127.0.0.1:{port}/other", ""),
+    ],
+)
+def test_scope_decides_which_server_gets_the_token(token_listener, scope, url, expected):
+    port = token_listener.port
+    values = {"port": port, "short_port": str(port)[:2]}
+    c = _isolated_connect()
+    c.execute(f"CREATE SECRET s (TYPE n6k, TOKEN 'tok', SCOPE '{scope.format(**values)}')")
+    assert _token_sent(c, token_listener, url.format(**values)) == expected
+
+
+def test_most_specific_scope_wins(token_listener):
+    port = token_listener.port
+    c = _isolated_connect()
+    c.execute("CREATE SECRET broad (TYPE n6k, TOKEN 'broad', SCOPE '127.0.0.1')")
+    c.execute(f"CREATE SECRET narrow (TYPE n6k, TOKEN 'narrow', SCOPE '127.0.0.1:{port}')")
+    assert _token_sent(c, token_listener, f"n6k://127.0.0.1:{port}") == "narrow"
+
+
+def test_omitted_scope_is_a_catch_all(token_listener):
+    c = _isolated_connect()
+    c.execute("CREATE SECRET s (TYPE n6k, TOKEN 'tok')")
+    assert _token_sent(c, token_listener, f"n6k://127.0.0.1:{token_listener.port}") == "tok"
+
+
+@pytest.mark.parametrize(
+    "path, matches",
+    [
+        ("n6k://prod.example.com:80/", True),
+        ("n6ks://prod.example.com:443/", True),
+        ("n6k://prod.example.com.evil.net:80/", False),
+        ("n6k://prod.example.community:80/", False),
+    ],
+)
+def test_scope_stops_at_the_host_boundary(path, matches):
+    c = _isolated_connect()
+    c.execute("CREATE SECRET s (TYPE n6k, TOKEN 'tok', SCOPE 'prod.example.com')")
+    assert bool(c.execute("SELECT * FROM which_secret(?, 'n6k')", [path]).fetchall()) is matches
+
+
+def test_tls_scope_stores_only_the_tls_prefix():
+    c = _isolated_connect()
+    c.execute("CREATE SECRET s (TYPE n6k, TOKEN 'tok', SCOPE 'n6ks://prod.example.com:443')")
+    assert c.execute("SELECT scope FROM duckdb_secrets() WHERE name = 's'").fetchone()[0] == [
+        "n6ks://prod.example.com:443/"
+    ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "n6k://prod.example.com@127.0.0.1:{port}",
+        "n6k://127.0.0.1:99999",
+        "n6k://127.0.0.1:{port}x",
+    ],
+)
+@pytest.mark.parametrize("options", ["", ", anonymous true", ", token 't'"])
+def test_a_malformed_url_is_refused_before_dialing(token_listener, url, options):
+    token_listener.tokens.clear()
+    c = _isolated_connect()
+    with pytest.raises(duckdb.InvalidInputException, match="invalid URL"):
+        c.execute(f"ATTACH '{url.format(port=token_listener.port)}' AS x (TYPE n6k{options})")
+    assert token_listener.tokens == []
+
+
+@pytest.mark.parametrize("scope", ["host/path", "bad@host", "host:99999"])
+def test_a_malformed_scope_is_refused(scope):
+    c = _isolated_connect()
+    with pytest.raises(duckdb.Error, match="n6k"):
+        c.execute(f"CREATE SECRET s (TYPE n6k, TOKEN 'tok', SCOPE '{scope}')")
+
+
+def test_n6k_connect_url_with_scope_is_refused(token_listener):
+    token_listener.tokens.clear()
+    c = _isolated_connect()
+    c.execute("CREATE SECRET s (TYPE n6k, TOKEN 'tok', SCOPE 'prod.example.com')")
+    with pytest.raises(duckdb.BinderException, match="scope only applies to wsFd"):
+        c.execute(
+            f"SELECT * FROM n6k_connect(url => 'n6k://127.0.0.1:{token_listener.port}', scope => 'prod.example.com')"
+        )
+    assert token_listener.tokens == []

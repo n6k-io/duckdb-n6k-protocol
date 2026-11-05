@@ -2,6 +2,7 @@
 #include "n6k_catalog.hpp"
 #include "n6k_catalog_session.hpp"
 #include "n6k_credentials.hpp"
+#include "n6k_endpoint.hpp"
 #include "n6k_schema_entry.hpp"
 #include "n6k_transaction.hpp"
 #include "duckdb/main/database.hpp"
@@ -252,6 +253,7 @@ static unique_ptr<Catalog> N6kStorageAttach(optional_ptr<StorageExtensionInfo> s
 				                  name, render_options());
 			}
 			base_url = (secure ? "https://" : "http://") + host + (port.empty() ? "" : ":" + port) + prefix;
+			n6k::ParseN6kEndpoint(base_url);
 		}
 	}
 

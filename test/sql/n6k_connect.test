@@ -15,6 +15,16 @@ SELECT * FROM n6k_connect(url => 'n6k://localhost:1', wsFd => 7, token => 'x');
 requires exactly one of url or wsFd
 
 statement error
+SELECT * FROM n6k_connect(url => 'n6k://localhost:1', scope => 'localhost:1');
+----
+scope only applies to wsFd
+
+statement error
+SELECT * FROM n6k_connect(url => 'n6k://prod.example.com@localhost:1');
+----
+host contains '@'
+
+statement error
 SELECT * FROM n6k_connect(url => 'http://localhost:1');
 ----
 url must be n6k://

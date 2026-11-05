@@ -2,6 +2,26 @@
 
 DuckDB extensions for remote and in-process data access.
 
+## Install
+
+Requires DuckDB 1.5.6. The extensions aren't signed by DuckDB, so DuckDB must start with unsigned extensions allowed (`duckdb -unsigned`, or
+`duckdb.connect(config={"allow_unsigned_extensions": "true"})` in Python).
+
+```sql
+INSTALL n6k_client FROM 'https://storage.googleapis.com/n6k-duckdb-release';
+LOAD n6k_client;
+```
+
+This installs the newest build from `main`, not a release. Pin a release with `VERSION`:
+`'v0.1.0'` exactly, `'v0.1'` for the last published `0.1.x`, or `'v0'` for the last published
+`0.x`:
+
+```sql
+INSTALL n6k_client FROM 'https://storage.googleapis.com/n6k-duckdb-release' VERSION 'v0.1';
+```
+
+`n6k_server` installs the same way.
+
 ## Extensions
 
 **n6k_server** — serves attached catalogs over the n6k protocol; see [docs/n6k-server.md](docs/n6k-server.md).
@@ -11,7 +31,7 @@ DuckDB extensions for remote and in-process data access.
 - Attach remote databases: `ATTACH 'n6k://host:port/path' AS db (TYPE n6k, token '...');`
 - Credentials via DuckDB secrets (keeps the token out of SQL/logs):
   `CREATE SECRET (TYPE n6k, TOKEN '...', SCOPE 'host:port');` then attach without a token
-- All attached-catalog traffic multiplexed over one WebSocket per ATTACH
+- All attached-catalog traffic multiplexed over one WebSocket per URL and token
 - Plan pushdown (crossing)
 - INSERT, UPDATE, DELETE, CREATE TABLE AS, views
 - RPC table functions with dynamic binding
@@ -31,19 +51,19 @@ DuckDB secret so it stays out of SQL text and logs (redacted in
 `duckdb_secrets()`):
 
 ```sql
--- store the credential once (SCOPE is the host; scheme is ignored)
+-- store the credential once (SCOPE is the server)
 CREATE SECRET my_n6k (TYPE n6k, TOKEN 'your_token', SCOPE 'host:port');
 
 -- attach with no token in the statement
 ATTACH 'n6k://host:port' AS db (TYPE n6k);
 
--- rotate in place; the next ATTACH uses the new value (attached catalogs keep theirs, also on reconnect)
+-- rotate in place; the next ATTACH uses the new value (attached catalogs pick it up on a native redial)
 CREATE OR REPLACE SECRET my_n6k (TYPE n6k, TOKEN 'new_token', SCOPE 'host:port');
 ```
 
 Precedence: an inline `token '…'` option wins; otherwise a matching `TYPE n6k`
-secret is used; otherwise the connection is anonymous. `SCOPE` is matched as a
-prefix of the host (`'host'` matches any port/path; omit it for a catch-all).
+secret is used; otherwise the connection is anonymous. See
+[n6k-network.md](docs/n6k-network.md#bearer-token) for how `SCOPE` matches.
 
 To force an **anonymous** connection — no token, skipping the secret lookup and
 any `n6k_refresh` OAuth mint — pass `anonymous true`:

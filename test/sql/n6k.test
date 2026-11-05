@@ -19,8 +19,7 @@ nope
 
 # --- TYPE n6k secret -------------------------------------------------------
 # Credentials may be supplied via CREATE SECRET instead of an inline ATTACH
-# token. The token is redacted in duckdb_secrets() and the SCOPE is stored
-# scheme-stripped so a bare hostname matches the (also scheme-stripped) base URL.
+# token. The token is redacted in duckdb_secrets().
 
 statement ok
 CREATE SECRET n6k_test (TYPE n6k, TOKEN 'supersecret', SCOPE 'n6k://localhost:8099');
@@ -32,9 +31,8 @@ FROM duckdb_secrets() WHERE name = 'n6k_test';
 ----
 false	true
 
-# SCOPE had its 'n6k://' scheme stripped before storage
 query I
-SELECT scope = ['localhost:8099'] FROM duckdb_secrets() WHERE name = 'n6k_test';
+SELECT scope = ['n6k://localhost:8099/'] FROM duckdb_secrets() WHERE name = 'n6k_test';
 ----
 true
 
@@ -43,7 +41,7 @@ statement ok
 CREATE OR REPLACE SECRET n6k_test (TYPE n6k, TOKEN 'rotated', SCOPE 'localhost');
 
 query I
-SELECT scope = ['localhost'] FROM duckdb_secrets() WHERE name = 'n6k_test';
+SELECT list_sort(scope) = ['n6k://localhost:', 'n6ks://localhost:'] FROM duckdb_secrets() WHERE name = 'n6k_test';
 ----
 true
 

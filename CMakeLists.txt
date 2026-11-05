@@ -73,6 +73,7 @@ list(
 
 # Shared client + session + scan across native and wasm. The catalog session and
 # Arrow stream are transport-agnostic (they drive a WsClient/RequestState).
+list(APPEND EXTENSION_SOURCES src/n6k_client/n6k_endpoint.cpp)
 list(APPEND EXTENSION_SOURCES src/n6k_client/ws_client.cpp)
 list(APPEND EXTENSION_SOURCES src/n6k_client/connection_hub.cpp)
 list(APPEND EXTENSION_SOURCES src/n6k_client/hub_session.cpp)

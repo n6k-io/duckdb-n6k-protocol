@@ -1,5 +1,7 @@
 #include "n6k_credentials.hpp"
 
+#include "n6k_endpoint.hpp"
+
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
@@ -22,16 +24,6 @@
 
 namespace duckdb {
 
-string StripUrlScheme(const string &url) {
-	static const char *const kSchemes[] = {"https://", "http://", "n6ks://", "n6k://"};
-	for (auto *scheme : kSchemes) {
-		if (StringUtil::StartsWith(url, scheme)) {
-			return url.substr(string(scheme).size());
-		}
-	}
-	return url;
-}
-
 static string TokenFromMatch(SecretMatch &match) {
 	if (!match.HasMatch()) {
 		return "";
@@ -47,7 +39,7 @@ static string TokenFromMatch(SecretMatch &match) {
 static string TokenFromSecret(ClientContext &context, const string &url) {
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	auto match = secret_manager.LookupSecret(transaction, StripUrlScheme(url), "n6k");
+	auto match = secret_manager.LookupSecret(transaction, n6k::SecretLookupKey(url), "n6k");
 	return TokenFromMatch(match);
 }
 
@@ -207,7 +199,7 @@ static string MintViaRefreshGrant(ClientContext &context, const string &key, con
 // Mint a JWT from an n6k_refresh secret via the refresh grant, or discovery + RFC 8693 exchange; "" if none.
 // Single-flight within this process only.
 static string MintAndStoreAccessToken(ClientContext &context, const string &url) {
-	auto key = StripUrlScheme(url);
+	auto key = n6k::SecretLookupKey(url);
 	std::lock_guard<std::mutex> guard(MintLock());
 
 	// Another caller may have just minted while we waited for the lock.
@@ -310,7 +302,7 @@ string ResolveAttachToken(ClientContext &context, const string &base_url, const 
 	auto token = TokenFromSecret(context, base_url);
 #endif
 	if (token.empty()) {
-		DUCKDB_LOG_INFO(context, "n6k auth: no credential resolved for " + StripUrlScheme(base_url) +
+		DUCKDB_LOG_INFO(context, "n6k auth: no credential resolved for " + n6k::SecretLookupKey(base_url) +
 		                             " (anonymous; the server will reject if it requires auth)");
 	}
 	return token;
