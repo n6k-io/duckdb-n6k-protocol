@@ -97,6 +97,7 @@ std::string PackRespEndRowcountNull(const FrameTarget &target);
 std::string PackRespEndTxn(const FrameTarget &target, int64_t txn);
 std::string PackRespEndCancelled(const FrameTarget &target);
 std::string PackRespEndOk(const FrameTarget &target);
+std::string PackRespEndExists(const FrameTarget &target, bool exists);
 
 } // namespace n6k
 } // namespace duckdb

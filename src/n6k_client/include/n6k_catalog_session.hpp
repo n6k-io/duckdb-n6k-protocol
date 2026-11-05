@@ -59,6 +59,7 @@ public:
 	// `txn` >= 0 lists and describes inside that server transaction.
 	virtual n6k::WsTableList ListTables(int64_t txn) = 0;
 	virtual void FetchTableSchema(const string &schema, const string &table, int64_t txn, ArrowArrayStream *out) = 0;
+	virtual bool HasFunction(const string &name, const vector<string> &args) = 0;
 	// Start any op with a pre-serialized JSON body and hand back the raw RequestState so a source can
 	// drive it frame-by-frame (TryNext / SetOnFrame / Credit). The request is already in flight on
 	// return.

@@ -7,6 +7,7 @@ Run:
 """
 
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -96,6 +97,188 @@ def test_local_join_stays_local(con):
 def test_unshippable_function_stays_local(con):
     sql = "SELECT id FROM db.main.users WHERE regexp_matches(name, '^A') ORDER BY id"
     assert con.execute(sql).fetchall() == [(1,)]
+
+
+PRODUCT_IDS = "(SELECT id FROM db.test_schema.products)"
+
+
+def _folded(con, sql: str) -> None:
+    plan = _explain(con, sql)
+    assert "Crossing Read" in plan.splitlines()[0], plan
+
+
+def test_in_subquery_folds(con):
+    sql = f"SELECT name FROM db.main.users WHERE id IN {PRODUCT_IDS} ORDER BY id"
+    _folded(con, sql)
+    assert con.execute(sql).fetchall() == [("Alice",), ("Bob",)]
+
+
+def test_not_in_subquery_folds(con):
+    sql = f"SELECT name FROM db.main.users WHERE id NOT IN {PRODUCT_IDS} ORDER BY id"
+    _folded(con, sql)
+    assert con.execute(sql).fetchall() == [("Charlie",)]
+
+
+def test_in_subquery_as_value_folds(con):
+    sql = f"SELECT id, id IN {PRODUCT_IDS} FROM db.main.users ORDER BY id"
+    _folded(con, sql)
+    assert con.execute(sql).fetchall() == [(1, True), (2, True), (3, False)]
+
+
+@pytest.fixture
+def scratch(con):
+    table = f"pushdown_{int(time.time() * 1000)}"
+    create = f'CREATE TABLE db.main."{table}"(id INTEGER PRIMARY KEY, name VARCHAR)'
+    con.execute("SELECT * FROM n6k_catalog_exec('db', ?)", [create]).fetchall()
+    insert = f"INSERT INTO db.main.\"{table}\" VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    con.execute("SELECT * FROM n6k_catalog_exec('db', ?)", [insert]).fetchall()
+    con.execute("SELECT * FROM n6k_invalidate_cache('db', 'main')").fetchall()
+    yield f'db.main."{table}"'
+    drop = f'DROP TABLE IF EXISTS db.main."{table}"'
+    con.execute("SELECT * FROM n6k_catalog_exec('db', ?)", [drop]).fetchall()
+
+
+def test_delete_with_in_subquery_joins_on_server(con, scratch):
+    sql = f"DELETE FROM {scratch} WHERE id IN {PRODUCT_IDS}"
+    plan = _explain(con, sql)
+    assert "Hash Join" not in plan, plan
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert con.execute(f"SELECT id FROM {scratch}").fetchall() == [(3,)]
+
+
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        (
+            "SELECT name FROM db.main.users u WHERE EXISTS "
+            "(SELECT 1 FROM db.test_schema.products p WHERE p.id = u.id) ORDER BY u.id",
+            [("Alice",), ("Bob",)],
+        ),
+        (
+            "SELECT name FROM db.main.users u WHERE NOT EXISTS "
+            "(SELECT 1 FROM db.test_schema.products p WHERE p.id = u.id) ORDER BY u.id",
+            [("Charlie",)],
+        ),
+        (
+            "SELECT name FROM db.main.users u WHERE EXISTS "
+            "(SELECT 1 FROM db.test_schema.products p WHERE p.id > u.id) ORDER BY u.id",
+            [("Alice",)],
+        ),
+        (
+            "SELECT name FROM db.main.users u WHERE id IN "
+            "(SELECT id FROM db.test_schema.products p WHERE p.price < u.age) ORDER BY u.id",
+            [("Alice",), ("Bob",)],
+        ),
+        (
+            "SELECT name FROM db.main.users u WHERE id NOT IN "
+            "(SELECT id FROM db.test_schema.products p WHERE p.price < u.age) ORDER BY u.id",
+            [("Charlie",)],
+        ),
+        (
+            "SELECT id, (SELECT name FROM db.test_schema.products p WHERE p.id = u.id) "
+            "FROM db.main.users u ORDER BY id",
+            [(1, "Widget"), (2, "Gadget"), (3, None)],
+        ),
+    ],
+    ids=["exists", "not_exists", "exists_non_equality", "in", "not_in", "scalar"],
+)
+def test_correlated_subquery_folds(con, sql, expected):
+    _folded(con, sql)
+    assert con.execute(sql).fetchall() == expected
+
+
+def _add_one_udf(con):
+    con.create_function("myudf", lambda x: x + 1, ["INTEGER"], "INTEGER")
+
+
+def test_client_udf_in_projection_runs_on_client(con):
+    _add_one_udf(con)
+    sql = "SELECT myudf(id) FROM db.main.users ORDER BY id"
+    _crossed(con, sql)
+    assert con.execute(sql).fetchall() == [(2,), (3,), (4,)]
+
+
+def test_client_udf_in_filter_runs_on_client(con):
+    _add_one_udf(con)
+    sql = "SELECT id FROM db.main.users WHERE myudf(id) > 2 ORDER BY id"
+    _crossed(con, sql)
+    assert con.execute(sql).fetchall() == [(2,), (3,)]
+
+
+def test_client_udf_beside_server_condition(con):
+    _add_one_udf(con)
+    sql = "SELECT id FROM db.main.users WHERE upper(name) <> 'BOB' AND myudf(id) > 2 ORDER BY id"
+    _crossed(con, sql)
+    assert con.execute(sql).fetchall() == [(3,)]
+
+
+def test_client_udf_in_update(con, scratch):
+    con.create_function("shout", lambda x: x.upper(), ["VARCHAR"], "VARCHAR")
+    con.execute(f"UPDATE {scratch} SET name = shout(name) WHERE id = 2")
+    assert con.execute(f"SELECT id, name FROM {scratch} ORDER BY id").fetchall() == [(1, "a"), (2, "B"), (3, "c")]
+
+
+def test_client_udf_in_delete(con, scratch):
+    _add_one_udf(con)
+    con.execute(f"DELETE FROM {scratch} WHERE myudf(id) = 3")
+    assert con.execute(f"SELECT id FROM {scratch} ORDER BY id").fetchall() == [(1,), (3,)]
+
+
+def test_client_udf_in_insert(con, scratch):
+    _add_one_udf(con)
+    con.execute(f"INSERT INTO {scratch} SELECT myudf(id) + 10, name FROM {scratch} WHERE id = 1")
+    assert con.execute(f"SELECT id, name FROM {scratch} WHERE id > 3").fetchall() == [(12, "a")]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT age + 1, age * 2, age / 2, age % 2, -age FROM db.main.users ORDER BY id",
+        "SELECT count(*), count(name), sum(age), avg(age), min(name), max(age) FROM db.main.users",
+        "SELECT string_agg(name, ',') FROM db.main.users",
+        "SELECT id FROM db.main.users WHERE name LIKE 'A%' ORDER BY id",
+        "SELECT id FROM db.main.users WHERE name ILIKE 'a%' ORDER BY id",
+        "SELECT id FROM db.main.users WHERE regexp_matches(name, '^A') ORDER BY id",
+        "SELECT abs(age::DECIMAL(10, 2)), sum(age::DECIMAL(10, 2)) OVER () FROM db.main.users ORDER BY id",
+        "SELECT round(price, 1), sqrt(price) FROM db.test_schema.products ORDER BY id",
+        "SELECT sum(price::DECIMAL(10, 2)) FROM db.test_schema.products",
+        "SELECT concat(name, '!', name), name || '?', length(name), substr(name, 1, 2) FROM db.main.users ORDER BY id",
+        "SELECT list_contains([id, age], 30), [id, age][1], len([id, age]) FROM db.main.users ORDER BY id",
+        "SELECT {'a': id, 'b': name}.b FROM db.main.users ORDER BY id",
+        "SELECT date_trunc('day', TIMESTAMP '2024-01-02 03:04:05') + INTERVAL 1 DAY, id FROM db.main.users ORDER BY id",
+        "SELECT id, row_number() OVER (ORDER BY age), sum(age) OVER () FROM db.main.users ORDER BY id",
+        "SELECT date_part('year', DATE '2024-01-02' + id), year(DATE '2024-01-02' + id) FROM db.main.users ORDER BY id",
+    ],
+)
+def test_builtin_functions_still_fold(con, sql):
+    _folded(con, sql)
+    assert con.execute(sql).fetchall()
+
+
+def test_server_function_still_folds_with_client_udf_registered(con):
+    _add_one_udf(con)
+    sql = "SELECT upper(name) FROM db.main.users ORDER BY id"
+    assert "Crossing Read" in _explain(con, sql).splitlines()[0]
+    assert con.execute(sql).fetchall() == [("ALICE",), ("BOB",), ("CHARLIE",)]
+
+
+def test_client_overload_the_server_can_bind_by_cast_runs_on_client(con):
+    con.create_function("sqrt", lambda x: x * 100, ["INTEGER"], "INTEGER")
+    sql = "SELECT sqrt(id) FROM db.main.users ORDER BY id"
+    assert con.execute(sql).fetchall() == [(100,), (200,), (300,)]
+
+
+def test_client_overload_the_server_cannot_bind_runs_on_client(con):
+    con.create_function("abs", lambda x: x.lower(), ["VARCHAR"], "VARCHAR")
+    sql = "SELECT abs(name) FROM db.main.users ORDER BY id"
+    assert con.execute(sql).fetchall() == [("alice",), ("bob",), ("charlie",)]
+
+
+def test_server_overload_of_client_overloaded_name_still_folds(con):
+    con.create_function("upper", lambda x: x * 100, ["INTEGER"], "INTEGER")
+    sql = "SELECT upper(name) FROM db.main.users ORDER BY id"
+    assert "Crossing Read" in _explain(con, sql).splitlines()[0]
+    assert con.execute(sql).fetchall() == [("ALICE",), ("BOB",), ("CHARLIE",)]
 
 
 def test_distinct_and_union_cross(con):

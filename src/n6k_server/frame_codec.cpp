@@ -324,5 +324,15 @@ std::string PackRespEndOk(const FrameTarget &target) {
 	return PackedHeader(sb);
 }
 
+std::string PackRespEndExists(const FrameTarget &target, bool exists) {
+	msgpack::sbuffer sb;
+	msgpack::packer<msgpack::sbuffer> pk(&sb);
+	pk.pack_map(3 + NsKeyCount(target));
+	PackTIdInto(pk, FrameType::RESP_END, target);
+	PackString(pk, "exists");
+	pk.pack(exists);
+	return PackedHeader(sb);
+}
+
 } // namespace n6k
 } // namespace duckdb

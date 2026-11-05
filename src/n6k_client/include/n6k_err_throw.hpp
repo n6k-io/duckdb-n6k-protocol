@@ -132,6 +132,8 @@ inline const char *OpName(uint8_t op) {
 		return "CREATE_VIEW";
 	case OP_DROP_VIEW:
 		return "DROP_VIEW";
+	case OP_HAS_FUNCTION:
+		return "HAS_FUNCTION";
 	case OP_ALTER_TABLE:
 		return "ALTER_TABLE";
 	case OP_READ_PLAN:

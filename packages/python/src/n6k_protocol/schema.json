@@ -492,6 +492,9 @@
         "txn": {
           "type": "integer"
         },
+        "exists": {
+          "type": "boolean"
+        },
         "ns": {
           "type": "integer"
         }
@@ -1046,6 +1049,40 @@
         "schema",
         "name",
         "if_exists"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 1
+        },
+        "op": {
+          "const": 23
+        },
+        "id": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "op",
+        "id",
+        "name",
+        "args"
       ],
       "additionalProperties": false
     },

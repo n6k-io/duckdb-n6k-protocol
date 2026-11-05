@@ -14,7 +14,10 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
@@ -413,6 +416,8 @@ static constexpr LogicalOperatorType CROSSING_OPERATOR_TYPES[] = {
     LogicalOperatorType::LOGICAL_LIMIT,
     LogicalOperatorType::LOGICAL_ORDER_BY,
     LogicalOperatorType::LOGICAL_TOP_N,
+    LogicalOperatorType::LOGICAL_MATERIALIZED_CTE,
+    LogicalOperatorType::LOGICAL_CTE_REF,
 };
 
 static string CrossingOperatorName(LogicalOperatorType type) {
@@ -634,6 +639,59 @@ CrossingPlan N6kSource::Plan(const CrossingPlanRequest &request) {
 	    MakeFloorNode(0, request.schema, request.table, columns.names, columns.types, floor_catalog));
 }
 
+static bool NamedCallOf(const Expression &expr, string &name, vector<string> &args) {
+	auto add_args = [&](const vector<unique_ptr<Expression>> &children) {
+		for (auto &child : children) {
+			args.push_back(child->GetReturnType().ToString());
+		}
+	};
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &call = expr.Cast<BoundFunctionExpression>();
+		name = call.Function().GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	case ExpressionClass::BOUND_AGGREGATE: {
+		auto &call = expr.Cast<BoundAggregateExpression>();
+		name = call.Function().GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	case ExpressionClass::BOUND_WINDOW: {
+		auto &call = expr.Cast<BoundWindowExpression>();
+		if (!call.AggregateFunction()) {
+			return false;
+		}
+		name = call.AggregateFunction()->GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+bool N6kSource::ServerHasFunction(const string &name, const vector<string> &args) {
+	auto signature = name + "(" + StringUtil::Join(args, ", ") + ")";
+	{
+		lock_guard<mutex> guard(server_functions_lock);
+		auto known = server_functions.find(signature);
+		if (known != server_functions.end()) {
+			return known->second;
+		}
+	}
+	auto exists = session->HasFunction(name, args);
+	lock_guard<mutex> guard(server_functions_lock);
+	server_functions[signature] = exists;
+	return exists;
+}
+
+void N6kSource::ForgetServerFunctions() {
+	lock_guard<mutex> guard(server_functions_lock);
+	server_functions.clear();
+}
+
 CrossingVerdict N6kSource::AcceptsCall(const Expression &expr) {
 	if (!session->HasCapability(n6k::CAP_CROSSING)) {
 		return CrossingVerdict::No("the server does not accept plans");
@@ -641,6 +699,17 @@ CrossingVerdict N6kSource::AcceptsCall(const Expression &expr) {
 	std::string reason;
 	if (!SubstraitCanRenderCall(expr, reason)) {
 		return CrossingVerdict::No(reason);
+	}
+	string name;
+	vector<string> args;
+	if (!NamedCallOf(expr, name, args)) {
+		return CrossingVerdict::Yes();
+	}
+	if (!session->HasCapability(n6k::CAP_HAS_FUNCTION)) {
+		return CrossingVerdict::No("the server cannot say which functions it has");
+	}
+	if (!ServerHasFunction(name, args)) {
+		return CrossingVerdict::No("the server has no function " + name + "(" + StringUtil::Join(args, ", ") + ")");
 	}
 	return CrossingVerdict::Yes();
 }

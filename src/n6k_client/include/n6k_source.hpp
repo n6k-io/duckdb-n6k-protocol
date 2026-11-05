@@ -47,8 +47,11 @@ public:
 	//! `action` is set, add or remove.
 	vector<string> SetCrossingOperators(const string &action, const vector<string> &names);
 
+	void ForgetServerFunctions();
+
 private:
 	void ListIfNeeded();
+	bool ServerHasFunction(const string &name, const vector<string> &args);
 
 	struct Columns {
 		vector<string> names;
@@ -68,6 +71,8 @@ private:
 	case_insensitive_map_t<case_insensitive_map_t<Columns>> described;
 	mutex crossing_lock;
 	case_insensitive_set_t crossing_operators;
+	mutex server_functions_lock;
+	case_insensitive_map_t<bool> server_functions;
 };
 
 class N6kSession {

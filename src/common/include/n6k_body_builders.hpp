@@ -170,6 +170,19 @@ inline std::string DropView(const std::string &schema, const std::string &name, 
 	return n6k::SerializeJsonDocAndFree(doc);
 }
 
+inline std::string HasFunction(const std::string &name, const std::vector<std::string> &args) {
+	auto *doc = yyjson_mut_doc_new(nullptr);
+	auto *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_strncpy(doc, root, "name", name.c_str(), name.size());
+	auto *types = duckdb_yyjson::yyjson_mut_arr(doc);
+	for (auto &arg : args) {
+		duckdb_yyjson::yyjson_mut_arr_add_strncpy(doc, types, arg.c_str(), arg.size());
+	}
+	yyjson_mut_obj_add_val(doc, root, "args", types);
+	return n6k::SerializeJsonDocAndFree(doc);
+}
+
 inline std::string AlterTable(const std::string &schema, const std::string &table, const std::string &kind,
                               const std::string &details_json) {
 	auto *doc = yyjson_mut_doc_new(nullptr);

@@ -15,6 +15,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/main/query_parameters.hpp"
@@ -370,7 +372,7 @@ static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::
 	const auto batch_rows = RequestedBatchRows(root);
 	auto scope = ConnectionFor(reactor, *own, sess, root);
 	auto &conn = *scope.conn;
-	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, "", PlanCatalogCheck(reactor, slot));
+	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, {}, PlanCatalogCheck(reactor, slot));
 	auto statement = make_uniq<RelationStatement>(rel);
 	auto result = scope.pinned ? conn.Query(std::move(statement)) : conn.Submit(std::move(statement));
 	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(own), target, batch_rows));
@@ -555,6 +557,130 @@ static void HandleCreateView(ServeReactor &reactor, Connection &own, const Sessi
 	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
+static bool DeclaredTypeTakes(const LogicalType &declared, const LogicalType &actual) {
+	if (declared.id() == LogicalTypeId::ANY || declared.id() == LogicalTypeId::TEMPLATE) {
+		return true;
+	}
+	if (declared.id() != actual.id()) {
+		return false;
+	}
+	// A bare STRUCT, ARRAY or similar declares no children, and reading them would be undefined.
+	if (!declared.HasParameters()) {
+		return true;
+	}
+	switch (declared.id()) {
+	case LogicalTypeId::LIST:
+		return DeclaredTypeTakes(ListType::GetChildType(declared), ListType::GetChildType(actual));
+	case LogicalTypeId::ARRAY:
+		return DeclaredTypeTakes(ArrayType::GetChildType(declared), ArrayType::GetChildType(actual));
+	case LogicalTypeId::MAP:
+		return DeclaredTypeTakes(MapType::KeyType(declared), MapType::KeyType(actual)) &&
+		       DeclaredTypeTakes(MapType::ValueType(declared), MapType::ValueType(actual));
+	case LogicalTypeId::STRUCT: {
+		auto count = StructType::GetChildCount(declared);
+		if (count == 0) {
+			return true;
+		}
+		if (count != StructType::GetChildCount(actual)) {
+			return false;
+		}
+		for (idx_t i = 0; i < count; i++) {
+			if (!DeclaredTypeTakes(StructType::GetChildType(declared, i), StructType::GetChildType(actual, i))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	default:
+		return true;
+	}
+}
+
+static bool SignatureTakes(const FunctionSignature &signature, const vector<LogicalType> &actual) {
+	idx_t next = 0;
+	for (auto &param : signature.GetParameters()) {
+		if (param.IsVariadic()) {
+			continue;
+		}
+		if (next < actual.size() && param.AcceptsPosition()) {
+			if (!DeclaredTypeTakes(param.GetType(), actual[next])) {
+				return false;
+			}
+			next++;
+		} else if (!param.HasDefaultValue()) {
+			return false;
+		}
+	}
+	auto variadic = signature.GetArgs();
+	if (!variadic) {
+		variadic = signature.GetKwargs();
+	}
+	for (; next < actual.size(); next++) {
+		if (!variadic || !DeclaredTypeTakes(variadic->GetType(), actual[next])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+template <class ENTRY>
+static bool AnyOverloadTakes(ENTRY &entry, const vector<LogicalType> &actual) {
+	for (idx_t i = 0; i < entry.functions.Size(); i++) {
+		if (SignatureTakes(entry.functions.GetFunctionByOffset(i)->GetSignature(), actual)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Only the system catalog: looking further would ask every attached catalog, and one could be an unreachable upstream.
+// Scalar and aggregate functions share a lookup, so asking for one can return the other.
+static bool SystemFunctionTakes(ClientContext &context, const string &name, const vector<LogicalType> &actual) {
+	QualifiedName qualified(Identifier(string(SYSTEM_CATALOG)), Identifier(string(DEFAULT_SCHEMA)), Identifier(name));
+	EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, qualified, QueryErrorContext());
+	auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+	if (!entry) {
+		return false;
+	}
+	switch (entry->type) {
+	case CatalogType::SCALAR_FUNCTION_ENTRY:
+		return AnyOverloadTakes(entry->Cast<ScalarFunctionCatalogEntry>(), actual);
+	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+		return AnyOverloadTakes(entry->Cast<AggregateFunctionCatalogEntry>(), actual);
+	default:
+		return false;
+	}
+}
+
+static void HandleHasFunction(ServeReactor &reactor, Connection &conn, const char *body, size_t body_len,
+                              RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
+	JsonDoc doc(body, body_len);
+	if (!doc.Parsed()) {
+		throw InvalidInputException("n6k_server: OP_HAS_FUNCTION body is not valid JSON");
+	}
+	auto *root = doc.Root();
+	auto name = JsonGetStr(root, "name");
+	if (name.empty() || !duckdb_yyjson::yyjson_is_arr(duckdb_yyjson::yyjson_obj_get(root, "args"))) {
+		throw InvalidInputException("n6k_server: OP_HAS_FUNCTION requires \"name\" and \"args\"");
+	}
+	auto arg_names = JsonGetStrArray(root, "args");
+	bool exists = false;
+	conn.context->RunFunctionInTransaction([&]() {
+		vector<LogicalType> actual;
+		for (auto &arg : arg_names) {
+			try {
+				actual.push_back(TransformStringToLogicalType(arg, *conn.context));
+			} catch (const std::exception &) {
+				// A type this server cannot name is a type no function here takes.
+				return;
+			}
+		}
+		exists = SystemFunctionTakes(*conn.context, name, actual);
+	});
+	reactor.EndRequest(slot, PackRespEndExists(target, exists));
+}
+
 static void HandleDropView(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
                            size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
@@ -681,7 +807,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 		seam = conn.TableFunction(N6K_INSERT_SCAN_FN, {Value::POINTER(reinterpret_cast<uintptr_t>(&bytes))})
 		           ->GetTableRef();
 	} else if (!plan.empty()) {
-		seam = DecodeSubstraitJson(conn, catalog, plan, "", PlanCatalogCheck(reactor, slot))->GetTableRef();
+		seam = DecodeSubstraitJson(conn, catalog, plan, {}, PlanCatalogCheck(reactor, slot))->GetTableRef();
 	} else {
 		throw InvalidInputException("n6k_server: OP_WRITE_PLAN carries neither rows nor a plan");
 	}
@@ -1112,6 +1238,9 @@ std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_p
 		break;
 	case OP_DROP_VIEW:
 		HandleDropView(reactor, conn, sess, body, body_len, slot);
+		break;
+	case OP_HAS_FUNCTION:
+		HandleHasFunction(reactor, conn, body, body_len, slot);
 		break;
 	case OP_RPC_SCALAR:
 		return HandleRpcScalar(reactor, own, catalog, body, body_len, slot);

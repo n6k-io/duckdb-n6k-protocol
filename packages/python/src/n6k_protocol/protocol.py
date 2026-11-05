@@ -101,6 +101,7 @@ OP_CATALOG_LIST: Final = 19
 OP_CATALOGS_CHANGED: Final = 20
 OP_CREATE_VIEW: Final = 21
 OP_DROP_VIEW: Final = 22
+OP_HAS_FUNCTION: Final = 23
 
 _OPS = [
     ("SCHEMA_LIST", OP_SCHEMA_LIST),
@@ -123,6 +124,7 @@ _OPS = [
     ("CATALOGS_CHANGED", OP_CATALOGS_CHANGED),
     ("CREATE_VIEW", OP_CREATE_VIEW),
     ("DROP_VIEW", OP_DROP_VIEW),
+    ("HAS_FUNCTION", OP_HAS_FUNCTION),
 ]
 
 
@@ -272,6 +274,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("cancelled", "boolean", False),
             ("ok", "boolean", False),
             ("txn", "integer", False),
+            ("exists", "boolean", False),
         ],
     },
     # ── Requests (t=REQ, discriminated on op) ────────────────────────────────
@@ -374,6 +377,13 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("if_exists", "boolean", True),
             ("txn", "integer", False),
         ],
+    },
+    # `args` are the argument types of a bound call, as DuckDB spells them.
+    {
+        "name": "REQ_HAS_FUNCTION",
+        "t": FT_REQ,
+        "op": OP_HAS_FUNCTION,
+        "fields": [_F_ID, ("name", "string", True), ("args", _ARRAY_OF_STR, True)],
     },
     {
         "name": "REQ_ALTER_TABLE",
@@ -513,9 +523,10 @@ CAP_CROSSING: Final = "crossing"
 CAP_JSONRPC: Final = "jsonrpc"
 CAP_MCP: Final = "mcp"
 CAP_CATALOG_PLANS: Final = "catalog_plans"
+CAP_HAS_FUNCTION: Final = "has_function"
 
 # What this implementation supports at each level; client and server both send their set.
 HELLO_CAPS: Final = (CAP_CROSSING, CAP_JSONRPC, CAP_MCP)
 # The subset of HELLO_CAPS the server grants only when the app serving the socket provides it.
 APP_HELLO_CAPS: Final = (CAP_JSONRPC, CAP_MCP)
-OPEN_CAPS: Final = (CAP_CATALOG_PLANS,)
+OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION)

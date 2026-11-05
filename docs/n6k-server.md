@@ -421,6 +421,11 @@ The extension answers the REQ ops dispatched in `HandleRequest`
 | `CREATE_TABLE` / `ALTER_TABLE` | ✅ → `{"ok":true}` (ALTER: add/drop/rename column) |
 | `CREATE_VIEW` / `DROP_VIEW` | ✅ → `{"ok":true}`; the body is a Substrait plan decoded over the served catalog |
 | `RPC_SCALAR` / `RPC_TABLE` | ✅ calls a host registration, or a table function or macro resolved in the served DuckDB |
+| `HAS_FUNCTION` | ✅ → `{"exists":bool}`; an exact signature match against the system catalog's scalar and aggregate functions |
+
+A client asks `HAS_FUNCTION` before sending a function call in a plan, and runs the call itself on a no. It
+caches each answer until `n6k_invalidate_cache`, a catalog invalidation or `DETACH`. A client function with the
+same name and argument types as a different server function gets a yes, so the server's function runs.
 
 Streaming ops (`QUERY`, `READ_PLAN`, `RPC_*`) follow the protocol's credit and
 cancel rules ([Lifecycle](n6k-network-protocol.md#lifecycle)). Errors are typed

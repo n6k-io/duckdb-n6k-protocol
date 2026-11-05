@@ -47,6 +47,12 @@ vector<string> NamesOf(const vector<Identifier> &identifiers) {
 	return names;
 }
 
+ClientProperties WireProperties(ClientContext &context) {
+	auto props = context.GetClientProperties();
+	props.arrow_lossless_conversion = true;
+	return props;
+}
+
 } // namespace
 
 ArrowIpcStreamEncoder::ArrowIpcStreamEncoder(ClientContext &context, const vector<LogicalType> &types,
@@ -61,7 +67,7 @@ ArrowIpcStreamEncoder::ArrowIpcStreamEncoder(ClientContext &context, const vecto
 		wire_types_.push_back(StripEnums(type));
 		needs_cast_ = needs_cast_ || wire_types_.back() != type;
 	}
-	auto props = context.GetClientProperties();
+	auto props = WireProperties(context);
 	ArrowConverter::ToArrowSchema(&schema_, wire_types_, names, props);
 	ArrowBufferInit(&buf_);
 	if (ArrowIpcOutputStreamInitBuffer(&out_stream_, &buf_) != NANOARROW_OK) {
@@ -95,7 +101,7 @@ std::string ArrowIpcStreamEncoder::SchemaMessage() {
 }
 
 std::string ArrowIpcStreamEncoder::EncodeChunk(DataChunk &chunk) {
-	auto props = context_.GetClientProperties();
+	auto props = WireProperties(context_);
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> empty_extensions;
 
 	DataChunk cast_chunk;

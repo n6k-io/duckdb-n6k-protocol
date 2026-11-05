@@ -177,6 +177,7 @@ missing capability is fatal. Each name is defined at exactly one level.
 | `jsonrpc` | connect | Text frames carry JSON-RPC 2.0 requests the socket owner answers ([Text frames](#text-frames)). |
 | `mcp` | connect | Text frames carry an MCP session (implies `jsonrpc`). |
 | `catalog_plans` | open | A `READ_PLAN`, `WRITE_PLAN` or `CREATE_VIEW` plan may name a table `[catalog, schema, table]`, for any catalog a session on this socket has open. |
+| `has_function` | open | `HAS_FUNCTION {name, args}` is implemented: `RESP_END {exists}` says whether the session's server has a scalar or aggregate function taking exactly those argument types, with no cast. A client without this capability treats every answer as no and keeps named function calls out of its plans. |
 
 `catalog_plans` is granted only for a catalog the server serves itself, never one it forwards upstream. A
 plan naming a catalog no session on the socket has open fails with `CatalogException`, and one naming a

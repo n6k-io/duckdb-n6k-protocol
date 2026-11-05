@@ -40,6 +40,7 @@ from n6k_protocol.protocol import (
     N6K_PROTOCOL_VERSION,
     OP_CATALOG_LIST,
     OP_CATALOGS_CHANGED,
+    OP_HAS_FUNCTION,
     OP_QUERY,
     STREAM_FRAME_N6K,
 )
@@ -307,6 +308,22 @@ def test_catalog_plans_is_granted_for_a_local_catalog_but_not_a_forwarded_one(
             ack = peer.recv_until(lambda f: f["t"] in (FT_OPEN_ACK, FT_OPEN_ERR) and f["ns"] == ns)
             assert ack["t"] == FT_OPEN_ACK
             assert ack["capabilities"] == granted
+
+
+def test_has_function_on_a_forwarded_catalog_answers_for_the_upstream(
+    con: duckdb.DuckDBPyConnection, upstream: _UpstreamServer
+) -> None:
+    upstream.con.cursor().create_function("only_upstream", lambda x: x, ["BIGINT"], "BIGINT")
+    side = con.cursor()
+    with _serving(con, ", 'x'") as (peer, session_id):
+        _attach_upstream(side, peer, session_id, upstream)
+        for ns, catalog, exists in ((1, "a", True), (2, "x", False)):
+            assert _open(peer, ns, catalog)["t"] == FT_OPEN_ACK
+            peer.send(
+                {"t": FT_REQ, "id": 1, "ns": ns, "op": OP_HAS_FUNCTION, "name": "only_upstream", "args": ["BIGINT"]}
+            )
+            end = peer.recv_until(lambda f: f["t"] == FT_RESP_END and f.get("ns") == ns)
+            assert end["exists"] is exists
 
 
 def test_a_name_already_served_is_skipped(con: duckdb.DuckDBPyConnection) -> None:

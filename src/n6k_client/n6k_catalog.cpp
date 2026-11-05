@@ -68,6 +68,7 @@ void N6kCatalog::HandlePushInvalidate(const std::string &body) {
 }
 
 void N6kCatalog::InvalidateSchemas(const std::vector<std::string> &schema_names) {
+	Source().ForgetServerFunctions();
 	for (auto &name : schema_names) {
 		attach.Refresh(name);
 	}
