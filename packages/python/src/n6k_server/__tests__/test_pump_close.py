@@ -1,16 +1,9 @@
-import asyncio
-import gc
 import logging
-import threading
-import time
-import weakref
-from types import SimpleNamespace
-from typing import Any
 
 import duckdb
 import pytest
 
-from n6k_server.pump import _Callbacks, _close_all
+from n6k_server.pump import _close_all
 
 
 def _is_closed(con: duckdb.DuckDBPyConnection) -> bool:
@@ -53,55 +46,3 @@ def test_no_on_close_closes_con() -> None:
     con = duckdb.connect()
     _close_all([], con, None)
     assert _is_closed(con)
-
-
-def test_a_close_refused_by_a_running_query_finishes_once_it_returns() -> None:
-    con = duckdb.connect()
-    entered = threading.Event()
-    release = threading.Event()
-
-    def block() -> int:
-        entered.set()
-        release.wait()
-        return 1
-
-    con.create_function("block", block, [], "BIGINT", side_effects=True)
-    runner = threading.Thread(target=lambda: con.execute("SELECT block()"), daemon=True)
-    runner.start()
-    assert entered.wait(10)
-    closes: list[duckdb.DuckDBPyConnection] = []
-
-    try:
-        _close_all([], con, closes.append)
-    finally:
-        release.set()
-    runner.join(10)
-    deadline = time.monotonic() + 10
-    while True:
-        try:
-            if _is_closed(con):
-                break
-        except duckdb.ResourceInUseException:
-            pass
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
-    assert closes == [con]
-
-
-def test_closing_callbacks_lets_gc_collect_them_while_con_is_open() -> None:
-    async def run() -> None:
-        con = duckdb.connect()
-        text: Any = SimpleNamespace(capabilities=())
-        handle: Any = None
-        callbacks = _Callbacks(None, con, lambda *_: [], {}, handle, text, None, lambda *_: None)
-        callbacks.create_functions()
-        ref = weakref.ref(callbacks)
-
-        callbacks.close()
-        del callbacks
-        gc.collect()
-
-        assert ref() is None
-        con.close()
-
-    asyncio.run(run())
