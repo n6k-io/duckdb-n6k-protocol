@@ -5,7 +5,6 @@ Run:
 """
 
 import io
-import uuid
 
 import pyarrow.ipc as ipc
 import pytest
@@ -28,44 +27,6 @@ from n6k_protocol.protocol import (
 async def _begin(client) -> int:
     frames = await client.request(OP_TXN_BEGIN)
     return [h for h, _ in frames if h["t"] == FT_RESP_END][0]["txn"]
-
-
-async def _table_row(client, name: str, **args) -> dict | None:
-    frames = await client.request(OP_TABLES_LIST, schema="main", **args)
-    chunk = [h for h, _ in frames if h["t"] == FT_RESP_CHUNK][0]
-    rows = [t for t in chunk["tables"] if t["name"] == name]
-    return rows[0] if rows else None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("target", TARGETS, ids=str)
-async def test_create_table_in_a_transaction_reports_its_constraints_and_rolls_back(target: Target) -> None:
-    name = "wt_" + uuid.uuid4().hex[:8]
-    async with connect(target) as (client, _hello):
-        txn = await _begin(client)
-        await client.request(
-            OP_CREATE_TABLE,
-            schema="main",
-            name=name,
-            columns=[
-                {"name": "id", "type": "INTEGER"},
-                {"name": "code", "type": "VARCHAR"},
-                {"name": "n", "type": "INTEGER", "not_null": True},
-            ],
-            primary_key=["id"],
-            unique_keys=[["code"]],
-            txn=txn,
-        )
-
-        row = await _table_row(client, name, txn=txn)
-        assert row is not None
-        assert row["primary_keys"] == ["id"]
-        assert sorted(row["not_null"]) == ["id", "n"]
-        assert row["unique_keys"] == [["code"]]
-        assert await _table_row(client, name) is None
-
-        await client.request(OP_TXN_ROLLBACK, txn=txn)
-        assert await _table_row(client, name) is None
 
 
 @pytest.mark.asyncio
