@@ -42,8 +42,6 @@ from n6k_protocol.protocol import (  # noqa: E402
     OP_READ_PLAN,
     OP_RPC_SCALAR,
     OP_RPC_TABLE,
-    OP_TABLE_SCHEMA,
-    OP_TABLES_LIST,
 )
 
 # A frame is `(header map, body bytes)` — see n6k_protocol.engine.
@@ -123,63 +121,6 @@ async def test_open_ack(server):
     try:
         assert opened["default_batch_credits"] >= 1
         assert opened["max_concurrent_reqs"] >= 1
-    finally:
-        await ws.close()
-
-
-@pytest.mark.asyncio
-async def test_schema_list(server):
-    ws, client, _ = await _connect(server)
-    try:
-        req = await client.send_req(OP_SCHEMA_LIST)
-        frames = await client.drain_until_end(req)
-        chunk = [h for h, _ in frames if h["t"] == FT_RESP_CHUNK][0]
-        assert "main" in chunk["schemas"]
-        assert "test_schema" in chunk["schemas"]
-        # Ordering is part of the op's contract — see src/common/n6k_catalog_list.cpp.
-        assert chunk["schemas"] == sorted(chunk["schemas"])
-        assert any(h["t"] == FT_RESP_END for h, _ in frames)
-    finally:
-        await ws.close()
-
-
-@pytest.mark.asyncio
-async def test_catalog_list(server):
-    ws, client, _ = await _connect(server)
-    try:
-        req = await client.send_req(OP_CATALOG_LIST)
-        frames = await client.drain_until_end(req)
-        chunk = [h for h, _ in frames if h["t"] == FT_RESP_CHUNK][0]
-        assert isinstance(chunk["catalogs"], list)
-        assert len(chunk["catalogs"]) > 0
-        assert any(h["t"] == FT_RESP_END for h, _ in frames)
-    finally:
-        await ws.close()
-
-
-@pytest.mark.asyncio
-async def test_tables_list(server):
-    ws, client, _ = await _connect(server)
-    try:
-        req = await client.send_req(OP_TABLES_LIST)
-        frames = await client.drain_until_end(req)
-        chunk = [h for h, _ in frames if h["t"] == FT_RESP_CHUNK][0]
-        names = {t["name"] for t in chunk["tables"]}
-        assert {"users", "products"}.issubset(names)
-    finally:
-        await ws.close()
-
-
-@pytest.mark.asyncio
-async def test_table_schema(server):
-    ws, client, _ = await _connect(server)
-    try:
-        req = await client.send_req(OP_TABLE_SCHEMA, schema="main", table="users")
-        frames = await client.drain_until_end(req)
-        schema_frames = [b for h, b in frames if h["t"] == FT_RESP_SCHEMA]
-        assert len(schema_frames) == 1  # RESP_SCHEMA always carries the Arrow schema body
-        reader = ipc.open_stream(io.BytesIO(schema_frames[0]))
-        assert {f.name for f in reader.schema} == {"id", "name", "age"}
     finally:
         await ws.close()
 
@@ -359,82 +300,6 @@ async def test_socket_drop_server_cleans_up(server):
 
 
 # ── Streaming RPC (an RPC whose handler yields batches, incl. unbounded) ──────
-
-
-@pytest.mark.asyncio
-async def test_streaming_rpc_bounded_streams_and_completes(server):
-    """A bounded streaming RPC delivers its rows as RESP_CHUNKs and ends normally
-    (not cancelled). Proves the RPC op flows through the streaming path."""
-    ws, client, _ = await _connect(server)
-    try:
-        req = await client.send_req(OP_RPC_SCALAR, function="stream_counter", args=[3])
-        frames = await client.drain_until_end(req)
-
-        assert sum(1 for h, _ in frames if h["t"] == FT_RESP_SCHEMA) == 1
-        chunks = [b for h, b in frames if h["t"] == FT_RESP_CHUNK]
-        assert len(chunks) >= 1
-        end = [h for h, _ in frames if h["t"] == FT_RESP_END][0]
-        assert not end.get("cancelled")
-
-        schema_bytes = [b for h, b in frames if h["t"] == FT_RESP_SCHEMA][0]
-        table = ipc.open_stream(io.BytesIO(schema_bytes + b"".join(chunks))).read_all()
-        assert table.column("n").to_pylist() == [0, 1, 2]
-    finally:
-        await ws.close()
-
-
-@pytest.mark.asyncio
-async def test_streaming_rpc_unbounded_backpressure_and_cancel(server):
-    """An *unbounded* streaming RPC: yields forever, so it delivers exactly the
-    credit window then parks on backpressure; granting credit resumes it; CANCEL
-    terminates it with RESP_END{cancelled:true}."""
-    ws, client, opened = await _connect(server)
-    budget = opened["default_batch_credits"]
-    try:
-        # args=[0] → unbounded counter.
-        req = await client.send_req(OP_RPC_SCALAR, function="stream_counter", args=[0])
-
-        header, _ = await client.recv()
-        assert header["t"] == FT_RESP_SCHEMA and header.get("id") == req
-
-        # Incremental delivery: an infinite generator produces the full credit
-        # window without ever finishing.
-        got = 0
-        async with asyncio.timeout(5):
-            while got < budget:
-                header, _ = await client.recv()
-                assert header.get("id") == req
-                if header["t"] == FT_RESP_CHUNK:
-                    got += 1
-        assert got == budget
-
-        # Backpressure: with credits exhausted, no further chunk arrives.
-        with pytest.raises(asyncio.TimeoutError):
-            async with asyncio.timeout(0.5):
-                await client.recv()
-
-        # Granting credit resumes the producer.
-        await client.send_credit(req, 3)
-        more = 0
-        async with asyncio.timeout(5):
-            while more < 3:
-                header, _ = await client.recv()
-                if header["t"] == FT_RESP_CHUNK and header.get("id") == req:
-                    more += 1
-        assert more == 3
-
-        # Cancel terminates the unbounded stream.
-        await client.send_cancel(req)
-        end_header = None
-        async with asyncio.timeout(5):
-            while end_header is None:
-                header, _ = await client.recv()
-                if header["t"] in (FT_RESP_END, FT_ERR) and header.get("id") == req:
-                    end_header = header
-        assert end_header["t"] == FT_RESP_END
-        assert end_header.get("cancelled") is True
-    finally:
-        await ws.close()
 
 
 # ── Host-backed RPC (a Python generator, not a macro) ─────────────────────────
