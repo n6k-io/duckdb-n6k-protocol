@@ -174,6 +174,11 @@ def test_failed_errs_every_parked_open_and_every_later_one(con: duckdb.DuckDBPyC
     with _serving(con, _pending_late(con)) as (peer, session_id):
         peer.send({"t": FT_OPEN, "ns": 1, "catalog": "late"})
         peer.send({"t": FT_OPEN, "ns": 2, "catalog": "late"})
+        parked = set()
+        while parked != {1, 2}:
+            frame = peer.recv_skipping_pings()
+            assert frame["t"] == FT_OPEN_PENDING
+            parked.add(frame["ns"])
         side.execute("SELECT * FROM n6k_serve_open_failed(?, 'late', 'worker died')", [session_id]).fetchall()
         errs = {}
         while len(errs) < 2:

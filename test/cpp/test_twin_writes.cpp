@@ -68,6 +68,14 @@ TEST_CASE("update, delete, insert, returning, merge and conflict clauses run on 
 	     {"1|alice|99", "2|bob|25", "3|charlie|35"}},
 	    {KV, "UPDATE " + KV + " SET v = 99 WHERE id = 1", {"1"}, {"1|99", "2|20"}},
 	    {KV, "DELETE FROM " + KV + " WHERE id = 1", {"1"}, {"2|20"}},
+	    {KV, "DELETE FROM " + KV, {"2"}, {}},
+	    {KV, "UPDATE " + KV + " SET v = 5", {"2"}, {"1|5", "2|5"}},
+	    {KV, "UPDATE " + KV + " SET v = u.v FROM (VALUES (1, 7)) u(id, v) WHERE kv.id = u.id", {"1"}, {"1|7", "2|20"}},
+	    {KV, "DELETE FROM " + KV + " USING (VALUES (1)) u(id) WHERE kv.id = u.id", {"1"}, {"2|20"}},
+	    {KV,
+	     "INSERT INTO " + KV + " SELECT * FROM (VALUES (3, 30), (4, 40)) u(id, v) WHERE id = 3",
+	     {"1"},
+	     {"1|10", "2|20", "3|30"}},
 	    {NOTES, "INSERT INTO " + NOTES + " VALUES (1, 'x') ON CONFLICT DO NOTHING", {"0"}, {"1|a"}},
 	    {NOTES, "INSERT INTO " + NOTES + " VALUES (1, 'x') ON CONFLICT (id) DO NOTHING", {"0"}, {"1|a"}},
 	    {NOTES,
@@ -107,6 +115,21 @@ TEST_CASE("update, delete, insert, returning, merge and conflict clauses run on 
 		        RowList {"1|alice|30", "2|bob2|26", "3|charlie|35", "7|gus|70"});
 	}
 
+	SECTION("an update and a delete joined to a local table") {
+		N6kTwin twin;
+		SeedWriteTables(twin);
+		twin.Attach();
+		twin.Near("CREATE TABLE incoming(id INTEGER, v INTEGER)");
+		twin.Near("INSERT INTO incoming VALUES (1, 11), (9, 99)");
+
+		REQUIRE(twin.Rows("UPDATE " + KV + " SET v = i.v FROM incoming i WHERE kv.id = i.id") == RowList {"1"});
+		REQUIRE(twin.FarRows("SELECT * FROM " + KV + " ORDER BY id") == RowList {"1|11", "2|20"});
+
+		REQUIRE(twin.Rows("DELETE FROM " + KV + " USING incoming i WHERE kv.id = i.id") == RowList {"1"});
+		REQUIRE(twin.FarRows("SELECT * FROM " + KV + " ORDER BY id") == RowList {"2|20"});
+		REQUIRE(twin.ServeError().empty());
+	}
+
 	SECTION("a merge from a constant") {
 		N6kTwin twin;
 		SeedWriteTables(twin);
@@ -126,6 +149,19 @@ TEST_CASE("update, delete, insert, returning, merge and conflict clauses run on 
 		twin.NearFails("UPDATE db.main.keyless SET age = 1 WHERE id = 1", ExceptionType::BINDER, "no key");
 		REQUIRE(twin.FarRows("SELECT age FROM db.main.keyless") == RowList {"30"});
 	}
+}
+
+TEST_CASE("an insert into an ENUM column keeps valid labels and refuses others", "[twin][writes]") {
+	N6kTwin twin;
+	twin.Far("CREATE TABLE db.main.e (i INTEGER, v ENUM('x', 'y'))");
+	twin.Attach();
+
+	twin.Near("INSERT INTO db.main.e VALUES (1, 'x')");
+	REQUIRE(twin.FarRows("SELECT * FROM db.main.e") == RowList {"1|x"});
+
+	twin.NearErrors("INSERT INTO db.main.e VALUES (2, 'nope')");
+	REQUIRE(twin.FarRows("SELECT * FROM db.main.e") == RowList {"1|x"});
+	REQUIRE(twin.ServeError().empty());
 }
 
 TEST_CASE("constraints are enforced and what the wire cannot carry is refused", "[twin][writes]") {

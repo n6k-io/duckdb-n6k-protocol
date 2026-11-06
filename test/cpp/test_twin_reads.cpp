@@ -66,6 +66,9 @@ TEST_CASE("every column type and odd column name reads back identical", "[twin][
 	    {"STRUCT(a INTEGER, b VARCHAR)", "{'a': 1, 'b': 'x'}"},
 	    {"STRUCT(t TIMETZ, b BIT)", "{'t': '12:00:00+05:30'::TIMETZ, 'b': '101'::BIT}"},
 	    {"UNION(n INTEGER, s VARCHAR)", "union_value(s := 'x')"},
+	    {"ENUM('x', 'y')", "'x'"},
+	    {"ENUM('x', 'y')[]", "['x', 'y']"},
+	    {"STRUCT(e ENUM('x', 'y'))", "{'e': 'x'}"},
 	};
 
 	for (const auto &column : columns) {
@@ -112,6 +115,50 @@ TEST_CASE("every column type and odd column name reads back identical", "[twin][
 			twin.Same(both);
 			REQUIRE(twin.Rows(both) == std::vector<std::string> {"22|11"});
 		}
+	}
+}
+
+TEST_CASE("a table with an ENUM column reads back", "[twin][reads]") {
+	N6kTwin twin;
+
+	SECTION("an inline type") {
+		twin.Far("CREATE TABLE db.main.e (i INTEGER, v ENUM('x', 'y'))");
+		twin.Far("INSERT INTO db.main.e VALUES (1, 'x'), (2, 'y')");
+		twin.Attach();
+
+		twin.Same("SELECT i FROM db.main.e ORDER BY i");
+		twin.Same("SELECT v FROM db.main.e ORDER BY i");
+		twin.Same("SELECT i FROM db.main.e WHERE v = 'x'");
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("a named type") {
+		twin.Far("CREATE TYPE db.main.mood AS ENUM ('x', 'y')");
+		twin.Far("CREATE TABLE db.main.e (i INTEGER, v db.main.mood)");
+		twin.Far("INSERT INTO db.main.e VALUES (1, 'x'), (2, 'y')");
+		twin.Attach();
+
+		twin.Same("SELECT v FROM db.main.e ORDER BY i");
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("a label holding a quote") {
+		twin.Far("CREATE TABLE db.main.e (i INTEGER, v ENUM('it''s', 'y'))");
+		twin.Far("INSERT INTO db.main.e VALUES (1, 'it''s'), (2, 'y')");
+		twin.Attach();
+
+		twin.Same("SELECT v FROM db.main.e ORDER BY i");
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("a view") {
+		twin.Far("CREATE TABLE db.main.e (i INTEGER, v ENUM('x', 'y'))");
+		twin.Far("INSERT INTO db.main.e VALUES (1, 'x'), (2, 'y')");
+		twin.Far("CREATE VIEW db.main.ve AS SELECT * FROM db.main.e");
+		twin.Attach();
+
+		twin.Same("SELECT v FROM db.main.ve ORDER BY i");
+		REQUIRE(twin.ServeError().empty());
 	}
 }
 

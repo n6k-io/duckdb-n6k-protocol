@@ -3,9 +3,11 @@
 #include "n6k_body_builders.hpp"
 #include "n6k_fetch.hpp"
 #include "n6k_frame_source.hpp"
+#include "n6k_wire_type.hpp"
 #include "crossing_substrait.hpp"
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/set.hpp"
@@ -13,17 +15,11 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/enum_util.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/operator/logical_expression_get.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -42,92 +38,19 @@ namespace duckdb {
 
 namespace {
 
-void ReplaceColumnRefs(unique_ptr<Expression> &expr, const vector<ColumnBinding> &bindings) {
-	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		auto &ref = expr->Cast<BoundColumnRefExpression>();
-		for (idx_t i = 0; i < bindings.size(); i++) {
-			if (bindings[i] == ref.Binding()) {
-				expr = make_uniq<BoundReferenceExpression>(ref.GetReturnType(), i);
-				return;
-			}
-		}
-		throw InternalException("n6k crossing: a feed column is not in scope");
-	}
-	ExpressionIterator::EnumerateChildren(*expr,
-	                                      [&](unique_ptr<Expression> &child) { ReplaceColumnRefs(child, bindings); });
-}
-
-vector<unique_ptr<DataChunk>> EvaluateFeed(ClientContext &context, LogicalOperator &op) {
+vector<unique_ptr<DataChunk>> ChunksOf(const ColumnDataCollection &rows) {
 	vector<unique_ptr<DataChunk>> chunks;
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_CHUNK_GET: {
-		auto rows = SeamRowsOf(op);
-		ColumnDataScanState scan_state;
-		rows->InitializeScan(scan_state);
-		while (true) {
-			auto chunk = make_uniq<DataChunk>();
-			chunk->Initialize(Allocator::DefaultAllocator(), rows->Types());
-			if (!rows->Scan(scan_state, *chunk) || chunk->size() == 0) {
-				break;
-			}
-			chunks.push_back(std::move(chunk));
+	ColumnDataScanState scan_state;
+	rows.InitializeScan(scan_state);
+	while (true) {
+		auto chunk = make_uniq<DataChunk>();
+		chunk->Initialize(Allocator::DefaultAllocator(), rows.Types());
+		if (!rows.Scan(scan_state, *chunk) || chunk->size() == 0) {
+			break;
 		}
-		return chunks;
+		chunks.push_back(std::move(chunk));
 	}
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
-		auto &get = op.Cast<LogicalExpressionGet>();
-		for (idx_t start = 0; start < get.expressions.size(); start += STANDARD_VECTOR_SIZE) {
-			auto end = MinValue<idx_t>(start + STANDARD_VECTOR_SIZE, get.expressions.size());
-			auto chunk = make_uniq<DataChunk>();
-			chunk->Initialize(Allocator::DefaultAllocator(), get.expr_types);
-			for (idx_t row = start; row < end; row++) {
-				auto &exprs = get.expressions[row];
-				for (idx_t col = 0; col < exprs.size(); col++) {
-					auto value = ExpressionExecutor::EvaluateScalar(context, *exprs[col]);
-					chunk->data[col].SetValue(row - start, value.DefaultCastAs(get.expr_types[col]));
-				}
-			}
-			chunk->SetChildCardinality(end - start);
-			chunks.push_back(std::move(chunk));
-		}
-		return chunks;
-	}
-	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		auto &proj = op.Cast<LogicalProjection>();
-		auto inputs = EvaluateFeed(context, *op.children[0]);
-		auto bindings = op.children[0]->GetColumnBindings();
-		vector<unique_ptr<Expression>> exprs;
-		vector<LogicalType> types;
-		for (auto &expr : proj.expressions) {
-			auto copy = expr->Copy();
-			ReplaceColumnRefs(copy, bindings);
-			types.push_back(copy->GetReturnType());
-			exprs.push_back(std::move(copy));
-		}
-		ExpressionExecutor executor(context, exprs);
-		for (auto &input : inputs) {
-			auto out = make_uniq<DataChunk>();
-			out->Initialize(Allocator::DefaultAllocator(), types);
-			executor.Execute(*input, *out);
-			chunks.push_back(std::move(out));
-		}
-		return chunks;
-	}
-	default:
-		throw NotImplementedException("n6k crossing: cannot evaluate a %s feed locally", EnumUtil::ToChars(op.type));
-	}
-}
-
-bool ContainsFloor(const LogicalOperator &op) {
-	if (FloorOf(op)) {
-		return true;
-	}
-	for (auto &child : op.children) {
-		if (ContainsFloor(*child)) {
-			return true;
-		}
-	}
-	return false;
+	return chunks;
 }
 
 struct ArmedWaker {
@@ -624,6 +547,12 @@ CrossingTable N6kSource::DescribeIn(const string &schema, const string &name, in
 		Connection conn(db);
 		for (int i = 0; i < arrow_schema.n_children; i++) {
 			auto *child = arrow_schema.children[i];
+			ArrowSchemaMetadata metadata(child->metadata);
+			if (metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == n6k::DUCKDB_TYPE_EXTENSION) {
+				table.Column(child->name, n6k::DeserializeTypeFromBase64(
+				                              metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY)));
+				continue;
+			}
 			auto arrow_type = ArrowType::GetArrowLogicalType(*conn.context, *child);
 			table.Column(child->name, arrow_type->GetDuckType(true));
 		}
@@ -1046,12 +975,11 @@ CrossingWriter N6kSession::Write(ClientContext &context, const CrossingQuery &qu
 	auto &use = query.written;
 	std::string plan_json;
 	std::string arrow;
-	if (ContainsFloor(query.plan)) {
-		plan_json = RenderCrossingPlan(query.plan);
-	} else {
-		auto chunks = EvaluateFeed(
-		    context, const_cast<LogicalOperator &>(query.plan)); // NOLINT(cppcoreguidelines-pro-type-const-cast)
-		vector<LogicalType> types = chunks.empty() ? query.plan.types : chunks[0]->GetTypes();
+	if (query.types.empty()) {
+		// A delete that reads nothing: its plan is a placeholder.
+	} else if (auto rows = SeamRowsOf(query.plan)) {
+		auto &types = rows->Types();
+		auto chunks = ChunksOf(*rows);
 		vector<string> names;
 		for (idx_t i = 0; i < types.size(); i++) {
 			names.push_back("c" + std::to_string(i));
@@ -1061,9 +989,11 @@ CrossingWriter N6kSession::Write(ClientContext &context, const CrossingQuery &qu
 		SerializeChunksToArrowIPC(context, types, names, chunks, &ipc_buf);
 		arrow.assign(reinterpret_cast<const char *>(ipc_buf.data), static_cast<size_t>(ipc_buf.size_bytes));
 		ArrowBufferReset(&ipc_buf);
+	} else {
+		plan_json = RenderCrossingPlan(query.plan);
 	}
 	auto body = n6k_body::WritePlan(CrossingVerbName(query.kind), use.schema, use.table, query.key_columns,
-	                                query.set_columns, plan_json, Txn());
+	                                query.set_columns, query.reads_rows, plan_json, Txn());
 	body.push_back('\n');
 	body.append(arrow);
 

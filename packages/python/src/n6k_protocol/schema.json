@@ -708,6 +708,9 @@
             "type": "string"
           }
         },
+        "reads_rows": {
+          "type": "boolean"
+        },
         "plan": {
           "type": "string"
         },

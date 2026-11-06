@@ -821,6 +821,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 	write.verb = WriteVerbOf(JsonGetStr(root, "verb"));
 	write.key_columns = JsonGetStrArray(root, "key_columns");
 	write.set_columns = JsonGetStrArray(root, "set_columns");
+	write.reads_rows = JsonGetBool(root, "reads_rows", true);
 	auto plan = JsonGetStr(root, "plan");
 	if (write.schema.empty() || write.table.empty()) {
 		throw InvalidInputException("n6k_server: OP_WRITE_PLAN requires \"schema\" and \"table\"");
@@ -837,7 +838,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 		           ->GetTableRef();
 	} else if (!plan.empty()) {
 		seam = DecodeSubstraitJson(conn, catalog, plan, PlanCatalogCheck(reactor, slot))->GetTableRef();
-	} else {
+	} else if (write.reads_rows) {
 		throw InvalidInputException("n6k_server: OP_WRITE_PLAN carries neither rows nor a plan");
 	}
 	auto rowcount = WriteInTransaction(conn, scope.pinned != nullptr, write, std::move(seam));

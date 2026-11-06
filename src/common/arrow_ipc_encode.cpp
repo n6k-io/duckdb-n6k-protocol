@@ -1,42 +1,15 @@
 #include "arrow_ipc_encode.hpp"
 
+#include "n6k_wire_type.hpp"
+
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/vector_operations/vector_operations.hpp"
 
 namespace duckdb {
 namespace n6k {
 
 namespace {
-
-LogicalType StripEnums(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::ENUM:
-		return LogicalType::VARCHAR;
-	case LogicalTypeId::LIST:
-		return LogicalType::LIST(StripEnums(ListType::GetChildType(type)));
-	case LogicalTypeId::ARRAY:
-		return LogicalType::ARRAY(StripEnums(ArrayType::GetChildType(type)), ArrayType::GetSize(type));
-	case LogicalTypeId::MAP:
-		return LogicalType::MAP(StripEnums(MapType::KeyType(type)), StripEnums(MapType::ValueType(type)));
-	case LogicalTypeId::STRUCT: {
-		child_list_t<LogicalType> children;
-		for (auto &child : StructType::GetChildTypes(type)) {
-			children.emplace_back(child.first, StripEnums(child.second));
-		}
-		return LogicalType::STRUCT(std::move(children));
-	}
-	case LogicalTypeId::UNION: {
-		child_list_t<LogicalType> members;
-		for (idx_t i = 0; i < UnionType::GetMemberCount(type); i++) {
-			members.emplace_back(UnionType::GetMemberName(type, i), StripEnums(UnionType::GetMemberType(type, i)));
-		}
-		return LogicalType::UNION(std::move(members));
-	}
-	default:
-		return type;
-	}
-}
 
 vector<string> NamesOf(const vector<Identifier> &identifiers) {
 	vector<string> names;
@@ -69,6 +42,16 @@ ArrowIpcStreamEncoder::ArrowIpcStreamEncoder(ClientContext &context, const vecto
 	}
 	auto props = WireProperties(context);
 	ArrowConverter::ToArrowSchema(&schema_, wire_types_, names, props);
+	for (idx_t i = 0; i < types.size(); i++) {
+		if (wire_types_[i] == types[i]) {
+			continue;
+		}
+		ArrowSchemaMetadata metadata;
+		metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, DUCKDB_TYPE_EXTENSION);
+		metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, SerializeTypeToBase64(types[i]));
+		field_metadata_.push_back(metadata.SerializeMetadata());
+		schema_.children[i]->metadata = field_metadata_.back().get();
+	}
 	ArrowBufferInit(&buf_);
 	if (ArrowIpcOutputStreamInitBuffer(&out_stream_, &buf_) != NANOARROW_OK) {
 		throw IOException("n6k: ArrowIpcOutputStreamInitBuffer failed");
@@ -107,15 +90,7 @@ std::string ArrowIpcStreamEncoder::EncodeChunk(DataChunk &chunk) {
 	DataChunk cast_chunk;
 	DataChunk *to_encode = &chunk;
 	if (needs_cast_) {
-		cast_chunk.Initialize(Allocator::DefaultAllocator(), wire_types_);
-		for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
-			if (chunk.data[col].GetType() == wire_types_[col]) {
-				cast_chunk.data[col].Reference(chunk.data[col]);
-			} else {
-				VectorOperations::Cast(context_, chunk.data[col], cast_chunk.data[col], chunk.size());
-			}
-		}
-		cast_chunk.SetChildCardinality(chunk.size());
+		CastChunkToWireTypes(context_, chunk, wire_types_, cast_chunk);
 		to_encode = &cast_chunk;
 	}
 

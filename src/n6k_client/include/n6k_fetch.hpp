@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "n6k_wire_type.hpp"
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"
 #include <string>
@@ -37,8 +38,13 @@ static void SerializeChunksToArrowIPC(ClientContext &context, const vector<Logic
                                       ArrowBuffer *out_buf) {
 	auto client_props = context.GetClientProperties();
 
+	vector<LogicalType> wire_types;
+	for (auto &type : types) {
+		wire_types.push_back(n6k::StripEnums(type));
+	}
+
 	ArrowSchema arrow_schema;
-	ArrowConverter::ToArrowSchema(&arrow_schema, types, col_names, client_props);
+	ArrowConverter::ToArrowSchema(&arrow_schema, wire_types, col_names, client_props);
 
 	ArrowError error;
 	error.message[0] = '\0';
@@ -76,8 +82,14 @@ static void SerializeChunksToArrowIPC(ClientContext &context, const vector<Logic
 		if (chunk->size() == 0) {
 			continue;
 		}
+		DataChunk wire_chunk;
+		DataChunk *to_encode = chunk.get();
+		if (wire_types != types) {
+			n6k::CastChunkToWireTypes(context, *chunk, wire_types, wire_chunk);
+			to_encode = &wire_chunk;
+		}
 		ArrowArray arrow_array;
-		ArrowConverter::ToArrowArray(*chunk, &arrow_array, client_props, empty_extensions);
+		ArrowConverter::ToArrowArray(*to_encode, &arrow_array, client_props, empty_extensions);
 
 		ArrowArrayView array_view;
 		int rc = ArrowArrayViewInitFromSchema(&array_view, &arrow_schema, &error);

@@ -319,6 +319,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("table", "string", True),
             ("key_columns", _ARRAY_OF_STR, True),
             ("set_columns", _ARRAY_OF_STR, True),
+            ("reads_rows", "boolean", False),
             ("plan", "string", True),
             ("txn", "integer", False),
         ],
