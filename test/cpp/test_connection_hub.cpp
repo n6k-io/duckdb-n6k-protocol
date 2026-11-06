@@ -1,59 +1,41 @@
-#include "connection_hub_selftest.hpp"
-
-#include "duckdb/main/extension/extension_loader.hpp"
-
-#include <chrono>
-#include <string>
-#include <vector>
-
-#if !defined(WASM_LOADABLE_EXTENSIONS) && !defined(_WIN32)
-#define N6K_HAS_RAW_SOCKET 1
+#include "catch.hpp"
 #include "connection_hub.hpp"
+#include "hub_session.hpp"
 #include "n6k_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
 #include "n6k_stream_framing.hpp"
-#include "hub_session.hpp"
 #include "ws_transport_raw.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <thread>
 #include <poll.h>
+#include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
-#endif
+#include <vector>
 
-namespace duckdb {
+using namespace duckdb;
+
 namespace {
 
 struct HubRoutingResult {
-	std::string mode = "native";
-	bool ok = false;
+	std::string error;
 	int32_t got_ns1 = 0;
 	int32_t got_ns2 = 0;
-	// Each session saw exactly its own ns.
 	bool ns1_only_own = false;
 	bool ns2_only_own = false;
-	// An untagged frame no request claims reaches no session.
 	bool untagged_dropped = false;
-	// A frame naming a session nobody claims is dropped, never handed to a sibling.
 	bool unknown_ns_dropped = false;
-	// An untagged RESP_CHUNK whose id is a bound connection-scoped request reaches only that request.
 	bool request_routed = false;
-	// An untagged PONG with the same id is not a response: the request never sees it.
 	bool pong_not_stolen = false;
-	// The hub answered an untagged PING with a PONG carrying its id, and no session saw the PING.
 	bool ping_answered = false;
 	bool single_hub = false;
-	// Close() did not return while that session's callback was still running.
 	bool close_waits = false;
-	// Close() put CANCEL {ns, id: 0} on the wire for every closed session.
 	bool close_sends_cancel = false;
-	int64_t elapsed_ms = 0;
 };
-
-#ifdef N6K_HAS_RAW_SOCKET
 
 constexpr int64_t T_RESP_CHUNK = static_cast<int64_t>(n6k::FrameType::RESP_CHUNK);
 constexpr int64_t T_PONG = static_cast<int64_t>(n6k::FrameType::PONG);
@@ -129,7 +111,6 @@ bool ReadExactWithin(int fd, char *buf, size_t n, std::chrono::steady_clock::tim
 	return true;
 }
 
-// True once the peer reads a frame of type `t` with this `ns` and `id` among the frames the hub wrote.
 bool PeerSaw(int fd, int64_t t, int64_t ns, int64_t id) {
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 	for (;;) {
@@ -154,7 +135,6 @@ bool PeerSaw(int fd, int64_t t, int64_t ns, int64_t id) {
 	}
 }
 
-// Holds a session's callback mid-dispatch until released.
 struct Gate {
 	std::mutex mu;
 	std::condition_variable cv;
@@ -219,18 +199,12 @@ int CountOf(const std::vector<Seen> &values, int64_t ns, int64_t t = T_RESP_CHUN
 	return n;
 }
 
-HubRoutingResult RunHubRoutingSelftest() {
+HubRoutingResult RunHubRouting() {
 	HubRoutingResult r;
-	const auto t0 = std::chrono::steady_clock::now();
-	const auto stamp = [&]() {
-		r.elapsed_ms =
-		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-	};
 
 	int sv[2] = {-1, -1};
 	if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-		r.mode = "socketpair_failed";
-		stamp();
+		r.error = "socketpair failed";
 		return r;
 	}
 	const int client_fd = sv[0];
@@ -244,7 +218,7 @@ HubRoutingResult RunHubRoutingSelftest() {
 		opts.dial = [client_fd]() {
 			return std::unique_ptr<n6k::Transport>(new n6k::RawSocketTransport(client_fd));
 		};
-		opts.endpoint = "selftest socket";
+		opts.endpoint = "test socket";
 		auto hub = n6k::ConnectionHub::Create(nullptr, std::move(opts));
 		// Queued ahead, so the hub's HELLO finds its answer already waiting.
 		WriteFramed(peer_fd, MakeHelloAck());
@@ -260,8 +234,8 @@ HubRoutingResult RunHubRoutingSelftest() {
 
 		WriteFramed(peer_fd, MakeFrame(1));
 		WriteFramed(peer_fd, MakeFrame(2));
-		WriteFramed(peer_fd, MakeFrame(0));  // untagged, no request claims it: dropped
-		WriteFramed(peer_fd, MakeFrame(99)); // nobody's session: dropped
+		WriteFramed(peer_fd, MakeFrame(0));
+		WriteFramed(peer_fd, MakeFrame(99));
 		WriteFramed(peer_fd, MakeFrame(0, T_RESP_CHUNK, req_id));
 		WriteFramed(peer_fd, MakeFrame(0, T_PONG, req_id));
 		WriteFramed(peer_fd, MakeFrame(0, T_PING, PING_ID));
@@ -274,7 +248,7 @@ HubRoutingResult RunHubRoutingSelftest() {
 			}
 			::usleep(2000);
 		}
-		// Give a stray/misrouted frame a chance to land before asserting it did not.
+		// Give a stray or misrouted frame a chance to land before asserting it did not.
 		::usleep(50000);
 		hub->UnbindRequest(req_id);
 
@@ -301,9 +275,9 @@ HubRoutingResult RunHubRoutingSelftest() {
 		s2.Close();
 		r.close_sends_cancel =
 		    PeerSaw(peer_fd, T_CANCEL, 3, 0) && PeerSaw(peer_fd, T_CANCEL, 1, 0) && PeerSaw(peer_fd, T_CANCEL, 2, 0);
-		hub->Disconnect("selftest done");
+		hub->Disconnect("test done");
 	} catch (const std::exception &e) {
-		r.mode = std::string("error: ") + e.what();
+		r.error = e.what();
 	}
 
 	const auto seen1 = sink1.Snapshot();
@@ -318,93 +292,29 @@ HubRoutingResult RunHubRoutingSelftest() {
 	r.request_routed = seen_req.size() == 1 && CountOf(seen_req, 0) == 1;
 	r.pong_not_stolen = CountOf(seen_req, 0, T_PONG) == 0;
 	r.ping_answered = r.ping_answered && CountOf(seen1, 0, T_PING) == 0 && CountOf(seen2, 0, T_PING) == 0;
-	r.ok = r.single_hub && r.ns1_only_own && r.ns2_only_own && r.untagged_dropped && r.unknown_ns_dropped &&
-	       r.request_routed && r.pong_not_stolen && r.ping_answered && r.close_waits && r.close_sends_cancel &&
-	       r.got_ns1 == 1 && r.got_ns2 == 1;
 
 	::close(peer_fd);
 	::close(client_fd);
-	stamp();
 	return r;
-}
-
-#else
-
-HubRoutingResult RunHubRoutingSelftest() {
-	HubRoutingResult r;
-	r.mode = "no_raw_socket";
-	r.ok = true;
-	return r;
-}
-
-#endif
-
-struct N6kHubRoutingBind : public TableFunctionData {};
-
-struct N6kHubRoutingState : public GlobalTableFunctionState {
-	bool emitted = false;
-};
-
-unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<Identifier> &names) {
-	names = {"mode",
-	         "ok",
-	         "got_ns1",
-	         "got_ns2",
-	         "ns1_only_own",
-	         "ns2_only_own",
-	         "untagged_dropped",
-	         "unknown_ns_dropped",
-	         "single_hub",
-	         "request_routed",
-	         "pong_not_stolen",
-	         "ping_answered",
-	         "close_waits",
-	         "close_sends_cancel",
-	         "elapsed_ms"};
-	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::INTEGER, LogicalType::INTEGER,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::INTEGER};
-	return make_uniq<N6kHubRoutingBind>();
-}
-
-unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<N6kHubRoutingState>();
-}
-
-void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-	auto &state = data_p.global_state->Cast<N6kHubRoutingState>();
-	if (state.emitted) {
-		output.SetChildCardinality(0);
-		return;
-	}
-	state.emitted = true;
-
-	const HubRoutingResult r = RunHubRoutingSelftest();
-	output.data[0].SetValue(0, Value(r.mode));
-	output.data[1].SetValue(0, Value::BOOLEAN(r.ok));
-	output.data[2].SetValue(0, Value::INTEGER(r.got_ns1));
-	output.data[3].SetValue(0, Value::INTEGER(r.got_ns2));
-	output.data[4].SetValue(0, Value::BOOLEAN(r.ns1_only_own));
-	output.data[5].SetValue(0, Value::BOOLEAN(r.ns2_only_own));
-	output.data[6].SetValue(0, Value::BOOLEAN(r.untagged_dropped));
-	output.data[7].SetValue(0, Value::BOOLEAN(r.unknown_ns_dropped));
-	output.data[8].SetValue(0, Value::BOOLEAN(r.single_hub));
-	output.data[9].SetValue(0, Value::BOOLEAN(r.request_routed));
-	output.data[10].SetValue(0, Value::BOOLEAN(r.pong_not_stolen));
-	output.data[11].SetValue(0, Value::BOOLEAN(r.ping_answered));
-	output.data[12].SetValue(0, Value::BOOLEAN(r.close_waits));
-	output.data[13].SetValue(0, Value::BOOLEAN(r.close_sends_cancel));
-	output.data[14].SetValue(0, Value::INTEGER(static_cast<int32_t>(r.elapsed_ms)));
-	output.SetChildCardinality(1);
 }
 
 } // namespace
 
-void RegisterN6kSelftestHubRouting(ExtensionLoader &loader) {
-	TableFunction fn("n6k_selftest_hub_routing", {}, Scan, Bind, InitGlobal);
-	loader.RegisterFunction(fn);
-}
+TEST_CASE("one hub routes each frame by ns, answers PING and closes sessions in order", "[hub]") {
+	const auto r = RunHubRouting();
+	INFO(r.error);
 
-} // namespace duckdb
+	REQUIRE(r.error.empty());
+	REQUIRE(r.single_hub);
+	REQUIRE(r.got_ns1 == 1);
+	REQUIRE(r.got_ns2 == 1);
+	REQUIRE(r.ns1_only_own);
+	REQUIRE(r.ns2_only_own);
+	REQUIRE(r.untagged_dropped);
+	REQUIRE(r.unknown_ns_dropped);
+	REQUIRE(r.request_routed);
+	REQUIRE(r.pong_not_stolen);
+	REQUIRE(r.ping_answered);
+	REQUIRE(r.close_waits);
+	REQUIRE(r.close_sends_cancel);
+}

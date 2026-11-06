@@ -1,76 +1,47 @@
-// `n6k_selftest_open_pending(scenario)` — pins how WsClient::Connect waits on FT_OPEN_PENDING and
-// FT_HELLO_PENDING.
-//
-// Drives the REAL WsClient on a ConnectionHub against an in-process ix::WebSocketServer that answers
-// HELLO_ACK and then plays a scripted reply to OPEN, with connect_timeout=kConnectTimeoutMs and
-// open_pending_stall=kStallMs:
-//   ack          PENDING(kStatus) every kBeatMs for kPendingForMs, then OPEN_ACK -> connected
-//   err          same, then OPEN_ERR("backend exploded")                   -> error carries it
-//   stall        same, then silence                                        -> "open stalled" + status
-//   drop         same, then the server closes the socket                   -> error carries the status
-//   no_reply     no reply at all                                           -> connect timeout
-//   late_pending first PENDING past connect_timeout                        -> connect timeout
-//   abort        PENDING, then Connect's should_abort turns true            -> InterruptException + CANCEL
-//   hello_ack    the ack script, played on HELLO with HELLO_PENDING         -> connected
-//   hello_stall  the stall script, played on HELLO with HELLO_PENDING       -> "handshake stalled" + status
-// The reconnect scenarios answer the first OPEN with OPEN_ACK, drop the socket, then play the ack script
-// on the reconnect's OPEN; Connect's should_abort must never run after Connect returns:
-//   reconnect_dead_abort  the request's should_abort is polled       -> connected
-//   reconnect_abort       the request's should_abort turns true      -> InterruptException + CANCEL
-// Every reconnect's OPEN carries a fresh ns. reopen_after_timeout answers the first OPEN, drops the socket,
-// leaves the reconnect's OPEN unanswered (connect timeout, hub still up), then answers a third: the second
-// session's ns must be released with CANCEL {ns, id: 0} before that third OPEN, on the same socket.
-//
-// Native only; wasm reports mode='wasm_no_ix'.
-
-#include "open_pending_selftest.hpp"
-#include "duckdb/function/table_function.hpp"
-
-#include <chrono>
-#include <cstdint>
-#include <string>
-
-#ifndef WASM_LOADABLE_EXTENSIONS
-#include "duckdb/common/exception.hpp"
-#include "n6k_msgpack.hpp"
+#include "catch.hpp"
 #include "connection_hub.hpp"
+#include "duckdb/common/exception.hpp"
 #include "hub_session.hpp"
+#include "n6k_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
 #include "ws_client.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketMessage.h>
 #include <ixwebsocket/IXWebSocketMessageType.h>
 #include <ixwebsocket/IXWebSocketServer.h>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
-#endif
 
-namespace duckdb {
+using namespace duckdb;
 
 namespace {
-
-struct OpenPendingResult {
-	std::string mode;
-	bool ok = false;
-	bool connected = false;
-	std::string error;
-	int32_t pendings_sent = 0;
-	int64_t elapsed_ms = 0;
-	bool interrupted = false;
-	bool cancel_seen = false;
-};
-
-#ifndef WASM_LOADABLE_EXTENSIONS
 
 constexpr int kConnectTimeoutMs = 300;
 constexpr int kStallMs = 600;
 constexpr int kBeatMs = 150;
 constexpr int kPendingForMs = 1000;
 constexpr const char *kStatus = "warming";
+
+struct OpenPendingResult {
+	bool connected = false;
+	std::string error;
+	int64_t elapsed_ms = 0;
+	bool interrupted = false;
+	bool cancel_seen = false;
+	int32_t opens = 0;
+	int32_t aborts_after_connect = 0;
+	int32_t request_polls = 0;
+	std::vector<int64_t> open_ns;
+	// (OPENs seen before it, ns)
+	std::vector<std::pair<int32_t, int64_t>> cancels;
+};
 
 std::string PackHelloAck() {
 	msgpack::sbuffer sbuf;
@@ -145,18 +116,15 @@ std::string PackOpenPending(int64_t ns) {
 	return std::string(sbuf.data(), sbuf.size());
 }
 
+// Each run gets its own candidates: every scenario in this process binds a server on one thread.
 int CandidateBasePort() {
+	static std::atomic<int> next {0};
 	const auto tid = std::hash<std::thread::id> {}(std::this_thread::get_id());
-	return 43000 + static_cast<int>(tid % 2000);
-}
-
-bool Contains(const std::string &haystack, const std::string &needle) {
-	return haystack.find(needle) != std::string::npos;
+	return 43000 + static_cast<int>(tid % 1000) + next.fetch_add(16);
 }
 
 // Played on its own thread so the server callback returns and ix keeps reading.
-void PlayScript(const std::string &scenario, ix::WebSocket &ws, int64_t ns, const std::atomic<bool> &abort,
-                std::atomic<int32_t> &pendings) {
+void PlayScript(const std::string &scenario, ix::WebSocket &ws, int64_t ns, const std::atomic<bool> &abort) {
 	auto sleep_ms = [&](int ms) {
 		const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
 		while (!abort.load() && std::chrono::steady_clock::now() < until) {
@@ -173,13 +141,11 @@ void PlayScript(const std::string &scenario, ix::WebSocket &ws, int64_t ns, cons
 	if (step == "late_pending") {
 		if (sleep_ms(500)) {
 			ws.sendBinary(pending);
-			pendings++;
 		}
 		return;
 	}
 	for (int t = 0; t < kPendingForMs; t += kBeatMs) {
 		ws.sendBinary(pending);
-		pendings++;
 		if (!sleep_ms(kBeatMs)) {
 			return;
 		}
@@ -193,12 +159,10 @@ void PlayScript(const std::string &scenario, ix::WebSocket &ws, int64_t ns, cons
 	}
 }
 
-OpenPendingResult RunOpenPendingSelftest(const std::string &scenario) {
+OpenPendingResult RunOpenPending(const std::string &scenario) {
 	OpenPendingResult r;
-	r.mode = "native";
 
 	std::atomic<bool> abort {false};
-	std::atomic<int32_t> pendings {0};
 	std::atomic<bool> cancel_seen {false};
 	std::mutex script_mu;
 	std::thread script;
@@ -206,10 +170,9 @@ OpenPendingResult RunOpenPendingSelftest(const std::string &scenario) {
 	const bool reconnect = scenario == "reconnect_dead_abort" || scenario == "reconnect_abort" || reopen;
 	std::atomic<int32_t> opens {0};
 	std::atomic<ix::WebSocket *> first_ws {nullptr};
-	// What the server saw, in order: each OPEN's ns, and each CANCEL {ns, id: 0}'s ns.
 	std::mutex wire_mu;
 	std::vector<int64_t> open_ns;
-	std::vector<std::pair<int32_t, int64_t>> cancels; // (OPENs seen before it, ns)
+	std::vector<std::pair<int32_t, int64_t>> cancels;
 
 	std::unique_ptr<ix::WebSocketServer> server;
 	const int base = CandidateBasePort();
@@ -273,7 +236,7 @@ OpenPendingResult RunOpenPendingSelftest(const std::string &scenario) {
 			    std::lock_guard<std::mutex> lk(script_mu);
 			    if (!script.joinable()) {
 				    script = std::thread(PlayScript, reconnect ? std::string("ack") : scenario, std::ref(ws), ns,
-				                         std::cref(abort), std::ref(pendings));
+				                         std::cref(abort));
 			    }
 		    });
 		if (!candidate->listen().first) {
@@ -297,8 +260,8 @@ OpenPendingResult RunOpenPendingSelftest(const std::string &scenario) {
 	opts.catalog = "pendtest";
 	opts.connect_timeout = std::chrono::milliseconds(kConnectTimeoutMs);
 	opts.open_pending_stall = std::chrono::milliseconds(kStallMs);
-	opts.open_channel = [hub](uint64_t ns, const n6k::AbortCheck &abort) {
-		hub->EnsureConnected(abort);
+	opts.open_channel = [hub](uint64_t ns, const n6k::AbortCheck &abort_check) {
+		hub->EnsureConnected(abort_check);
 		return std::unique_ptr<n6k::Reactor>(new n6k::HubSession(hub, ns));
 	};
 
@@ -373,121 +336,141 @@ OpenPendingResult RunOpenPendingSelftest(const std::string &scenario) {
 	}
 	// Before Close, whose own CANCEL {ns, id: 0} would otherwise read as the one under test.
 	r.cancel_seen = cancel_seen.load();
-	std::vector<int64_t> seen_open_ns;
-	std::vector<std::pair<int32_t, int64_t>> seen_cancels;
 	{
 		std::lock_guard<std::mutex> lk(wire_mu);
-		seen_open_ns = open_ns;
-		seen_cancels = cancels;
+		r.open_ns = open_ns;
+		r.cancels = cancels;
 	}
 	client->Close();
-	hub->Disconnect("selftest done");
+	hub->Disconnect("test done");
 	server->stop();
-	r.pendings_sent = pendings.load();
+	r.opens = opens.load();
+	r.aborts_after_connect = aborts_after_connect->load();
+	r.request_polls = request_polls.load();
+	return r;
+}
 
-	const bool waited_past_connect_timeout = r.elapsed_ms >= kPendingForMs;
-	if (scenario == "ack") {
-		r.ok = r.connected && waited_past_connect_timeout;
-	} else if (scenario == "err") {
-		r.ok = !r.connected && Contains(r.error, "backend exploded");
-	} else if (scenario == "stall") {
-		r.ok = !r.connected && Contains(r.error, "open stalled") && Contains(r.error, kStatus) &&
-		       r.elapsed_ms >= kPendingForMs + kStallMs - kBeatMs;
-	} else if (scenario == "drop") {
-		r.ok = !r.connected && Contains(r.error, kStatus) && waited_past_connect_timeout;
-	} else if (scenario == "hello_ack") {
-		r.ok = r.connected && waited_past_connect_timeout;
-	} else if (scenario == "hello_stall") {
-		r.ok = !r.connected && Contains(r.error, "handshake stalled") && Contains(r.error, kStatus) &&
-		       r.elapsed_ms >= kPendingForMs + kStallMs - kBeatMs;
-	} else if (scenario == "abort") {
-		r.ok = !r.connected && r.interrupted && r.cancel_seen && r.elapsed_ms < kPendingForMs;
-	} else if (reopen) {
-		const bool fresh = seen_open_ns.size() == 3 && seen_open_ns[0] != seen_open_ns[1] &&
-		                   seen_open_ns[1] != seen_open_ns[2] && seen_open_ns[0] != seen_open_ns[2];
-		bool released_before_reopen = false;
-		for (auto &cancel : seen_cancels) {
-			if (fresh && cancel.second == seen_open_ns[1] && cancel.first == 2) {
-				released_before_reopen = true;
+bool AllDistinct(const std::vector<int64_t> &values) {
+	for (size_t i = 0; i < values.size(); i++) {
+		for (size_t j = i + 1; j < values.size(); j++) {
+			if (values[i] == values[j]) {
+				return false;
 			}
 		}
-		r.ok = r.connected && fresh && released_before_reopen && aborts_after_connect->load() == 0;
-	} else if (reconnect) {
-		const auto stale = aborts_after_connect->load();
-		const bool fresh = seen_open_ns.size() == 2 && seen_open_ns[0] != seen_open_ns[1];
-		const bool reconnected = opens.load() == 2 && fresh && stale == 0 && request_polls.load() > 0;
-		if (scenario == "reconnect_abort") {
-			r.ok = reconnected && !r.connected && r.interrupted && r.cancel_seen;
-		} else {
-			r.ok = reconnected && r.connected;
-		}
-		if (stale > 0) {
-			r.error = "Connect's should_abort ran " + std::to_string(stale) + " times after Connect";
-		}
-	} else if (scenario == "no_reply" || scenario == "late_pending") {
-		r.ok = !r.connected && Contains(r.error, "connect timeout") && r.elapsed_ms < kPendingForMs;
-	} else {
-		r.error = "unknown scenario \"" + scenario + "\"";
 	}
-	return r;
-}
-
-#else
-
-OpenPendingResult RunOpenPendingSelftest(const std::string &) {
-	OpenPendingResult r;
-	r.mode = "wasm_no_ix";
-	r.ok = true;
-	return r;
-}
-
-#endif
-
-struct N6kOpenPendingBind : public TableFunctionData {
-	std::string scenario;
-};
-
-struct N6kOpenPendingState : public GlobalTableFunctionState {
-	bool emitted = false;
-};
-
-unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<Identifier> &names) {
-	names = {"mode", "ok", "connected", "error", "pendings_sent", "elapsed_ms"};
-	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BIGINT};
-	auto result = make_uniq<N6kOpenPendingBind>();
-	result->scenario = input.inputs[0].GetValue<string>();
-	return std::move(result);
-}
-
-unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<N6kOpenPendingState>();
-}
-
-void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-	auto &state = data_p.global_state->Cast<N6kOpenPendingState>();
-	if (state.emitted) {
-		output.SetChildCardinality(0);
-		return;
-	}
-	state.emitted = true;
-
-	const OpenPendingResult r = RunOpenPendingSelftest(data_p.bind_data->Cast<N6kOpenPendingBind>().scenario);
-	output.data[0].SetValue(0, Value(r.mode));
-	output.data[1].SetValue(0, Value::BOOLEAN(r.ok));
-	output.data[2].SetValue(0, Value::BOOLEAN(r.connected));
-	output.data[3].SetValue(0, Value(r.error));
-	output.data[4].SetValue(0, Value::INTEGER(r.pendings_sent));
-	output.data[5].SetValue(0, Value::BIGINT(r.elapsed_ms));
-	output.SetChildCardinality(1);
+	return true;
 }
 
 } // namespace
 
-void RegisterN6kSelftestOpenPending(ExtensionLoader &loader) {
-	TableFunction fn("n6k_selftest_open_pending", {LogicalType::VARCHAR}, Scan, Bind, InitGlobal);
-	loader.RegisterFunction(fn);
+TEST_CASE("connect waits out OPEN_PENDING past its timeout, then connects on OPEN_ACK", "[open_pending]") {
+	const auto r = RunOpenPending("ack");
+	INFO(r.error);
+
+	REQUIRE(r.connected);
+	REQUIRE(r.elapsed_ms >= kPendingForMs);
 }
 
-} // namespace duckdb
+TEST_CASE("connect reports the OPEN_ERR that follows OPEN_PENDING", "[open_pending]") {
+	const auto r = RunOpenPending("err");
+
+	REQUIRE(!r.connected);
+	REQUIRE_THAT(r.error, Catch::Contains("backend exploded"));
+}
+
+TEST_CASE("connect fails with the last status when OPEN_PENDING stalls", "[open_pending]") {
+	const auto r = RunOpenPending("stall");
+
+	REQUIRE(!r.connected);
+	REQUIRE_THAT(r.error, Catch::Contains("open stalled"));
+	REQUIRE_THAT(r.error, Catch::Contains(kStatus));
+	REQUIRE(r.elapsed_ms >= kPendingForMs + kStallMs - kBeatMs);
+}
+
+TEST_CASE("connect reports the last status when the socket drops while pending", "[open_pending]") {
+	const auto r = RunOpenPending("drop");
+
+	REQUIRE(!r.connected);
+	REQUIRE_THAT(r.error, Catch::Contains(kStatus));
+	REQUIRE(r.elapsed_ms >= kPendingForMs);
+}
+
+TEST_CASE("connect times out with no reply, or a first OPEN_PENDING past the timeout", "[open_pending]") {
+	const std::string scenario = GENERATE(as<std::string> {}, "no_reply", "late_pending");
+	INFO(scenario);
+	const auto r = RunOpenPending(scenario);
+
+	REQUIRE(!r.connected);
+	REQUIRE_THAT(r.error, Catch::Contains("connect timeout"));
+	REQUIRE(r.elapsed_ms < kPendingForMs);
+}
+
+TEST_CASE("an abort during OPEN_PENDING interrupts and sends CANCEL", "[open_pending]") {
+	const auto r = RunOpenPending("abort");
+
+	REQUIRE(!r.connected);
+	REQUIRE(r.interrupted);
+	REQUIRE(r.cancel_seen);
+	REQUIRE(r.elapsed_ms < kPendingForMs);
+}
+
+TEST_CASE("connect waits out HELLO_PENDING past its timeout, then connects on HELLO_ACK", "[open_pending]") {
+	const auto r = RunOpenPending("hello_ack");
+	INFO(r.error);
+
+	REQUIRE(r.connected);
+	REQUIRE(r.elapsed_ms >= kPendingForMs);
+}
+
+TEST_CASE("connect fails with the last status when HELLO_PENDING stalls", "[open_pending]") {
+	const auto r = RunOpenPending("hello_stall");
+
+	REQUIRE(!r.connected);
+	REQUIRE_THAT(r.error, Catch::Contains("handshake stalled"));
+	REQUIRE_THAT(r.error, Catch::Contains(kStatus));
+	REQUIRE(r.elapsed_ms >= kPendingForMs + kStallMs - kBeatMs);
+}
+
+TEST_CASE("a reconnect polls the request's abort, never Connect's, and opens a fresh ns", "[open_pending]") {
+	const auto r = RunOpenPending("reconnect_dead_abort");
+	INFO(r.error);
+
+	REQUIRE(r.connected);
+	REQUIRE(r.opens == 2);
+	REQUIRE(r.open_ns.size() == 2);
+	REQUIRE(AllDistinct(r.open_ns));
+	REQUIRE(r.aborts_after_connect == 0);
+	REQUIRE(r.request_polls > 0);
+}
+
+TEST_CASE("a request's abort interrupts a reconnect and sends CANCEL", "[open_pending]") {
+	const auto r = RunOpenPending("reconnect_abort");
+	INFO(r.error);
+
+	REQUIRE(!r.connected);
+	REQUIRE(r.interrupted);
+	REQUIRE(r.cancel_seen);
+	REQUIRE(r.opens == 2);
+	REQUIRE(r.open_ns.size() == 2);
+	REQUIRE(AllDistinct(r.open_ns));
+	REQUIRE(r.aborts_after_connect == 0);
+	REQUIRE(r.request_polls > 0);
+}
+
+TEST_CASE("a reopen after a timed-out OPEN first releases that session's ns", "[open_pending]") {
+	const auto r = RunOpenPending("reopen_after_timeout");
+	INFO(r.error);
+
+	REQUIRE(r.connected);
+	REQUIRE(r.open_ns.size() == 3);
+	REQUIRE(AllDistinct(r.open_ns));
+	REQUIRE(r.aborts_after_connect == 0);
+
+	bool released_before_reopen = false;
+	for (auto &cancel : r.cancels) {
+		if (cancel.second == r.open_ns[1] && cancel.first == 2) {
+			released_before_reopen = true;
+		}
+	}
+	REQUIRE(released_before_reopen);
+}

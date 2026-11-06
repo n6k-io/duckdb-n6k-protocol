@@ -16,9 +16,7 @@ namespace n6k {
 //
 // One implementation, deliberately: a second is a place for the two to disagree, and disagreement
 // here is a security bug. The reactor (src/n6k_server/request_handlers.cpp) is the ONLY caller on
-// the serving path; the n6k_testing_build_*_sql scalars expose these to SQL so tests can assert on
-// the exact statement, and live in the unpublished n6k_testing extension so that keyhole is not
-// part of a shipped binary.
+// the serving path.
 
 // QuoteIdent lives in n6k_sql_escape.hpp, included above.
 

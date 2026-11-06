@@ -15,13 +15,7 @@ from n6k_server.extension import load_n6k, load_n6k_testing
 
 @pytest.fixture
 def n6k_con():
-    """In-memory connection with the `n6k` and `n6k_testing` extensions loaded.
-
-    The SQL builders live in C++ (src/common/n6k_sql_builder.cpp) and reach
-    Python only through the `n6k_testing_build_*_sql` scalars, which the
-    unpublished `n6k_testing` extension registers, so testing them means running
-    them.
-    """
+    """In-memory connection with the `n6k` and `n6k_testing` extensions loaded."""
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     load_n6k(con)
     load_n6k_testing(con)

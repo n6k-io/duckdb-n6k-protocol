@@ -1,7 +1,7 @@
-#include "arrow_ipc_decode_selftest.hpp"
+#include "catch.hpp"
 #include "n6k_arrow_frame_decoder.hpp"
 
-#include "duckdb/function/table_function.hpp"
+#include "duckdb/common/exception.hpp"
 
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"
@@ -9,21 +9,30 @@
 #include <string>
 #include <vector>
 
-namespace duckdb {
+using namespace duckdb;
 
 namespace {
 
-// Throw the nanoarrow error text verbatim (never as a printf format — a stray % in err.message would
-// otherwise raise a formatting exception that masks the real failure).
+// Verbatim, never as a printf format: a stray % in err.message would mask the real failure.
 void ThrowNanoarrow(const char *stage, const ArrowError &err) {
-	throw IOException("n6k_testing_arrow_ipc_decode: " + std::string(stage) + ": " + std::string(err.message));
+	throw IOException("arrow frame test: " + std::string(stage) + ": " + std::string(err.message));
 }
 
 struct DecodedRow {
 	int32_t id;
 	std::string name;
+
+	bool operator==(const DecodedRow &other) const {
+		return id == other.id && name == other.name;
+	}
 };
 
+std::ostream &operator<<(std::ostream &out, const DecodedRow &row) {
+	return out << row.id << ":" << row.name;
+}
+
+// The framing pyarrow produces: an empty RESP_SCHEMA frame, a first RESP_CHUNK carrying the schema and first batch as
+// two IPC messages, a second batch, and EOS.
 std::vector<std::string> BuildPyarrowFrames() {
 	ArrowError err;
 	err.message[0] = '\0';
@@ -48,7 +57,6 @@ std::vector<std::string> BuildPyarrowFrames() {
 		ThrowNanoarrow("writer init", err);
 	}
 
-	// Slice out every byte written to `buf` since the previous flush — one IPC message.
 	size_t cursor = 0;
 	auto flush = [&]() -> std::string {
 		std::string frame(reinterpret_cast<const char *>(buf.data) + cursor,
@@ -99,8 +107,8 @@ std::vector<std::string> BuildPyarrowFrames() {
 		}
 		std::string eos = flush();
 
-		frames.emplace_back();                 // empty RESP_SCHEMA frame
-		frames.push_back(schema_msg + batch0); // first RESP_CHUNK: two messages in one frame
+		frames.emplace_back();
+		frames.push_back(schema_msg + batch0);
 		frames.push_back(std::move(batch1));
 		frames.push_back(std::move(eos));
 	} catch (...) {
@@ -135,65 +143,23 @@ void CollectBatch(const ArrowSchema *schema, ArrowArray *array, std::vector<Deco
 	ArrowArrayViewReset(&view);
 }
 
-std::vector<DecodedRow> RunDecodeSelftest() {
-	std::vector<std::string> frames = BuildPyarrowFrames();
+} // namespace
 
+TEST_CASE("the decoder reads the pyarrow framing across frames", "[arrow]") {
+	const auto frames = BuildPyarrowFrames();
 	n6k::N6kArrowFrameDecoder decoder;
 	std::vector<DecodedRow> rows;
+
 	for (const auto &frame : frames) {
-		if (!decoder.PushFrame(frame)) {
-			throw IOException("n6k_testing_arrow_ipc_decode: PushFrame: " + decoder.ErrorMessage());
-		}
+		INFO(decoder.ErrorMessage());
+		REQUIRE(decoder.PushFrame(frame));
 		ArrowArray batch;
 		while (decoder.TryPopBatch(&batch)) {
 			CollectBatch(decoder.GetSchema(), &batch, rows);
 			batch.release(&batch);
 		}
 	}
-	if (!decoder.SawEndOfStream()) {
-		throw IOException("n6k_testing_arrow_ipc_decode: stream ended without EOS marker");
-	}
-	return rows;
+
+	REQUIRE(decoder.SawEndOfStream());
+	REQUIRE(rows == std::vector<DecodedRow> {{1, "Alice"}, {2, "Bob"}, {3, "Charlie"}});
 }
-
-struct N6kFrameDecodeSelftestBind : public TableFunctionData {};
-
-struct N6kFrameDecodeSelftestState : public GlobalTableFunctionState {
-	bool emitted = false;
-};
-
-unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<Identifier> &names) {
-	names = {"id", "name"};
-	return_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
-	return make_uniq<N6kFrameDecodeSelftestBind>();
-}
-
-unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<N6kFrameDecodeSelftestState>();
-}
-
-void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-	auto &state = data_p.global_state->Cast<N6kFrameDecodeSelftestState>();
-	if (state.emitted) {
-		output.SetChildCardinality(0);
-		return;
-	}
-	state.emitted = true;
-
-	const std::vector<DecodedRow> rows = RunDecodeSelftest();
-	for (idx_t i = 0; i < rows.size(); i++) {
-		output.data[0].SetValue(i, Value::INTEGER(rows[i].id));
-		output.data[1].SetValue(i, Value(rows[i].name));
-	}
-	output.SetChildCardinality(rows.size());
-}
-
-} // namespace
-
-void RegisterN6kTestingArrowIpcDecode(ExtensionLoader &loader) {
-	TableFunction fn("n6k_testing_arrow_ipc_decode", {}, Scan, Bind, InitGlobal);
-	loader.RegisterFunction(fn);
-}
-
-} // namespace duckdb

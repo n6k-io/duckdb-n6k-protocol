@@ -60,10 +60,7 @@ list(
   src/n6k_client/n6k_client_settings_function.cpp
   src/n6k_client/n6k_thread_selftest.cpp
   src/n6k_client/n6k_io_thread_selftest.cpp
-  src/n6k_client/ws_send_after_start_selftest.cpp
   src/n6k_client/open_ns_selftest.cpp
-  src/n6k_client/open_pending_selftest.cpp
-  src/n6k_client/connection_hub_selftest.cpp
   src/n6k_client/n6k_connect_function.cpp
   src/n6k_client/n6k_connection_functions.cpp
   src/n6k_client/n6k_list_catalogs_function.cpp
