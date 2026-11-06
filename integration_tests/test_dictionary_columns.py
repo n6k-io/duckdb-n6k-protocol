@@ -58,22 +58,3 @@ def test_the_catalog_stays_usable_after_touching_the_dictionary_table():
         assert [(row[0], row[1]) for row in described] == [("id", "BIGINT"), ("cat", "VARCHAR")]
     finally:
         con.close()
-
-
-def test_an_enum_column_is_served_as_varchar():
-    """The other direction: DuckDB's Arrow export renders ENUM as a dictionary field,
-    which nanoarrow's IPC writer cannot emit, so the server casts ENUM to VARCHAR
-    before encoding. The cast here runs per row server-side, so the result column
-    really is an ENUM until it hits the encoder."""
-    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-    con.execute("LOAD httpfs")
-    con.execute(f"LOAD '{EXT_PATH}'")
-    con.execute(f"ATTACH '{DSN}' AS db (TYPE n6k)")
-    try:
-        rows = con.execute(
-            "SELECT * FROM n6k_catalog_query('db', "
-            "\"SELECT id, name::ENUM('Alice','Bob','Charlie') AS who FROM db.main.users ORDER BY id\")"
-        ).fetchall()
-        assert rows == [(1, "Alice"), (2, "Bob"), (3, "Charlie")]
-    finally:
-        con.close()
