@@ -67,4 +67,8 @@ export const CAP_HAS_FUNCTION = "has_function";
 export const CAP_TABLE_DDL = "table_ddl";
 export const HELLO_CAPS: readonly string[] = ["crossing", "jsonrpc", "mcp"];
 export const APP_HELLO_CAPS: readonly string[] = ["jsonrpc", "mcp"];
-export const OPEN_CAPS: readonly string[] = ["catalog_plans", "has_function", "table_ddl"];
+export const OPEN_CAPS: readonly string[] = [
+  "catalog_plans",
+  "has_function",
+  "table_ddl",
+];
