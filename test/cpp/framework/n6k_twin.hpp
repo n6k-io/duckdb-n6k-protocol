@@ -49,71 +49,112 @@ inline unique_ptr<QueryResult> TwinRun(Connection &connection, const std::string
 	return result;
 }
 
+inline std::vector<std::string> TwinRows(Connection &connection, const std::string &sql) {
+	auto result = TwinRun(connection, sql);
+	auto values = result->Collection().GetRows();
+	std::vector<std::string> rows;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		std::string cells;
+		for (idx_t column = 0; column < result->GetTypes().size(); column++) {
+			cells += (column == 0 ? "" : "|") + values.GetValue(column, row).ToString();
+		}
+		rows.push_back(cells);
+	}
+	return rows;
+}
+
 class TwinClient {
 public:
 	TwinClient(DuckDB &far_p, Connection &far_con_p, std::vector<std::string> catalogs_p)
 	    : far(far_p), far_con(far_con_p), catalogs(std::move(catalogs_p)) {
 		ExtensionLoader near_loader(*near_db->instance, "n6k_client");
 		LoadInternal(near_loader);
-		if (::socketpair(AF_UNIX, SOCK_STREAM, 0, near_pair) != 0 ||
-		    ::socketpair(AF_UNIX, SOCK_STREAM, 0, far_pair) != 0) {
-			throw std::runtime_error("socketpair failed");
-		}
-		SetNoSigPipe(near_pair[1]);
-		SetNoSigPipe(far_pair[0]);
+		con = make_uniq<Connection>(*near_db);
 	}
 
 	~TwinClient() {
 		con.reset();
 		near_db.reset();
-		for (int fd : {near_pair[0], near_pair[1], far_pair[0], far_pair[1]}) {
-			n6k::ShutdownSocket(fd);
-		}
-		for (auto *thread : {&to_far, &to_near, &serve}) {
-			if (thread->joinable()) {
-				thread->join();
+		for (auto &link : links) {
+			for (int fd : {link->near_pair[0], link->near_pair[1], link->far_pair[0], link->far_pair[1]}) {
+				n6k::ShutdownSocket(fd);
 			}
 		}
-		for (int fd : {near_pair[0], near_pair[1], far_pair[0], far_pair[1]}) {
-			::close(fd);
+		for (auto &link : links) {
+			for (auto *thread : {&link->to_far, &link->to_near, &link->serve}) {
+				if (thread->joinable()) {
+					thread->join();
+				}
+			}
+			for (int fd : {link->near_pair[0], link->near_pair[1], link->far_pair[0], link->far_pair[1]}) {
+				::close(fd);
+			}
 		}
 	}
 
 	TwinClient(const TwinClient &) = delete;
 	TwinClient &operator=(const TwinClient &) = delete;
 
-	void Attach() {
-		to_far = std::thread([this] { Pump(near_pair[1], far_pair[0], true); });
-		to_near = std::thread([this] { Pump(far_pair[0], near_pair[1], false); });
+	std::string Connect() {
+		links.push_back(make_uniq<TwinLink>());
+		auto &link = *links.back();
+		if (::socketpair(AF_UNIX, SOCK_STREAM, 0, link.near_pair) != 0 ||
+		    ::socketpair(AF_UNIX, SOCK_STREAM, 0, link.far_pair) != 0) {
+			throw std::runtime_error("socketpair failed");
+		}
+		SetNoSigPipe(link.near_pair[1]);
+		SetNoSigPipe(link.far_pair[0]);
+		link.to_far = std::thread([this, &link] { Pump(link.near_pair[1], link.far_pair[0], true); });
+		link.to_near = std::thread([this, &link] { Pump(link.far_pair[0], link.near_pair[1], false); });
 
-		auto session =
-		    TwinRun(far_con, "SELECT session_id FROM n6k_serve_create_session(" + std::to_string(far_pair[1]) + ")");
+		auto session = TwinRun(far_con, "SELECT session_id FROM n6k_serve_create_session(" +
+		                                    std::to_string(link.far_pair[1]) + ")");
 		const auto session_id = session->Collection().GetValue(0, 0).ToString();
 		std::string serve_sql = "CALL n6k_serve_fd('" + session_id + "'::UUID";
 		for (auto &catalog : catalogs) {
 			serve_sql += ", '" + catalog + "'";
 		}
 		serve_sql += ")";
-		serve_con = make_uniq<Connection>(far);
-		serve = std::thread([this, serve_sql] {
-			auto result = serve_con->Query(serve_sql);
+		link.serve_con = make_uniq<Connection>(far);
+		link.serve = std::thread([this, &link, serve_sql] {
+			auto result = link.serve_con->Query(serve_sql);
 			if (result->HasError()) {
 				std::lock_guard<std::mutex> lk(lock);
 				serve_error = result->GetError();
 			}
 		});
 
-		con = make_uniq<Connection>(*near_db);
-		auto connected = TwinRun(*con, "SELECT connection_id FROM n6k_connect(wsFd => " + std::to_string(near_pair[0]) +
-		                                   ", token => '')");
-		const auto connection_id = connected->Collection().GetValue(0, 0).ToString();
+		auto connected = TwinRun(*con, "SELECT connection_id FROM n6k_connect(wsFd => " +
+		                                   std::to_string(link.near_pair[0]) + ", token => '')");
+		return connected->Collection().GetValue(0, 0).ToString();
+	}
+
+	void AttachAs(const std::string &alias, const std::string &catalog, const std::string &connection_id) {
+		TwinRun(*con, "ATTACH '' AS " + alias + " (TYPE n6k, CONNECTION '" + connection_id + "'" +
+		                  (alias == catalog ? "" : ", CATALOG '" + catalog + "'") + ")");
+	}
+
+	void Attach() {
+		first_connection = Connect();
 		for (auto &catalog : catalogs) {
-			TwinRun(*con, "ATTACH '' AS " + catalog + " (TYPE n6k, CONNECTION '" + connection_id + "')");
+			AttachAs(catalog, catalog, first_connection);
 		}
+	}
+
+	const std::string &ConnectionId() const {
+		return first_connection;
 	}
 
 	unique_ptr<QueryResult> Near(const std::string &sql) {
 		return TwinRun(*con, sql);
+	}
+
+	void NearErrors(const std::string &sql, const std::string &message = "") {
+		INFO(sql);
+		auto result = con->Query(sql);
+		REQUIRE(result->HasError());
+		INFO(result->GetError());
+		REQUIRE(result->GetError().find(message) != std::string::npos);
 	}
 
 	void NearFails(const std::string &sql, ExceptionType type, const std::string &message) {
@@ -132,17 +173,7 @@ public:
 	}
 
 	std::vector<std::string> Rows(const std::string &sql) {
-		auto result = Near(sql);
-		auto values = result->Collection().GetRows();
-		std::vector<std::string> rows;
-		for (idx_t row = 0; row < result->RowCount(); row++) {
-			std::string cells;
-			for (idx_t column = 0; column < result->GetTypes().size(); column++) {
-				cells += (column == 0 ? "" : "|") + values.GetValue(column, row).ToString();
-			}
-			rows.push_back(cells);
-		}
-		return rows;
+		return TwinRows(*con, sql);
 	}
 
 	std::string Explain(const std::string &sql) {
@@ -325,19 +356,23 @@ private:
 		}
 	}
 
+	struct TwinLink {
+		int near_pair[2] = {-1, -1};
+		int far_pair[2] = {-1, -1};
+		std::thread to_far;
+		std::thread to_near;
+		std::thread serve;
+		unique_ptr<Connection> serve_con;
+	};
+
 	DuckDB &far;
 	Connection &far_con;
 	std::vector<std::string> catalogs;
 
 	unique_ptr<DuckDB> near_db = make_uniq<DuckDB>(nullptr);
 	unique_ptr<Connection> con;
-	unique_ptr<Connection> serve_con;
-
-	int near_pair[2] = {-1, -1};
-	int far_pair[2] = {-1, -1};
-	std::thread to_far;
-	std::thread to_near;
-	std::thread serve;
+	std::vector<unique_ptr<TwinLink>> links;
+	std::string first_connection;
 
 	std::mutex lock;
 	std::vector<std::string> sent;
@@ -362,6 +397,10 @@ public:
 		TwinRun(far_con, sql);
 	}
 
+	std::vector<std::string> FarRows(const std::string &sql) {
+		return TwinRows(far_con, sql);
+	}
+
 	TwinClient &Client() {
 		clients.push_back(make_uniq<TwinClient>(far, far_con, catalogs));
 		clients.back()->Attach();
@@ -377,6 +416,18 @@ public:
 	}
 	void NearFails(const std::string &sql, ExceptionType type, const std::string &message) {
 		First().NearFails(sql, type, message);
+	}
+	void NearErrors(const std::string &sql, const std::string &message = "") {
+		First().NearErrors(sql, message);
+	}
+	std::string Connect() {
+		return First().Connect();
+	}
+	void AttachAs(const std::string &alias, const std::string &catalog, const std::string &connection_id) {
+		First().AttachAs(alias, catalog, connection_id);
+	}
+	const std::string &ConnectionId() {
+		return First().ConnectionId();
 	}
 	void NearFunction(ScalarFunction function) {
 		First().NearFunction(std::move(function));
