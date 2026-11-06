@@ -88,25 +88,25 @@ void WakeOnFrame(const std::shared_ptr<State> &state) {
 	});
 }
 
-unique_ptr<CrossingWriteResult> WriteResultOf(const string &catalog, const n6k::Frame &frame) {
+optional_idx WriteResultOf(const string &catalog, const n6k::Frame &frame) {
 	if (frame.type == n6k::FrameType::ERR) {
 		n6k::ThrowN6kError(catalog, n6k::OP_WRITE_PLAN, frame.payload);
 	}
 	if (frame.type != n6k::FrameType::RESP_END) {
-		return nullptr;
+		return optional_idx();
 	}
 	n6k::JsonDoc doc(frame.payload);
 	auto *rowcount = doc.Parsed() ? duckdb_yyjson::yyjson_obj_get(doc.Root(), "rowcount") : nullptr;
 	if (!rowcount || !duckdb_yyjson::yyjson_is_int(rowcount)) {
 		throw IOException("n6k[" + catalog + "] write: server response has no rowcount");
 	}
-	auto affected = NumericCast<idx_t>(duckdb_yyjson::yyjson_get_sint(rowcount));
-	return make_uniq<CrossingWriteResult>(CrossingWriteResult::Done(affected));
+	return optional_idx(NumericCast<idx_t>(duckdb_yyjson::yyjson_get_sint(rowcount)));
 }
 
 struct N6kWriteState {
 	std::shared_ptr<n6k::RequestState> req;
 	ArmedWaker waker;
+	bool reported = false;
 
 	~N6kWriteState() {
 		if (req) {
@@ -120,6 +120,7 @@ struct N6kWriteState {
 // DuckDB vectors without `lock`. Fields set by ResolveReadSchema are written once under `lock` before
 // any batch is taken, then read unlocked.
 struct N6kReadShared : public N6kFrameSourceState {
+	uint8_t op = n6k::OP_READ_PLAN;
 	std::mutex lock;
 	idx_t next_batch = 0;
 	vector<CrossingWaker> parked;
@@ -263,15 +264,16 @@ CrossingReadResult PullRead(ClientContext &context, N6kReadShared &shared, N6kRe
 		// Readers parked before SetOnFrame was installed missed the frames that ended the stream.
 		shared.WakeAll();
 		if (shared.saw_error) {
-			N6kThrowSourceError(shared, catalog, n6k::OP_READ_PLAN, "read");
+			N6kThrowSourceError(shared, catalog, shared.op, "read");
 		}
 		return CrossingReadResult::Done();
 	}
 }
 
-CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const string &catalog, const string &body,
-                      const vector<LogicalType> &types, idx_t partitions) {
+CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const string &catalog, uint8_t op,
+                      const string &body, const vector<LogicalType> &types, idx_t partitions) {
 	auto shared = std::make_shared<N6kReadShared>();
+	shared->op = op;
 	CrossingScan scan;
 	scan.partitions = partitions;
 	scan.batch_indexed = true;
@@ -282,7 +284,7 @@ CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const stri
 			std::lock_guard<std::mutex> guard(shared->lock);
 			if (!shared->req) {
 				shared->req =
-				    session->StartOpRequest(n6k::OP_READ_PLAN, body, [&context]() { return context.IsInterrupted(); });
+				    session->StartOpRequest(shared->op, body, [&context]() { return context.IsInterrupted(); });
 				started = true;
 			}
 		}
@@ -592,6 +594,7 @@ CrossingTable N6kSource::DescribeIn(const string &schema, const string &name, in
 	table.verbs = CrossingVerbsNamed(info.verbs);
 	table.key = info.primary_keys;
 	table.key_unique = !table.key.empty();
+	table.returning = session->HasCapability(n6k::CAP_WRITE_RETURNING);
 	DeclareConstraints(table, info);
 	return table;
 }
@@ -609,9 +612,6 @@ CrossingSchema N6kSource::DescribeSchema(const string &schema) {
 }
 
 CrossingPlan N6kSource::Plan(const CrossingPlanRequest &request) {
-	if (request.verb != CrossingVerb::SELECT) {
-		return CrossingPlan::Of(MakeSeamNode(0, request.seam.types));
-	}
 	Columns columns;
 	{
 		lock_guard<mutex> guard(lock);
@@ -749,9 +749,15 @@ N6kSession::~N6kSession() {
 }
 
 int64_t N6kSession::Txn() {
-	if (autocommit) {
-		return -1;
+	lock_guard<mutex> guard(lock);
+	if (txn < 0 && !autocommit) {
+		txn = session->TxnBegin();
 	}
+	return txn;
+}
+
+// Autocommit too: crossing can fail the statement after a write's reader returned, and Rollback must undo it.
+int64_t N6kSession::WriteTxn() {
 	lock_guard<mutex> guard(lock);
 	if (txn < 0) {
 		txn = session->TxnBegin();
@@ -967,70 +973,89 @@ void N6kSession::Rollback() {
 	session->TxnEnd(ending, false);
 }
 
-CrossingScan N6kSession::Read(ClientContext &context, const CrossingQuery &query) {
+CrossingScan N6kSession::Run(ClientContext &context, const CrossingQuery &query) {
+	if (auto node = WriteOf(query.plan)) {
+		return RunWrite(context, query, *node);
+	}
 	auto body = n6k_body::ReadPlan(RenderCrossingPlan(query.plan), Txn());
 	auto partitions = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	return OpenScan(session, catalog_name, body, query.types, MaxValue<idx_t>(partitions, 1));
+	return OpenScan(session, catalog_name, n6k::OP_READ_PLAN, body, query.types, MaxValue<idx_t>(partitions, 1));
 }
 
-CrossingWriter N6kSession::Write(ClientContext &context, const CrossingQuery &query) {
-	if (query.written.table.empty()) {
-		throw InternalException("n6k crossing: a write names no table");
-	}
-	auto &use = query.written;
+CrossingScan N6kSession::RunWrite(ClientContext &context, const CrossingQuery &query, const CrossingWriteNode &node) {
 	std::string plan_json;
 	std::string arrow;
-	if (query.types.empty()) {
-		// A delete that reads nothing: its plan is a placeholder.
-	} else if (auto rows = SeamRowsOf(query.plan)) {
-		auto &types = rows->Types();
-		auto chunks = ChunksOf(*rows);
-		vector<string> names;
-		for (idx_t i = 0; i < types.size(); i++) {
-			names.push_back("c" + std::to_string(i));
+	if (!query.plan.children.empty()) {
+		auto &feed = *query.plan.children[0];
+		if (auto rows = SeamRowsOf(feed)) {
+			auto &types = rows->Types();
+			auto chunks = ChunksOf(*rows);
+			vector<string> names;
+			for (idx_t i = 0; i < types.size(); i++) {
+				names.push_back("c" + std::to_string(i));
+			}
+			ArrowBuffer ipc_buf;
+			ArrowBufferInit(&ipc_buf);
+			SerializeChunksToArrowIPC(context, types, names, chunks, &ipc_buf);
+			arrow.assign(reinterpret_cast<const char *>(ipc_buf.data), static_cast<size_t>(ipc_buf.size_bytes));
+			ArrowBufferReset(&ipc_buf);
+		} else {
+			plan_json = RenderCrossingPlan(feed);
 		}
-		ArrowBuffer ipc_buf;
-		ArrowBufferInit(&ipc_buf);
-		SerializeChunksToArrowIPC(context, types, names, chunks, &ipc_buf);
-		arrow.assign(reinterpret_cast<const char *>(ipc_buf.data), static_cast<size_t>(ipc_buf.size_bytes));
-		ArrowBufferReset(&ipc_buf);
-	} else {
-		plan_json = RenderCrossingPlan(query.plan);
 	}
-	auto body = n6k_body::WritePlan(CrossingVerbName(query.kind), use.schema, use.table, query.key_columns,
-	                                query.set_columns, query.reads_rows, plan_json, Txn());
+	auto reads_rows = CrossingWriteTargetOf(catalog_name, node).reads_rows;
+	auto body = n6k_body::WritePlan(CrossingVerbName(node.verb), node.schema, node.table, node.key_columns,
+	                                node.set_columns, reads_rows, node.returning_columns, plan_json, WriteTxn());
 	body.push_back('\n');
 	body.append(arrow);
+	if (!node.returning_columns.empty()) {
+		return OpenScan(session, catalog_name, n6k::OP_WRITE_PLAN, body, query.types, 1);
+	}
 
-	auto state = std::make_shared<N6kWriteState>();
 	auto session_copy = session;
 	auto catalog = catalog_name;
-	return [state, session_copy, catalog, body](ClientContext &ctx, const CrossingWaker &waker) {
-		if (!state->req) {
-			state->req =
-			    session_copy->StartOpRequest(n6k::OP_WRITE_PLAN, body, [&ctx]() { return ctx.IsInterrupted(); });
-			WakeOnFrame(state);
-		}
-		for (;;) {
-			n6k::Frame frame;
-			while (state->req->TryNext(frame)) {
-				if (auto done = WriteResultOf(catalog, frame)) {
-					return *done;
+	CrossingScan scan;
+	scan.open = [session_copy, catalog, body](ClientContext &, idx_t) -> CrossingReader {
+		auto state = std::make_shared<N6kWriteState>();
+		return [state, session_copy, catalog, body](ClientContext &ctx, DataChunk &chunk, CrossingWaker waker) {
+			if (state->reported) {
+				return CrossingReadResult::Done();
+			}
+			auto report = [&](idx_t changed) {
+				chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(changed)));
+				chunk.SetChildCardinality(1);
+				state->reported = true;
+				return CrossingReadResult::Rows();
+			};
+			if (!state->req) {
+				state->req =
+				    session_copy->StartOpRequest(n6k::OP_WRITE_PLAN, body, [&ctx]() { return ctx.IsInterrupted(); });
+				WakeOnFrame(state);
+			}
+			for (;;) {
+				n6k::Frame frame;
+				while (state->req->TryNext(frame)) {
+					auto changed = WriteResultOf(catalog, frame);
+					if (changed.IsValid()) {
+						return report(changed.GetIndex());
+					}
 				}
-			}
-			if (state->req->Exhausted()) {
-				throw IOException("n6k[" + catalog + "] write: the request ended without a result");
-			}
-			state->waker.Arm(waker);
-			if (state->req->TryNext(frame)) {
-				if (auto done = WriteResultOf(catalog, frame)) {
-					return *done;
+				if (state->req->Exhausted()) {
+					throw IOException("n6k[" + catalog + "] write: the request ended without a result");
 				}
-				continue;
+				state->waker.Arm(waker);
+				if (state->req->TryNext(frame)) {
+					auto changed = WriteResultOf(catalog, frame);
+					if (changed.IsValid()) {
+						return report(changed.GetIndex());
+					}
+					continue;
+				}
+				return CrossingReadResult::Wait();
 			}
-			return CrossingWriteResult::Wait();
-		}
+		};
 	};
+	return scan;
 }
 
 } // namespace duckdb

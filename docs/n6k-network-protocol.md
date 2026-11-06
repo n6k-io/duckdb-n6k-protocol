@@ -192,6 +192,7 @@ missing capability is fatal. Each name is defined at exactly one level.
 | `has_function` | open | `HAS_FUNCTION {name, args}` is implemented: `RESP_END {exists}` says whether the session's server has a scalar or aggregate function taking exactly those argument types, with no cast. A client without this capability treats every answer as no and keeps named function calls out of its plans. |
 | `schema_ddl` | open | `CREATE_SCHEMA` is implemented. A client without this capability refuses `CREATE SCHEMA`. |
 | `table_ddl` | open | `CREATE_TABLE` honours `not_null`, `primary_key`, `unique_keys` and `txn`, and `ALTER_TABLE` honours `txn`. A client without this capability refuses a `CREATE TABLE` with constraints and table DDL in a transaction. |
+| `write_returning` | open | `WRITE_PLAN` honours `returning_columns`: the response is the rows the write left, those columns of them, as `RESP_SCHEMA`, `RESP_CHUNK` frames and `RESP_END`, instead of `RESP_END {rowcount}`. A client without this capability refuses `RETURNING`. |
 
 `catalog_plans` is granted only for a catalog the server serves itself, never one it forwards upstream. A
 plan naming a catalog no session on the socket has open fails with `CatalogException`, and one naming a

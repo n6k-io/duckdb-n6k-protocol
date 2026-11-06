@@ -322,6 +322,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("key_columns", _ARRAY_OF_STR, True),
             ("set_columns", _ARRAY_OF_STR, True),
             ("reads_rows", "boolean", False),
+            ("returning_columns", _ARRAY_OF_STR, False),
             ("plan", "string", True),
             ("txn", "integer", False),
         ],
@@ -546,9 +547,10 @@ CAP_CATALOG_PLANS: Final = "catalog_plans"
 CAP_HAS_FUNCTION: Final = "has_function"
 CAP_TABLE_DDL: Final = "table_ddl"
 CAP_SCHEMA_DDL: Final = "schema_ddl"
+CAP_WRITE_RETURNING: Final = "write_returning"
 
 # What this implementation supports at each level; client and server both send their set.
 HELLO_CAPS: Final = (CAP_CROSSING, CAP_JSONRPC, CAP_MCP)
 # The subset of HELLO_CAPS the server grants only when the app serving the socket provides it.
 APP_HELLO_CAPS: Final = (CAP_JSONRPC, CAP_MCP)
-OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_TABLE_DDL, CAP_SCHEMA_DDL)
+OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_TABLE_DDL, CAP_SCHEMA_DDL, CAP_WRITE_RETURNING)

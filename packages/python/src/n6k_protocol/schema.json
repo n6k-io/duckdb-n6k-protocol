@@ -711,6 +711,12 @@
         "reads_rows": {
           "type": "boolean"
         },
+        "returning_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "plan": {
           "type": "string"
         },

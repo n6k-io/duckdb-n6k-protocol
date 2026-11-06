@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+`RETURNING` on an attached database now runs on the server. This adds the `write_returning` capability; against a
+server without it, `RETURNING` fails with `BinderException`.
+
+Writes in autocommit now run in a server transaction, so a statement that fails after its write leaves nothing behind.
+Each such write costs two more round trips.
+
 `CREATE SCHEMA` on an attached database now creates the schema on the server. It previously reported success but only
 changed that client's local catalog, so a following `CREATE TABLE` in it failed with a permission error. This adds the
 `CREATE_SCHEMA` op and the `schema_ddl` capability; against a server without them, `CREATE SCHEMA` fails with

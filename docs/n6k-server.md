@@ -414,7 +414,7 @@ The extension answers the REQ ops dispatched in `HandleRequest`
 | `TABLE_SCHEMA` | ✅ Arrow schema (`SELECT … LIMIT 0`) |
 | `QUERY` | ✅ raw passthrough SQL, streamed |
 | `READ_PLAN` | ✅ Substrait plan decoded over the served catalog (and, under `catalog_plans`, the socket's other open catalogs), streamed |
-| `WRITE_PLAN` | ✅ crossing write |
+| `WRITE_PLAN` | ✅ crossing write → `{"rowcount":N}`, or with `returning_columns` the rows it left, streamed |
 | `TXN_BEGIN` / `TXN_COMMIT` / `TXN_ROLLBACK` | ✅ one pinned `Connection` per `(ns, txn)` |
 | `EXEC` | ✅ → `{"rowcount":N}` |
 | `INSERT` | ✅ Arrow IPC body → `INSERT`, → `{"rowcount":N}` |

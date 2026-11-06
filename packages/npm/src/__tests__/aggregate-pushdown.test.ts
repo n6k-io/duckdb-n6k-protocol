@@ -46,6 +46,7 @@ backendDescribe()(`aggregate pushdown [${backendName}]`, () => {
       { capability: "has_function", level: "open" },
       { capability: "schema_ddl", level: "open" },
       { capability: "table_ddl", level: "open" },
+      { capability: "write_returning", level: "open" },
     ]);
   });
 

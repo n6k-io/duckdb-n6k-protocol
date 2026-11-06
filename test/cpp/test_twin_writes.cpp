@@ -66,6 +66,7 @@ TEST_CASE("update, delete, insert, returning, merge and conflict clauses run on 
 	     "UPDATE " + PEOPLE + " SET age = 99 WHERE id = 1 RETURNING id, age",
 	     {"1|99"},
 	     {"1|alice|99", "2|bob|25", "3|charlie|35"}},
+	    {PEOPLE, "DELETE FROM " + PEOPLE + " WHERE id = 1 RETURNING name", {"alice"}, {"2|bob|25", "3|charlie|35"}},
 	    {KV, "UPDATE " + KV + " SET v = 99 WHERE id = 1", {"1"}, {"1|99", "2|20"}},
 	    {KV, "DELETE FROM " + KV + " WHERE id = 1", {"1"}, {"2|20"}},
 	    {KV, "DELETE FROM " + KV, {"2"}, {}},

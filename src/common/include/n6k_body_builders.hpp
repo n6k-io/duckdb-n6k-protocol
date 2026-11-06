@@ -95,7 +95,8 @@ inline std::string ReadPlan(const std::string &plan_json, int64_t txn) {
 
 inline std::string WritePlan(const std::string &verb, const std::string &schema, const std::string &table,
                              const std::vector<std::string> &key_columns, const std::vector<std::string> &set_columns,
-                             bool reads_rows, const std::string &plan_json, int64_t txn) {
+                             bool reads_rows, const std::vector<std::string> &returning_columns,
+                             const std::string &plan_json, int64_t txn) {
 	auto *doc = yyjson_mut_doc_new(nullptr);
 	auto *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
@@ -113,6 +114,13 @@ inline std::string WritePlan(const std::string &verb, const std::string &schema,
 	}
 	yyjson_mut_obj_add_val(doc, root, "set_columns", sets);
 	duckdb_yyjson::yyjson_mut_obj_add_bool(doc, root, "reads_rows", reads_rows);
+	if (!returning_columns.empty()) {
+		auto *returning = duckdb_yyjson::yyjson_mut_arr(doc);
+		for (auto &column : returning_columns) {
+			duckdb_yyjson::yyjson_mut_arr_add_strncpy(doc, returning, column.c_str(), column.size());
+		}
+		yyjson_mut_obj_add_val(doc, root, "returning_columns", returning);
+	}
 	yyjson_mut_obj_add_strncpy(doc, root, "plan", plan_json.c_str(), plan_json.size());
 	if (txn >= 0) {
 		duckdb_yyjson::yyjson_mut_obj_add_sint(doc, root, "txn", txn);

@@ -83,8 +83,7 @@ public:
 	N6kSession(N6kSource &source, std::shared_ptr<CatalogSession> session, string catalog_name, bool autocommit);
 	~N6kSession();
 
-	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
-	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	CrossingScan Run(ClientContext &context, const CrossingQuery &query);
 	void Ddl(ClientContext &context, const CrossingDdl &ddl);
 	vector<string> Tables(const string &schema);
 	CrossingTable Describe(const string &schema, const string &name);
@@ -93,6 +92,8 @@ public:
 
 private:
 	int64_t Txn();
+	int64_t WriteTxn();
+	CrossingScan RunWrite(ClientContext &context, const CrossingQuery &query, const CrossingWriteNode &node);
 	void RequireTableDdl(const char *what);
 
 	N6kSource &source;

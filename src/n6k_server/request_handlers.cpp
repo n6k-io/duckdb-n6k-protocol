@@ -28,6 +28,7 @@
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -810,27 +811,51 @@ static CrossingVerb WriteVerbOf(const std::string &verb) {
 	throw InvalidInputException("n6k_server: OP_WRITE_PLAN verb '%s' is not insert, update or delete", verb);
 }
 
-// ExecuteWrite binds and runs inside a transaction. A pinned connection has one open; the worker's
-// own connection gets one for the statement.
-static idx_t WriteInTransaction(Connection &conn, bool pinned, const CrossingWriteTarget &target,
-                                unique_ptr<TableRef> seam) {
+// SubmitWrite binds and runs inside a transaction. A pinned connection has one open; the worker's
+// own connection gets one for the statement. SubmitWrite has already collected the result.
+static unique_ptr<QueryResult> WriteInTransaction(Connection &conn, bool pinned, const CrossingWriteTarget &target,
+                                                  unique_ptr<TableRef> seam) {
 	if (pinned) {
-		return ExecuteWrite(*conn.context, target, std::move(seam));
+		return SubmitWrite(*conn.context, target, std::move(seam));
 	}
 	conn.BeginTransaction();
-	idx_t changed;
+	unique_ptr<QueryResult> result;
 	try {
-		changed = ExecuteWrite(*conn.context, target, std::move(seam));
+		result = SubmitWrite(*conn.context, target, std::move(seam));
 	} catch (...) {
 		conn.Rollback();
 		throw;
 	}
 	conn.Commit();
-	return changed;
+	return result;
 }
 
-static void HandleWritePlan(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                            size_t body_len, RequestSlot &slot) {
+// From the served table, not the wire: the client's described types went through Arrow and can differ,
+// and SubmitWrite refuses a mismatch.
+static vector<LogicalType> ReturningTypesOf(Connection &conn, const std::string &catalog,
+                                            const CrossingWriteTarget &write) {
+	auto table = conn.Query(BuildTableSchemaSql(catalog, write.schema, write.table));
+	if (table->HasError()) {
+		table->ThrowError();
+	}
+	auto &names = table->GetNames();
+	auto &types = table->GetTypes();
+	vector<LogicalType> returning;
+	for (auto &column : write.returning_columns) {
+		auto found = std::find_if(names.begin(), names.end(), [&](const Identifier &name) {
+			return StringUtil::CIEquals(name.GetIdentifierName(), column);
+		});
+		if (found == names.end()) {
+			throw CatalogException("n6k_server: table '%s' has no column '%s' to return", write.table, column);
+		}
+		returning.push_back(types[NumericCast<idx_t>(found - names.begin())]);
+	}
+	return returning;
+}
+
+static std::unique_ptr<ParkedStream> HandleWritePlan(ServeReactor &reactor, std::unique_ptr<Connection> &own,
+                                                     const SessionRef &sess, const char *body, size_t body_len,
+                                                     RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
 	const std::string &catalog = sess.catalog;
 	auto *nl = static_cast<const char *>(memchr(body, '\n', body_len));
@@ -851,12 +876,16 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 	write.key_columns = JsonGetStrArray(root, "key_columns");
 	write.set_columns = JsonGetStrArray(root, "set_columns");
 	write.reads_rows = JsonGetBool(root, "reads_rows", true);
+	write.returning_columns = JsonGetStrArray(root, "returning_columns");
 	auto plan = JsonGetStr(root, "plan");
 	if (write.schema.empty() || write.table.empty()) {
 		throw InvalidInputException("n6k_server: OP_WRITE_PLAN requires \"schema\" and \"table\"");
 	}
-	auto scope = ConnectionFor(reactor, own, sess, root, slot);
+	auto scope = ConnectionFor(reactor, *own, sess, root, slot);
 	auto &conn = *scope.conn;
+	if (!write.returning_columns.empty()) {
+		write.returning_types = ReturningTypesOf(conn, catalog, write);
+	}
 
 	const uint8_t *arrow = reinterpret_cast<const uint8_t *>(body) + header_len + 1;
 	size_t arrow_len = body_len - header_len - 1;
@@ -867,11 +896,20 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 		           ->GetTableRef();
 	} else if (!plan.empty()) {
 		seam = DecodeSubstraitJson(conn, catalog, plan, PlanCatalogCheck(reactor, slot))->GetTableRef();
-	} else if (write.reads_rows) {
-		throw InvalidInputException("n6k_server: OP_WRITE_PLAN carries neither rows nor a plan");
 	}
-	auto rowcount = WriteInTransaction(conn, scope.pinned != nullptr, write, std::move(seam));
-	reactor.EndRequest(slot, PackRespEndRowcount(target, NumericCast<int64_t>(rowcount)));
+	auto result = WriteInTransaction(conn, scope.pinned != nullptr, write, std::move(seam));
+	if (write.returning_columns.empty()) {
+		auto rowcount = result->Fetch()->GetValue(0, 0).GetValue<int64_t>();
+		reactor.EndRequest(slot, PackRespEndRowcount(target, rowcount));
+		return nullptr;
+	}
+	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(own), target, 0));
+	if (scope.pinned) {
+		scope.StopInterrupts();
+		scope.guard.unlock();
+	}
+	stream->Start(reactor, slot, std::move(result), true);
+	return std::move(stream);
 }
 
 // A generator in the host process, reached through three scalar UDFs it registered on the served
@@ -1269,8 +1307,7 @@ std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_p
 	case OP_READ_PLAN:
 		return HandleReadPlan(reactor, own, sess, body, body_len, slot);
 	case OP_WRITE_PLAN:
-		HandleWritePlan(reactor, conn, sess, body, body_len, slot);
-		break;
+		return HandleWritePlan(reactor, own, sess, body, body_len, slot);
 	case OP_TXN_BEGIN:
 		HandleTxnBegin(reactor, sess, slot);
 		break;
