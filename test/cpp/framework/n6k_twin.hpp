@@ -11,10 +11,15 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -62,6 +67,49 @@ inline std::vector<std::string> TwinRows(Connection &connection, const std::stri
 	}
 	return rows;
 }
+
+class TwinTicks {
+public:
+	void Add(idx_t count) {
+		if (stopped.load()) {
+			throw InvalidInputException("far_tick stopped");
+		}
+		ticks.fetch_add(static_cast<int64_t>(count));
+	}
+
+	void Stop() {
+		stopped.store(true);
+	}
+
+	bool AwaitStarted() const {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		while (ticks.load() == 0) {
+			if (std::chrono::steady_clock::now() > deadline) {
+				return false;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		return true;
+	}
+
+	bool AwaitQuiet() const {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		auto last = ticks.load();
+		while (std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			const auto now = ticks.load();
+			if (now == last) {
+				return true;
+			}
+			last = now;
+		}
+		return false;
+	}
+
+private:
+	std::atomic<int64_t> ticks {0};
+	std::atomic<bool> stopped {false};
+};
 
 class TwinClient {
 public:
@@ -155,6 +203,44 @@ public:
 		REQUIRE(result->HasError());
 		INFO(result->GetError());
 		REQUIRE(result->GetError().find(message) != std::string::npos);
+	}
+
+	void NearIgnoringError(const std::string &sql) {
+		con->Query(sql);
+	}
+
+	void NearInterrupted(const std::string &sql, const std::function<bool()> &started,
+	                     const std::function<void()> &give_up) {
+		INFO(sql);
+		std::string error;
+		auto type = ExceptionType::INVALID;
+		bool failed = false;
+		std::atomic<bool> done {false};
+		std::thread runner([&] {
+			auto result = con->Query(sql);
+			failed = result->HasError();
+			if (failed) {
+				error = result->GetError();
+				type = result->GetErrorType();
+			}
+			done.store(true);
+		});
+		const bool reached = started();
+		con->Interrupt();
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		const bool stopped_in_time = done.load();
+		if (!stopped_in_time) {
+			give_up();
+		}
+		runner.join();
+		INFO(error);
+		REQUIRE(reached);
+		REQUIRE(stopped_in_time);
+		REQUIRE(failed);
+		REQUIRE(type == ExceptionType::INTERRUPT);
 	}
 
 	void NearFails(const std::string &sql, ExceptionType type, const std::string &message) {
@@ -388,6 +474,20 @@ public:
 		for (auto &catalog : catalogs) {
 			TwinRun(far_con, "ATTACH ':memory:' AS " + catalog);
 		}
+		auto counter = ticks;
+		ScalarFunction far_tick("far_tick", {LogicalType::BIGINT}, LogicalType::BIGINT,
+		                        [counter](DataChunk &args, ExpressionState &, Vector &result) {
+			                        counter->Add(args.size());
+			                        UnaryExecutor::Execute<int64_t, int64_t>(args.data[0], result,
+			                                                                 [](int64_t value) { return value; });
+		                        });
+		CreateScalarFunctionInfo info(std::move(far_tick));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		far_con.context->RegisterFunction(info);
+	}
+
+	~N6kTwin() {
+		ticks->Stop();
 	}
 
 	N6kTwin(const N6kTwin &) = delete;
@@ -419,6 +519,16 @@ public:
 	}
 	void NearErrors(const std::string &sql, const std::string &message = "") {
 		First().NearErrors(sql, message);
+	}
+	void NearIgnoringError(const std::string &sql) {
+		First().NearIgnoringError(sql);
+	}
+	void NearInterrupted(const std::string &sql) {
+		First().NearInterrupted(
+		    sql, [this] { return ticks->AwaitStarted(); }, [this] { ticks->Stop(); });
+	}
+	bool FarQuiet() const {
+		return ticks->AwaitQuiet();
 	}
 	std::string Connect() {
 		return First().Connect();
@@ -465,6 +575,7 @@ private:
 	DuckDB far;
 	Connection far_con;
 	std::vector<std::string> catalogs;
+	std::shared_ptr<TwinTicks> ticks = std::make_shared<TwinTicks>();
 	std::vector<unique_ptr<TwinClient>> clients;
 };
 
