@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 
@@ -24,9 +25,9 @@ static vector<std::string> AttachedUserCatalogs(ClientContext &context) {
 		if (db->IsSystem() || db->IsTemporary()) {
 			continue;
 		}
-		names.push_back(db->GetName());
+		names.push_back(db->GetName().GetIdentifierName());
 		if (!db->IsInitialDatabase() || !db->GetCatalog().InMemory()) {
-			requested.push_back(db->GetName());
+			requested.push_back(db->GetName().GetIdentifierName());
 		}
 	}
 	return requested.empty() ? names : requested;
@@ -57,7 +58,7 @@ vector<std::string> ResolveServedCatalogs(ClientContext &context, const vector<V
 			                      ALL_CATALOGS);
 		}
 		try {
-			(void)Catalog::GetCatalog(context, catalog_name);
+			(void)Catalog::GetCatalog(context, Identifier(catalog_name));
 		} catch (const std::exception &) {
 			throw BinderException("%s: catalog \"%s\" is not attached; ATTACH it before serving", fn_name,
 			                      catalog_name);

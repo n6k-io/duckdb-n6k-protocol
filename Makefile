@@ -4,6 +4,10 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=n6k_client
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
+# Without this DuckDB v2 stamps local builds with the commit hash, which release
+# clients (Python duckdb, duckdb-wasm) refuse to load.
+export OVERRIDE_GIT_DESCRIBE := v2.0.0
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
@@ -18,7 +22,7 @@ npm_db_wasm:
 # The coi (wasm_threads) extension must be built with the emsdk that matches
 # duckdb-wasm's coi runtime. A different emcc silently produces an incompatible
 # side-module, so gate the build on the pinned version.
-EXPECTED_EMCC_VERSION := 3.1.71
+EXPECTED_EMCC_VERSION := 6.0.9
 
 # Preflight: fail fast unless the emcc on PATH is the pinned toolchain.
 .PHONY: wasm-preflight
@@ -42,10 +46,27 @@ wasm_threads: EXT_FLAGS += -DUSE_WASM_THREADS=1
 # (a lock_guard held across a throw stays locked forever).
 wasm_threads: WASM_COMPILE_TIME_EH_FLAGS = -fwasm-exceptions -DWEBDB_FAST_EXCEPTIONS=1
 
-# Build + stage the coi (wasm_threads) variant. `wasm-all` is kept as an alias
-# (coi is the only variant now).
 .PHONY: wasm wasm-all
 wasm wasm-all: wasm-preflight wasm_threads npm_db_wasm
+
+# The Catch binary links the archives in build/release, so only those are rebuilt first.
+TEST_ARGS ?=
+CPP_TEST_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
+CPP_TEST_LOGS := build/test-logs
+CPP_TEST_BUILD_LOG := $(CPP_TEST_LOGS)/cpp-test-build.log
+CPP_TEST_RUN_LOG := $(CPP_TEST_LOGS)/cpp-test-run.log
+
+.PHONY: cpp-test
+cpp-test:
+	@test -f build/release/CMakeCache.txt || { echo "ERROR: build/release is not configured; run 'make release' once"; exit 1; }
+	@mkdir -p $(CPP_TEST_LOGS)
+	@echo "cpp-test: building (log: $(CPP_TEST_BUILD_LOG))"
+	@{ cmake --build build/release -j$(CPP_TEST_JOBS) --target n6k_client_extension n6k_server_extension n6k_testing_extension duckdb_static core_functions_extension \
+		&& cmake -S test/cpp -B build/cpp-test -DCMAKE_BUILD_TYPE=Release -DDUCKDB_SOURCE_DIR=$(PROJ_DIR)duckdb -DDUCKDB_BUILD_DIR=$(PROJ_DIR)build/release \
+		&& cmake --build build/cpp-test -j$(CPP_TEST_JOBS); } > $(CPP_TEST_BUILD_LOG) 2>&1 \
+		|| { grep -E 'error:|Undefined symbols|duplicate symbol|CMake Error' $(CPP_TEST_BUILD_LOG) | head -40; echo "cpp-test: build failed, full log: $(CPP_TEST_BUILD_LOG)"; exit 1; }
+	@echo "cpp-test: running (log: $(CPP_TEST_RUN_LOG))"
+	@build/cpp-test/n6k_unittest $(TEST_ARGS) > $(CPP_TEST_RUN_LOG) 2>&1; status=$$?; tail -40 $(CPP_TEST_RUN_LOG); exit $$status
 
 # Regenerate TS + C++ mirrors of packages/python/src/n6k_protocol/protocol.py.
 # Source of truth lives in Python; outputs are committed to git.

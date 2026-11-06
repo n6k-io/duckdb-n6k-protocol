@@ -1,5 +1,4 @@
 #include "n6k_schema_entry.hpp"
-#include "n6k_yyjson_util.hpp"
 #include "n6k_catalog.hpp"
 #include "n6k_catalog_session.hpp"
 #include "n6k_rpc_function.hpp"
@@ -10,33 +9,8 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/transaction/transaction.hpp"
-#include "yyjson.hpp"
 
 namespace duckdb {
-
-namespace {
-
-using duckdb_yyjson::yyjson_mut_arr;
-using duckdb_yyjson::yyjson_mut_arr_append;
-using duckdb_yyjson::yyjson_mut_doc;
-using duckdb_yyjson::yyjson_mut_doc_free;
-using duckdb_yyjson::yyjson_mut_doc_new;
-using duckdb_yyjson::yyjson_mut_doc_set_root;
-using duckdb_yyjson::yyjson_mut_obj;
-using duckdb_yyjson::yyjson_mut_obj_add_strncpy;
-using duckdb_yyjson::yyjson_mut_write;
-
-StreamCancelCheck InterruptCheckOf(CatalogTransaction &transaction) {
-	if (!transaction.HasContext()) {
-		return StreamCancelCheck();
-	}
-	auto &context = transaction.GetContext();
-	return [&context]() {
-		return context.IsInterrupted();
-	};
-}
-
-} // namespace
 
 N6kSchemaEntry::N6kSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, std::shared_ptr<CatalogSession> session_p)
     : SchemaCatalogEntry(catalog, info), session(std::move(session_p)) {
@@ -57,7 +31,7 @@ optional_ptr<CatalogEntry> N6kSchemaEntry::LookupEntry(CatalogTransaction transa
 
 	if (entry_type == CatalogType::TABLE_ENTRY || entry_type == CatalogType::VIEW_ENTRY) {
 		session->MarkDisconnectedIfConnectionReplaced();
-		return Attach().LookupTable(name, *this, entry_name, transaction.transaction);
+		return Attach().LookupTable(name.GetIdentifierName(), *this, entry_name, transaction.transaction);
 	}
 	if (entry_type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		return GetOrCreateTableFunctionEntry(transaction, entry_name);
@@ -95,7 +69,7 @@ void N6kSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	if (type == CatalogType::TABLE_ENTRY) {
 		session->MarkDisconnectedIfConnectionReplaced();
 		case_insensitive_set_t seen;
-		Attach().ScanTables(name, *this, seen, callback, &Transaction::Get(context, catalog));
+		Attach().ScanTables(name.GetIdentifierName(), *this, seen, callback, &Transaction::Get(context, catalog));
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		lock_guard<mutex> lock(table_functions_lock);
@@ -108,7 +82,7 @@ void N6kSchemaEntry::Scan(ClientContext &context, CatalogType type,
 void N6kSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
 	if (type == CatalogType::TABLE_ENTRY) {
 		case_insensitive_set_t seen;
-		Attach().ScanTables(name, *this, seen, callback, nullptr);
+		Attach().ScanTables(name.GetIdentifierName(), *this, seen, callback, nullptr);
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
 		lock_guard<mutex> lock(table_functions_lock);
@@ -119,24 +93,16 @@ void N6kSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntr
 }
 
 optional_ptr<CatalogEntry> N6kSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
-	auto &create_info = info.Base();
-
-	auto *doc = yyjson_mut_doc_new(nullptr);
-	auto *arr = yyjson_mut_arr(doc);
-	yyjson_mut_doc_set_root(doc, arr);
-	for (auto &col : create_info.columns.Logical()) {
-		auto *col_obj = yyjson_mut_obj(doc);
-		const auto &col_name = col.Name();
-		auto type_str = col.Type().ToString();
-		yyjson_mut_obj_add_strncpy(doc, col_obj, "name", col_name.c_str(), col_name.size());
-		yyjson_mut_obj_add_strncpy(doc, col_obj, "type", type_str.c_str(), type_str.size());
-		yyjson_mut_arr_append(arr, col_obj);
+	if (!transaction.HasContext()) {
+		throw BinderException("Cannot create table without client context");
 	}
-	auto columns_json = n6k::SerializeJsonDocAndFree(doc);
-
-	session->CreateTable(name, create_info.table, columns_json, InterruptCheckOf(transaction));
-	Attach().Refresh(name);
-	return Attach().LookupTable(name, *this, create_info.table, transaction.transaction);
+	CrossingDdl ddl;
+	ddl.verb = CrossingVerb::CREATE;
+	ddl.schema = name.GetIdentifierName();
+	ddl.table = info.Base().GetTableName().GetIdentifierName();
+	ddl.create = info.base.get();
+	Attach().Ddl(transaction.GetContext(), *transaction.transaction, *this, ddl);
+	return Attach().LookupTable(ddl.schema, *this, ddl.table, transaction.transaction);
 }
 
 optional_ptr<CatalogEntry> N6kSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
@@ -186,8 +152,8 @@ void N6kSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	if (info.type == CatalogType::VIEW_ENTRY) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::DROP;
-		ddl.schema = name;
-		ddl.table = info.name;
+		ddl.schema = name.GetIdentifierName();
+		ddl.table = info.GetQualifiedName().Name().GetIdentifierName();
 		ddl.drop = &info;
 		Attach().Ddl(context, Transaction::Get(context, catalog), *this, ddl);
 		return;
@@ -199,45 +165,23 @@ void N6kSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	if (info.type != AlterType::ALTER_TABLE) {
 		throw BinderException("Only ALTER TABLE is supported on n6k attached databases");
 	}
-	auto &alter = info.Cast<AlterTableInfo>();
-
-	string kind;
-	auto *doc = yyjson_mut_doc_new(nullptr);
-	auto *root = yyjson_mut_obj(doc);
-	yyjson_mut_doc_set_root(doc, root);
-	switch (alter.alter_table_type) {
-	case AlterTableType::ADD_COLUMN: {
-		auto &add = alter.Cast<AddColumnInfo>();
-		kind = "add_column";
-		const auto &col_name = add.new_column.Name();
-		auto type_str = add.new_column.Type().ToString();
-		yyjson_mut_obj_add_strncpy(doc, root, "name", col_name.c_str(), col_name.size());
-		yyjson_mut_obj_add_strncpy(doc, root, "type", type_str.c_str(), type_str.size());
-		break;
+	if (!transaction.HasContext()) {
+		throw BinderException("Cannot alter a table without client context");
 	}
-	case AlterTableType::REMOVE_COLUMN: {
-		auto &rem = alter.Cast<RemoveColumnInfo>();
-		kind = "drop_column";
-		yyjson_mut_obj_add_strncpy(doc, root, "name", rem.removed_column.c_str(), rem.removed_column.size());
-		break;
+	auto &schema_name = name.GetIdentifierName();
+	auto &entry_name = info.GetQualifiedName().Name();
+	if (!Attach().ServesTable(schema_name, entry_name.GetIdentifierName(), transaction.transaction)) {
+		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
+			return;
+		}
+		throw CatalogException::MissingEntry(info.GetCatalogType(), entry_name, string());
 	}
-	case AlterTableType::RENAME_COLUMN: {
-		auto &ren = alter.Cast<RenameColumnInfo>();
-		kind = "rename_column";
-		yyjson_mut_obj_add_strncpy(doc, root, "old_name", ren.old_name.c_str(), ren.old_name.size());
-		yyjson_mut_obj_add_strncpy(doc, root, "new_name", ren.new_name.c_str(), ren.new_name.size());
-		break;
-	}
-	default:
-		yyjson_mut_doc_free(doc);
-		throw BinderException(
-		    "ALTER TABLE %s is not supported on n6k attached databases (only ADD COLUMN, DROP COLUMN, RENAME COLUMN)",
-		    alter.ToString());
-	}
-	auto details_json = n6k::SerializeJsonDocAndFree(doc);
-
-	session->AlterTable(alter.schema, alter.name, kind, details_json, InterruptCheckOf(transaction));
-	Attach().Refresh(name);
+	CrossingDdl ddl;
+	ddl.verb = CrossingVerb::ALTER;
+	ddl.schema = schema_name;
+	ddl.table = entry_name.GetIdentifierName();
+	ddl.alter = &info;
+	Attach().Ddl(transaction.GetContext(), *transaction.transaction, *this, ddl);
 }
 
 } // namespace duckdb

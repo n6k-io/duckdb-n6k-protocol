@@ -118,6 +118,7 @@ public:
 	// Permanent: the hub never dials again. While the connection is up, every bound session and request gets
 	// on_close here; otherwise each already got it at the drop or when it bound.
 	void Disconnect(const std::string &reason);
+	void LogError(const std::exception &e);
 	bool IsDisconnected();
 	// Disconnected, or dropped with no way to redial.
 	bool IsDead();
@@ -220,6 +221,8 @@ private:
 class ConnectionRegistry : public ObjectCacheEntry {
 public:
 	static shared_ptr<ConnectionRegistry> Get(DatabaseInstance &db);
+	// The hubs log through the database's LogManager, which dies right after this: their threads must be done first.
+	~ConnectionRegistry() override;
 
 	static string ObjectType() {
 		return "n6k_connections";

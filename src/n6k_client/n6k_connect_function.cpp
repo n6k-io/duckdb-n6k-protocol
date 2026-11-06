@@ -94,7 +94,7 @@ static void SplitN6kUrl(const string &url, string &base_url, string &query) {
 }
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"connection_id", "capabilities"};
 	return_types = {LogicalType::UUID, LogicalType::LIST(LogicalType::VARCHAR)};
 	n6k::ThrowIfServed(context, FN_NAME);
@@ -133,6 +133,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		}
 		const auto url = result->url;
 		SplitN6kUrl(url, result->url, result->query);
+		// Throws on a malformed URL; the result is unused.
 		n6k::ParseN6kEndpoint(result->url);
 	} else if (!result->has_token && result->scope.empty()) {
 		throw BinderException("%s requires token or scope: SELECT * FROM %s(wsFd => 7, scope => 'host:port')", FN_NAME,
@@ -213,7 +214,7 @@ static std::shared_ptr<n6k::ConnectionHub> Connect(ClientContext &context, const
 #ifndef _WIN32
 		// The host still holds its fd, so only this tells a pump on the other end that the handshake failed.
 		if (acquired.created && bind_data.fd >= 0) {
-			::shutdown(bind_data.fd, SHUT_RDWR);
+			n6k::ShutdownSocket(bind_data.fd);
 		}
 #endif
 		throw;
@@ -227,7 +228,7 @@ static std::shared_ptr<n6k::ConnectionHub> Connect(ClientContext &context, const
 void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kConnectState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -237,12 +238,12 @@ void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
 	for (auto &cap : hub->HelloCapabilities()) {
 		capabilities.emplace_back(cap);
 	}
-	output.SetValue(0, 0, Value::UUID(hub->Id()));
-	output.SetValue(1, 0, Value::LIST(LogicalType::VARCHAR, std::move(capabilities)));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::UUID(hub->Id()));
+	output.data[1].SetValue(0, Value::LIST(LogicalType::VARCHAR, std::move(capabilities)));
+	output.SetChildCardinality(1);
 #else
 	(void)context;
-	output.SetCardinality(0);
+	output.SetChildCardinality(0);
 #endif
 }
 
@@ -250,12 +251,14 @@ void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
 
 void RegisterN6kConnect(ExtensionLoader &loader) {
 	TableFunction fn(FN_NAME, {}, Scan, Bind, InitGlobal);
-	fn.named_parameters["url"] = LogicalType::VARCHAR;
-	fn.named_parameters["wsFd"] = LogicalType::BIGINT;
-	fn.named_parameters["token"] = LogicalType::VARCHAR;
-	fn.named_parameters["scope"] = LogicalType::VARCHAR;
-	fn.named_parameters["on_text"] = LogicalType::VARCHAR;
-	fn.named_parameters["on_close"] = LogicalType::VARCHAR;
+	fn.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("url", LogicalType::VARCHAR);
+		options.Add("wsFd", LogicalType::BIGINT);
+		options.Add("token", LogicalType::VARCHAR);
+		options.Add("scope", LogicalType::VARCHAR);
+		options.Add("on_text", LogicalType::VARCHAR);
+		options.Add("on_close", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(fn);
 }
 

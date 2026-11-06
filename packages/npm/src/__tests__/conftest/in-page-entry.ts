@@ -128,13 +128,13 @@ async function boot(): Promise<void> {
   const coi = globalThis.__n6kBundle === "coi";
   const bundle = coi
     ? {
-        mainModule: "/duckdb/duckdb-coi.wasm",
-        mainWorker: "/duckdb/duckdb-browser-coi.worker.js",
-        pthreadWorker: "/duckdb/duckdb-browser-coi.pthread.worker.js",
+        mainModule: "/duckdb/duckdb-threads.wasm",
+        mainWorker: "/duckdb/duckdb-browser-threads.worker.js",
+        pthreadWorker: "/duckdb/duckdb-browser-threads.pthread.worker.js",
       }
     : {
-        mainModule: "/duckdb/duckdb-eh.wasm",
-        mainWorker: "/duckdb/duckdb-browser-eh.worker.js",
+        mainModule: "/duckdb/duckdb-base.wasm",
+        mainWorker: "/duckdb/duckdb-browser-base.worker.js",
         pthreadWorker: null,
       };
   const catalogsChanged: { wsId: string; catalogs: string[] }[] = [];

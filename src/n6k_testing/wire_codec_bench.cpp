@@ -40,8 +40,10 @@ Rows Materialize(DatabaseInstance &db, const string &sql) {
 		result->ThrowError();
 	}
 	Rows rows;
-	rows.types = result->types;
-	rows.names = result->names;
+	rows.types = result->GetTypes();
+	for (auto &column_name : result->GetNames()) {
+		rows.names.push_back(column_name.GetIdentifierName());
+	}
 	while (auto chunk = result->Fetch()) {
 		if (chunk->size() == 0) {
 			break;
@@ -109,7 +111,7 @@ idx_t ArrowDecode(ClientContext &context, const vector<string> &frames) {
 			while (scan_state.chunk_offset < len) {
 				out.Reset();
 				auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, len - scan_state.chunk_offset);
-				out.SetCardinality(count);
+				out.SetChildCardinality(count);
 				ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), out);
 				scan_state.chunk_offset += count;
 				rows += count;
@@ -121,9 +123,7 @@ idx_t ArrowDecode(ClientContext &context, const vector<string> &frames) {
 }
 
 SerializationOptions NativeOptions() {
-	SerializationOptions options;
-	options.serialization_compatibility = SerializationCompatibility::FromIndex(7);
-	return options;
+	return SerializationOptions();
 }
 
 vector<string> NativeEncode(Rows &rows) {
@@ -196,7 +196,7 @@ struct BenchState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	auto bind = make_uniq<BenchBind>();
 	bind->sql = input.inputs[0].GetValue<string>();
 	auto reps = input.named_parameters.find("reps");
@@ -215,26 +215,27 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 void Scan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<BenchState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
 	auto &bind = data_p.bind_data->Cast<BenchBind>();
 	auto measured = RunBench(context, bind.sql, bind.reps);
 	for (idx_t i = 0; i < measured.size(); i++) {
-		output.SetValue(0, i, Value(measured[i].codec));
-		output.SetValue(1, i, Value(measured[i].stage));
-		output.SetValue(2, i, Value::DOUBLE(measured[i].seconds));
-		output.SetValue(3, i, Value::UBIGINT(measured[i].bytes));
+		output.data[0].SetValue(i, Value(measured[i].codec));
+		output.data[1].SetValue(i, Value(measured[i].stage));
+		output.data[2].SetValue(i, Value::DOUBLE(measured[i].seconds));
+		output.data[3].SetValue(i, Value::UBIGINT(measured[i].bytes));
 	}
-	output.SetCardinality(measured.size());
+	output.SetChildCardinality(measured.size());
 }
 
 } // namespace
 
 void RegisterN6kTestingWireCodecBench(ExtensionLoader &loader) {
 	TableFunction fn("n6k_testing_wire_codec_bench", {LogicalType::VARCHAR}, Scan, Bind, InitGlobal);
-	fn.named_parameters["reps"] = LogicalType::UBIGINT;
+	fn.GetSignature().WithTypedKwargs("options",
+	                                  [](TypedKwargs &options) { options.Add("reps", LogicalType::UBIGINT); });
 	loader.RegisterFunction(fn);
 }
 

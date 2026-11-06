@@ -54,13 +54,17 @@ struct RequestSlot {
 	std::mutex mu;
 	// Its terminal frame went out: nothing more is sent for it. Guarded by `mu`.
 	bool ended = false;
+	// A CANCEL frame arrived, so an interrupted statement ends as cancelled, not as an error. Guarded by `mu`.
+	bool client_cancelled = false;
 	int credits = DEFAULT_BATCH_CREDITS;
 	// The response while it waits for credit, on no thread; whoever calls QueueParked takes it and queues
 	// it. Guarded by `mu`, as is when it parked.
 	std::unique_ptr<ParkedStream> parked;
 	std::chrono::steady_clock::time_point parked_at;
-	// The request's own Connection's context, published once it has one so another thread can interrupt a
-	// query that will not notice `cancel` on its own. Guarded by `mu`.
+	// The context of the Connection running the request's statement, published so another thread can
+	// interrupt a query that will not notice `cancel` on its own. A pinned transaction's is held only while
+	// the request holds that transaction, as its next statement may belong to another request. Guarded by
+	// `mu`.
 	shared_ptr<ClientContext> context;
 	// Immutable, as `ns` and `req_id`.
 	std::string catalog;

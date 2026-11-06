@@ -123,10 +123,10 @@ static void CommitSecretReplacement(ClientContext &context, unique_ptr<const Bas
 	con.Commit();
 }
 
-// Store a minted JWT as a per-host TEMPORARY n6k access secret so WS/HTTP pick it up; re-mints replace in place.
+// Store a minted JWT as a TEMPORARY n6k access secret scoped to the lookup key; re-mints replace in place.
 static void StoreMintedAccessSecret(ClientContext &context, const string &key, const string &token) {
 	vector<string> scope {key};
-	auto secret = make_uniq<KeyValueSecret>(scope, "n6k", "config", "__n6k_minted_" + key);
+	auto secret = make_uniq<KeyValueSecret>(scope, "n6k", "config", Identifier("__n6k_minted_" + key));
 	secret->secret_map["token"] = Value(token);
 	secret->redact_keys = {"token"};
 	CommitSecretReplacement(context, std::move(secret), SecretPersistType::TEMPORARY);
@@ -189,7 +189,8 @@ static string MintViaRefreshGrant(ClientContext &context, const string &key, con
 		replacement->secret_map["refresh_token"] = Value(rotated);
 		CommitSecretReplacement(context, std::move(replacement), match.secret_entry->persist_type,
 		                        match.secret_entry->storage_mode);
-		DUCKDB_LOG_INFO(context, "n6k auth: stored rotated refresh token in secret '" + kv.GetName() + "'");
+		DUCKDB_LOG_INFO(context,
+		                "n6k auth: stored rotated refresh token in secret '" + kv.GetName().GetIdentifierName() + "'");
 	}
 
 	StoreMintedAccessSecret(context, key, minted);
@@ -277,7 +278,7 @@ static string TokenFromSecretMintingIfNearExpiry(ClientContext &context, const s
 
 std::function<string()> RedialTokenResolver(DatabaseInstance &db, const string &base_url) {
 	weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
-	return [weak_db, base_url]() -> string {
+	return [weak_db, base_url = base_url]() -> string {
 		auto database = weak_db.lock();
 		if (!database) {
 			throw IOException("n6k: cannot refresh the token for %s: the database has closed", base_url);

@@ -11,6 +11,8 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parallel/async_result.hpp"
+#include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "ixwebsocket/IXHttp.h"
@@ -18,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -46,18 +49,32 @@ struct N6kServeWsBindData : public TableFunctionData {
 };
 
 struct N6kServeHttpState : public GlobalTableFunctionState {
+	// Runs under the executor's lock during query cleanup, so `server` must not wake the task once `stop` is set.
+	~N6kServeHttpState() override {
+		stop = true;
+		if (server.joinable()) {
+			server.join();
+		}
+	}
+
 	bool done = false;
+	std::thread server;
+	std::atomic<bool> stop {false};
+	std::atomic<int64_t> connections {0};
+	std::atomic<int64_t> handled {0};
+	std::exception_ptr error;
+	InterruptState wake;
 };
 
 } // namespace
 
-static void N6kServeHttpReturnSchema(vector<LogicalType> &return_types, vector<string> &names) {
+static void N6kServeHttpReturnSchema(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"connections", "requests_handled", "url"};
 	return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR};
 }
 
 static unique_ptr<FunctionData> N6kServeHttpBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	N6kServeHttpReturnSchema(return_types, names);
 	n6k::ThrowIfServed(context, FN_NAME);
 
@@ -94,35 +111,27 @@ static unique_ptr<GlobalTableFunctionState> N6kServeHttpInitGlobal(ClientContext
 	return make_uniq<N6kServeHttpState>();
 }
 
-static void N6kServeHttpScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<N6kServeHttpBindData>();
-	auto &state = data_p.global_state->Cast<N6kServeHttpState>();
-	if (state.done) {
-		output.SetCardinality(0);
-		return;
-	}
-
+static void ServeHttpUntilStopped(ClientContext &context, const N6kServeHttpBindData &bind_data,
+                                  N6kServeHttpState &state) {
 	// Every client shares this one DatabaseInstance, and so one catalog set: concurrent writers meet
 	// DuckDB's MVCC, and the reactor reports transaction conflicts as retriable.
 	auto &db = DatabaseInstance::GetDatabase(context);
 
-	std::atomic<int64_t> handled {0};
-	std::atomic<int64_t> connections {0};
 	// Declared before `server`, so on unwind the server stops before its clients are joined.
 	n6k::ServeClients<n6k::WsServeTransport> clients;
 
 	n6k::N6kWsServer server(
 	    bind_data.port, bind_data.host,
 	    [&](int fd, std::shared_ptr<n6k::WsServeTransport> transport, std::string request) {
-		    connections.fetch_add(1);
-		    clients.Spawn(std::move(transport), [&db, &context, &handled, &bind_data, fd,
+		    state.connections.fetch_add(1);
+		    clients.Spawn(std::move(transport), [&db, &context, &state, &bind_data, fd,
 		                                         request = std::move(request)](n6k::WsServeTransport &conn) {
 			    try {
 				    auto session_id = n6k::CreateServeSession(db, fd);
 				    n6k::ServeSessionClaim session(db, session_id);
-				    handled.fetch_add(n6k::ServeWsConnection(conn, db, context, bind_data.catalogs, bind_data.options,
-				                                             session_id, request)
-				                          .requests_handled);
+				    state.handled.fetch_add(n6k::ServeWsConnection(conn, db, context, bind_data.catalogs,
+				                                                   bind_data.options, session_id, request)
+				                                .requests_handled);
 			    } catch (const std::exception &e) {
 				    // `run` must not throw (ServeClients::Spawn); log so a failed reactor is visible.
 				    DUCKDB_LOG_WARNING(context, "n6k_serve_http: connection reactor failed: %s", e.what());
@@ -137,7 +146,7 @@ static void N6kServeHttpScan(ClientContext &context, TableFunctionInput &data_p,
 
 	// ixwebsocket owns the accept loop on its own threads, so this one only has to stay alive and
 	// watch for Ctrl-C — the same interrupt contract as the Unix-socket form's poll timeout.
-	while (!context.IsInterrupted()) {
+	while (!context.IsInterrupted() && !state.stop) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS));
 		clients.ReapFinished();
 	}
@@ -146,16 +155,51 @@ static void N6kServeHttpScan(ClientContext &context, TableFunctionInput &data_p,
 	// each reactor unwinds on its own and drains its in-flight workers before we join it.
 	server.stop();
 	clients.CloseAndJoin();
+}
 
-	// Declared, but not reachable in practice: the only way out of the loop above is the
-	// interrupt, and DuckDB aborts an interrupted statement rather than materialising its
-	// result. A table function must still declare a schema, and this is the honest one.
-	output.SetValue(0, 0, Value::BIGINT(connections.load()));
-	output.SetValue(1, 0, Value::BIGINT(handled.load()));
-	output.SetValue(2, 0, Value("ws://" + bind_data.host + ":" + std::to_string(bind_data.port)));
+static void N6kServeHttpScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<N6kServeHttpBindData>();
+	auto &state = data_p.global_state->Cast<N6kServeHttpState>();
+	if (state.done) {
+		output.SetChildCardinality(0);
+		return;
+	}
+
+	if (state.server.joinable()) {
+		state.server.join();
+		if (state.error) {
+			std::rethrow_exception(state.error);
+		}
+	} else if (data_p.interrupt_state && data_p.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
+		// A scan that never returned left DuckDB's waiting thread spinning when a worker ran it. Parked, that
+		// thread waits, and this one gives its worker back. An interrupt needs no wake: DuckDB aborts the
+		// statement and the state's destructor stops the server.
+		state.wake = *data_p.interrupt_state;
+		state.server = std::thread([&context, &bind_data, &state] {
+			try {
+				ServeHttpUntilStopped(context, bind_data, state);
+			} catch (...) {
+				state.error = std::current_exception();
+				if (!state.stop) {
+					state.wake.Callback();
+				}
+			}
+		});
+		data_p.async_result = AsyncResultType::BLOCKED;
+		return;
+	} else {
+		ServeHttpUntilStopped(context, bind_data, state);
+	}
+
+	// Declared, but not reachable in practice: the only way out of serving is the interrupt, and
+	// DuckDB aborts an interrupted statement rather than materialising its result. A table
+	// function must still declare a schema, and this is the honest one.
+	output.data[0].SetValue(0, Value::BIGINT(state.connections.load()));
+	output.data[1].SetValue(0, Value::BIGINT(state.handled.load()));
+	output.data[2].SetValue(0, Value("ws://" + bind_data.host + ":" + std::to_string(bind_data.port)));
 
 	state.done = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 // Missing or non-string fields read as "", non-string header values are dropped, and a non-object "headers" is ignored.
@@ -182,7 +226,7 @@ static ix::HttpRequestPtr BindUpgradeRequest(const string &json) {
 }
 
 static unique_ptr<FunctionData> N6kServeWsBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"connected",  "requests_handled", "frames_in",   "bytes_in",
 	         "frames_out", "bytes_out",        "duration_ms", "authenticate_ms"};
 	return_types = vector<LogicalType>(names.size(), LogicalType::BIGINT);
@@ -206,7 +250,7 @@ static void N6kServeWsScan(ClientContext &context, TableFunctionInput &data_p, D
 	auto &bind_data = data_p.bind_data->Cast<N6kServeWsBindData>();
 	auto &state = data_p.global_state->Cast<N6kServeHttpState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
@@ -253,22 +297,23 @@ static void N6kServeWsScan(ClientContext &context, TableFunctionInput &data_p, D
 	}
 	adopted.join();
 
-	output.SetValue(0, 0, Value::BOOLEAN(transport != nullptr));
+	output.data[0].SetValue(0, Value::BOOLEAN(transport != nullptr));
 	const vector<int64_t> values {stats.requests_handled, stats.frames_in,   stats.bytes_in,       stats.frames_out,
 	                              stats.bytes_out,        stats.duration_ms, stats.authenticate_ms};
 	for (idx_t i = 0; i < values.size(); i++) {
-		output.SetValue(i + 1, 0, Value::BIGINT(values[i]));
+		output.data[i + 1].SetValue(0, Value::BIGINT(values[i]));
 	}
 	state.done = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 void RegisterN6kServeHttpFunction(ExtensionLoader &loader) {
 	TableFunction func(FN_NAME, {LogicalType::VARCHAR, LogicalType::INTEGER}, N6kServeHttpScan, N6kServeHttpBind,
 	                   N6kServeHttpInitGlobal);
-	func.varargs = LogicalType::VARCHAR;
+	func.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	n6k::AddServeOptionParameters(func);
-	func.named_parameters["max_connections"] = LogicalType::BIGINT;
+	func.GetSignature().ExtendTypedKwargs(
+	    [](TypedKwargs &options) { options.Add("max_connections", LogicalType::BIGINT); });
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));
 }
@@ -276,7 +321,7 @@ void RegisterN6kServeHttpFunction(ExtensionLoader &loader) {
 void RegisterN6kServeWsFunction(ExtensionLoader &loader) {
 	TableFunction func(WS_FN_NAME, {LogicalType::UUID, LogicalType::VARCHAR}, N6kServeWsScan, N6kServeWsBind,
 	                   N6kServeHttpInitGlobal);
-	func.varargs = LogicalType::VARCHAR;
+	func.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	n6k::AddServeOptionParameters(func);
 	CreateTableFunctionInfo info(std::move(func));
 	loader.RegisterFunction(std::move(info));

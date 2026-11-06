@@ -34,7 +34,7 @@ struct StreamCounterState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> StreamCounterBindFn(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"n"};
 	return_types = {LogicalType::BIGINT};
 
@@ -58,7 +58,7 @@ void StreamCounterScan(ClientContext &context, TableFunctionInput &data_p, DataC
 
 	const bool unbounded = bind_data.count <= 0;
 	if (!unbounded && state.emitted >= bind_data.count) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	if (bind_data.interval_ms > 0) {
@@ -75,12 +75,12 @@ void StreamCounterScan(ClientContext &context, TableFunctionInput &data_p, DataC
 		}
 	}
 
-	auto values = FlatVector::GetData<int64_t>(output.data[0]);
+	output.SetChildCardinality(want);
+	auto values = FlatVector::GetDataMutable<int64_t>(output.data[0]);
 	for (idx_t i = 0; i < want; i++) {
 		values[i] = state.emitted + static_cast<int64_t>(i);
 	}
 	state.emitted += static_cast<int64_t>(want);
-	output.SetCardinality(want);
 }
 
 // n6k_testing_sum_table(TABLE) -> (total BIGINT)
@@ -96,7 +96,7 @@ struct SumTableState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> SumTableBindFn(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"total"};
 	return_types = {LogicalType::BIGINT};
 	return make_uniq<SumTableBind>();
@@ -119,19 +119,19 @@ OperatorResultType SumTableInOut(ExecutionContext &context, TableFunctionInput &
 			state.total += value.GetValue<int64_t>();
 		}
 	}
-	output.SetCardinality(0);
+	output.SetChildCardinality(0);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
 OperatorFinalizeResultType SumTableFinal(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<SumTableState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return OperatorFinalizeResultType::FINISHED;
 	}
 	state.done = true;
-	FlatVector::GetData<int64_t>(output.data[0])[0] = state.total;
-	output.SetCardinality(1);
+	FlatVector::GetDataMutable<int64_t>(output.data[0])[0] = state.total;
+	output.SetChildCardinality(1);
 	return OperatorFinalizeResultType::FINISHED;
 }
 
@@ -149,7 +149,7 @@ struct ServedCatalogsState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ServedCatalogsBindFn(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"catalog"};
 	return_types = {LogicalType::VARCHAR};
 
@@ -168,11 +168,11 @@ void ServedCatalogsScan(ClientContext &context, TableFunctionInput &data_p, Data
 
 	idx_t count = 0;
 	while (state.emitted < bind_data.catalogs.size() && count < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, count, Value(bind_data.catalogs[state.emitted]));
+		output.data[0].SetValue(count, Value(bind_data.catalogs[state.emitted]));
 		state.emitted++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace
@@ -180,7 +180,7 @@ void ServedCatalogsScan(ClientContext &context, TableFunctionInput &data_p, Data
 void RegisterN6kTestingFixtures(ExtensionLoader &loader) {
 	TableFunction counter("n6k_testing_stream_counter", {LogicalType::BIGINT}, StreamCounterScan, StreamCounterBindFn,
 	                      StreamCounterInit);
-	counter.varargs = LogicalType::BIGINT;
+	counter.GetSignature().AddArgs("args", LogicalType::BIGINT);
 	loader.RegisterFunction(CreateTableFunctionInfo(std::move(counter)));
 
 	TableFunction sum_table("n6k_testing_sum_table", {LogicalType::TABLE}, nullptr, SumTableBindFn, SumTableInit);
@@ -191,7 +191,7 @@ void RegisterN6kTestingFixtures(ExtensionLoader &loader) {
 	TableFunction served_catalogs("n6k_testing_served_catalogs", {}, ServedCatalogsScan, ServedCatalogsBindFn,
 	                              ServedCatalogsInit);
 	// Same shape as the serve functions: no arguments enumerates, names select.
-	served_catalogs.varargs = LogicalType::VARCHAR;
+	served_catalogs.GetSignature().AddArgs("args", LogicalType::VARCHAR);
 	loader.RegisterFunction(CreateTableFunctionInfo(std::move(served_catalogs)));
 }
 

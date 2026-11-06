@@ -4,10 +4,8 @@ Pytest requires `pytest_addoption` / `pytest_configure` hooks to live at or
 above the rootdir. Our fixtures and most per-test setup live alongside the
 code they exercise (see `src/n6k_server/__tests__/conftest.py`).
 
-Extension resolution is the exception and lives here: `DuckDBHandler` builds
-every statement through the `n6k_testing` extension's `n6k_testing_build_*_sql`
-scalars, so any
-test that touches a handler needs one — including the ones under
+Extension resolution is the exception and lives here: tests across the package
+load extensions, including the ones under
 `src/n6k_server/server_fastapi/__tests__/`. Pinning it package-wide also keeps
 those tests off the network, which a GCS-bucket fallback would not.
 """

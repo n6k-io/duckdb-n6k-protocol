@@ -21,7 +21,7 @@ struct SplitStatementsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> SplitStatementsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("ordinality");
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("statement");
@@ -31,7 +31,7 @@ static unique_ptr<FunctionData> SplitStatementsBind(ClientContext &context, Tabl
 
 	auto sql = input.inputs[0].GetValue<string>();
 
-	Parser parser;
+	Parser parser(context);
 	parser.ParseQuery(sql);
 
 	auto result = make_uniq<SplitStatementsBindData>();
@@ -59,13 +59,13 @@ static void SplitStatementsScan(ClientContext &context, TableFunctionInput &data
 	idx_t count = 0;
 	while (state.offset < bind_data.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = bind_data.rows[state.offset];
-		output.SetValue(0, count, Value::BIGINT(NumericCast<int64_t>(state.offset + 1)));
-		output.SetValue(1, count, Value(row.statement));
-		output.SetValue(2, count, Value(row.type));
+		output.data[0].SetValue(count, Value::BIGINT(NumericCast<int64_t>(state.offset + 1)));
+		output.data[1].SetValue(count, Value(row.statement));
+		output.data[2].SetValue(count, Value(row.type));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 void RegisterN6kSplitStatements(ExtensionLoader &loader) {

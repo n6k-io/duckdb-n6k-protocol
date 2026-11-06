@@ -5,7 +5,10 @@
 #include "n6k_endpoint.hpp"
 #include "n6k_schema_entry.hpp"
 #include "n6k_transaction.hpp"
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
 #include "connection_hub.hpp"
@@ -253,6 +256,7 @@ static unique_ptr<Catalog> N6kStorageAttach(optional_ptr<StorageExtensionInfo> s
 				                  name, render_options());
 			}
 			base_url = (secure ? "https://" : "http://") + host + (port.empty() ? "" : ":" + port) + prefix;
+			// Throws on a malformed URL; the result is unused.
 			n6k::ParseN6kEndpoint(base_url);
 		}
 	}
@@ -277,7 +281,7 @@ static unique_ptr<Catalog> N6kStorageAttach(optional_ptr<StorageExtensionInfo> s
 	std::shared_ptr<CatalogSession> session;
 	try {
 		lease->Hub()->EnsureConnected(should_abort);
-		auto on_detach = [lease, name]() {
+		auto on_detach = [lease, name = name]() {
 			AnnounceCatalog(*lease->Hub(), name, false);
 			lease->Release();
 		};

@@ -137,7 +137,11 @@ WsClient::WsClient(WsClientOptions opts) : opts_(std::move(opts)) {
 }
 
 WsClient::~WsClient() {
-	ShutdownFromOwner("client shutdown");
+	try {
+		ShutdownFromOwner("client shutdown");
+	} catch (const std::exception &e) {
+		LogException(opts_.logger, e);
+	}
 }
 
 void WsClient::RecordOpenAck(OpenAck ack) {

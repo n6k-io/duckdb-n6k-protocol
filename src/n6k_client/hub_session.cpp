@@ -9,7 +9,11 @@ HubSession::HubSession(std::shared_ptr<ConnectionHub> hub, uint64_t ns) : hub_(s
 }
 
 HubSession::~HubSession() {
-	Close();
+	try {
+		Close();
+	} catch (const std::exception &e) {
+		hub_->LogError(e);
+	}
 }
 
 void HubSession::Start(FrameFn on_frame, CloseFn on_close) {

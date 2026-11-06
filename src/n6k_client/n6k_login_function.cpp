@@ -152,7 +152,7 @@ static unique_ptr<FunctionData> RunDeviceLoginAndStoreRefreshSecret(ClientContex
 #endif // !WASM_LOADABLE_EXTENSIONS
 
 static unique_ptr<FunctionData> N6kLoginBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("status");
 	names.emplace_back("detail");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -184,19 +184,21 @@ static void N6kLoginScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	auto &bind_data = data_p.bind_data->Cast<N6kLoginBindData>();
 	auto &state = data_p.global_state->Cast<N6kLoginState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
-	output.SetValue(0, 0, Value(bind_data.status));
-	output.SetValue(1, 0, Value(bind_data.detail));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value(bind_data.status));
+	output.data[1].SetValue(0, Value(bind_data.detail));
+	output.SetChildCardinality(1);
 	state.done = true;
 }
 
 void RegisterN6kLogin(ExtensionLoader &loader) {
 	TableFunction fn("n6k_login", {LogicalType::VARCHAR}, N6kLoginScan, N6kLoginBind, N6kLoginInitGlobal);
-	fn.named_parameters["client_id"] = LogicalType::VARCHAR;
-	fn.named_parameters["resource"] = LogicalType::VARCHAR;
+	fn.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("client_id", LogicalType::VARCHAR);
+		options.Add("resource", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(fn);
 }
 

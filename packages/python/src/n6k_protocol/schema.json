@@ -492,6 +492,9 @@
         "txn": {
           "type": "integer"
         },
+        "exists": {
+          "type": "boolean"
+        },
         "ns": {
           "type": "integer"
         }
@@ -704,6 +707,9 @@
           "items": {
             "type": "string"
           }
+        },
+        "reads_rows": {
+          "type": "boolean"
         },
         "plan": {
           "type": "string"
@@ -943,6 +949,24 @@
         "columns": {
           "type": "array"
         },
+        "primary_key": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unique_keys": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "txn": {
+          "type": "integer"
+        },
         "ns": {
           "type": "integer"
         }
@@ -1056,6 +1080,71 @@
           "const": 1
         },
         "op": {
+          "const": 24
+        },
+        "id": {
+          "type": "integer"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "on_conflict": {
+          "type": "string"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "op",
+        "id",
+        "schema",
+        "on_conflict"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 1
+        },
+        "op": {
+          "const": 23
+        },
+        "id": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "op",
+        "id",
+        "name",
+        "args"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 1
+        },
+        "op": {
           "const": 11
         },
         "id": {
@@ -1072,6 +1161,9 @@
         },
         "details": {
           "type": "object"
+        },
+        "txn": {
+          "type": "integer"
         },
         "ns": {
           "type": "integer"

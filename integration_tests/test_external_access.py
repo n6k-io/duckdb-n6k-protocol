@@ -1,7 +1,4 @@
-"""With `enable_external_access = false`, n6k_client opens no new connections.
-
-uv run pytest integration_tests/test_external_access.py -v
-"""
+"""With `enable_external_access = false`, n6k_client opens no new connections."""
 
 from __future__ import annotations
 

@@ -3,26 +3,31 @@
 #include "n6k_body_builders.hpp"
 #include "n6k_fetch.hpp"
 #include "n6k_frame_source.hpp"
+#include "n6k_wire_type.hpp"
 #include "crossing_substrait.hpp"
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/enum_util.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/operator/logical_expression_get.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 
@@ -33,92 +38,19 @@ namespace duckdb {
 
 namespace {
 
-void ReplaceColumnRefs(unique_ptr<Expression> &expr, const vector<ColumnBinding> &bindings) {
-	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		auto &ref = expr->Cast<BoundColumnRefExpression>();
-		for (idx_t i = 0; i < bindings.size(); i++) {
-			if (bindings[i] == ref.binding) {
-				expr = make_uniq<BoundReferenceExpression>(ref.return_type, i);
-				return;
-			}
-		}
-		throw InternalException("n6k crossing: a feed column is not in scope");
-	}
-	ExpressionIterator::EnumerateChildren(*expr,
-	                                      [&](unique_ptr<Expression> &child) { ReplaceColumnRefs(child, bindings); });
-}
-
-vector<unique_ptr<DataChunk>> EvaluateFeed(ClientContext &context, LogicalOperator &op) {
+vector<unique_ptr<DataChunk>> ChunksOf(const ColumnDataCollection &rows) {
 	vector<unique_ptr<DataChunk>> chunks;
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_CHUNK_GET: {
-		auto rows = SeamRowsOf(op);
-		ColumnDataScanState scan_state;
-		rows->InitializeScan(scan_state);
-		while (true) {
-			auto chunk = make_uniq<DataChunk>();
-			chunk->Initialize(Allocator::DefaultAllocator(), rows->Types());
-			if (!rows->Scan(scan_state, *chunk) || chunk->size() == 0) {
-				break;
-			}
-			chunks.push_back(std::move(chunk));
+	ColumnDataScanState scan_state;
+	rows.InitializeScan(scan_state);
+	while (true) {
+		auto chunk = make_uniq<DataChunk>();
+		chunk->Initialize(Allocator::DefaultAllocator(), rows.Types());
+		if (!rows.Scan(scan_state, *chunk) || chunk->size() == 0) {
+			break;
 		}
-		return chunks;
+		chunks.push_back(std::move(chunk));
 	}
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
-		auto &get = op.Cast<LogicalExpressionGet>();
-		for (idx_t start = 0; start < get.expressions.size(); start += STANDARD_VECTOR_SIZE) {
-			auto end = MinValue<idx_t>(start + STANDARD_VECTOR_SIZE, get.expressions.size());
-			auto chunk = make_uniq<DataChunk>();
-			chunk->Initialize(Allocator::DefaultAllocator(), get.expr_types);
-			for (idx_t row = start; row < end; row++) {
-				auto &exprs = get.expressions[row];
-				for (idx_t col = 0; col < exprs.size(); col++) {
-					auto value = ExpressionExecutor::EvaluateScalar(context, *exprs[col]);
-					chunk->SetValue(col, row - start, value.DefaultCastAs(get.expr_types[col]));
-				}
-			}
-			chunk->SetCardinality(end - start);
-			chunks.push_back(std::move(chunk));
-		}
-		return chunks;
-	}
-	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		auto &proj = op.Cast<LogicalProjection>();
-		auto inputs = EvaluateFeed(context, *op.children[0]);
-		auto bindings = op.children[0]->GetColumnBindings();
-		vector<unique_ptr<Expression>> exprs;
-		vector<LogicalType> types;
-		for (auto &expr : proj.expressions) {
-			auto copy = expr->Copy();
-			ReplaceColumnRefs(copy, bindings);
-			types.push_back(copy->return_type);
-			exprs.push_back(std::move(copy));
-		}
-		ExpressionExecutor executor(context, exprs);
-		for (auto &input : inputs) {
-			auto out = make_uniq<DataChunk>();
-			out->Initialize(Allocator::DefaultAllocator(), types);
-			executor.Execute(*input, *out);
-			chunks.push_back(std::move(out));
-		}
-		return chunks;
-	}
-	default:
-		throw NotImplementedException("n6k crossing: cannot evaluate a %s feed locally", EnumUtil::ToChars(op.type));
-	}
-}
-
-bool ContainsFloor(const LogicalOperator &op) {
-	if (FloorOf(op)) {
-		return true;
-	}
-	for (auto &child : op.children) {
-		if (ContainsFloor(*child)) {
-			return true;
-		}
-	}
-	return false;
+	return chunks;
 }
 
 struct ArmedWaker {
@@ -179,6 +111,7 @@ struct N6kWriteState {
 	~N6kWriteState() {
 		if (req) {
 			req->SetOnFrame({});
+			req->Cancel();
 		}
 	}
 };
@@ -241,7 +174,7 @@ void EmitReadChunk(ClientContext &context, const N6kReadShared &shared, N6kReade
                    idx_t count, const vector<LogicalType> &types) {
 	auto &columns = shared.arrow_table.GetColumns();
 	if (!shared.any_cast) {
-		chunk.SetCardinality(count);
+		chunk.SetChildCardinality(count);
 		ArrowTableFunction::ArrowToDuckDB(reader.scan_state, columns, chunk);
 		chunk.Verify();
 		return;
@@ -251,9 +184,9 @@ void EmitReadChunk(ClientContext &context, const N6kReadShared &shared, N6kReade
 		reader.scratch->Initialize(context, shared.wire_types);
 	}
 	reader.scratch->Reset();
-	reader.scratch->SetCardinality(count);
+	reader.scratch->SetChildCardinality(count);
 	ArrowTableFunction::ArrowToDuckDB(reader.scan_state, columns, *reader.scratch);
-	chunk.SetCardinality(reader.scratch->size());
+	chunk.SetChildCardinality(reader.scratch->size());
 	for (idx_t i = 0; i < types.size(); i++) {
 		if (shared.needs_cast[i]) {
 			VectorOperations::Cast(context, reader.scratch->data[i], chunk.data[i], reader.scratch->size());
@@ -342,7 +275,8 @@ CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const stri
 	CrossingScan scan;
 	scan.partitions = partitions;
 	scan.batch_indexed = true;
-	scan.open = [shared, session, catalog, body, types, partitions](ClientContext &context, idx_t) -> CrossingReader {
+	scan.open = [shared, session, catalog = catalog, body = body, types = types, partitions](ClientContext &context,
+	                                                                                         idx_t) -> CrossingReader {
 		bool started = false;
 		{
 			std::lock_guard<std::mutex> guard(shared->lock);
@@ -365,8 +299,8 @@ CrossingScan OpenScan(const std::shared_ptr<CatalogSession> &session, const stri
 			}
 		}
 		auto reader = std::make_shared<N6kReader>(context);
-		return [shared, reader, catalog, types](ClientContext &ctx, DataChunk &chunk,
-		                                        const CrossingWaker &waker) -> CrossingReadResult {
+		return [shared, reader, catalog = catalog, types = types](ClientContext &ctx, DataChunk &chunk,
+		                                                          const CrossingWaker &waker) -> CrossingReadResult {
 			return PullRead(ctx, *shared, *reader, chunk, waker, types, catalog);
 		};
 	};
@@ -412,6 +346,8 @@ static constexpr LogicalOperatorType CROSSING_OPERATOR_TYPES[] = {
     LogicalOperatorType::LOGICAL_LIMIT,
     LogicalOperatorType::LOGICAL_ORDER_BY,
     LogicalOperatorType::LOGICAL_TOP_N,
+    LogicalOperatorType::LOGICAL_MATERIALIZED_CTE,
+    LogicalOperatorType::LOGICAL_CTE_REF,
 };
 
 static string CrossingOperatorName(LogicalOperatorType type) {
@@ -476,6 +412,11 @@ const void *N6kSource::Group() {
 	return group;
 }
 
+void N6kSource::ForgetListing() {
+	lock_guard<mutex> guard(lock);
+	listed = false;
+}
+
 void N6kSource::ListIfNeeded() {
 	if (listed) {
 		return;
@@ -487,6 +428,8 @@ void N6kSource::ListIfNeeded() {
 		N6kTableInfo info;
 		info.verbs = row.verbs;
 		info.primary_keys = row.primary_keys;
+		info.not_null = row.not_null;
+		info.unique_keys = row.unique_keys;
 		tables[row.schema][row.name] = std::move(info);
 	}
 	for (auto &row : listing.schemas) {
@@ -546,6 +489,50 @@ CrossingTable N6kSource::Describe(const string &schema, const string &name) {
 	return DescribeIn(schema, name, -1);
 }
 
+static optional_idx ColumnPosition(const CrossingTable &table, const string &column) {
+	for (idx_t i = 0; i < table.column_names.size(); i++) {
+		if (StringUtil::CIEquals(table.column_names[i], column)) {
+			return i;
+		}
+	}
+	return optional_idx();
+}
+
+// The listing can predate the description, so a constraint on a column no longer described is skipped.
+static void DeclareUnique(CrossingTable &table, const std::vector<std::string> &columns, bool is_primary_key) {
+	vector<Identifier> names;
+	for (auto &column : columns) {
+		if (!ColumnPosition(table, column).IsValid()) {
+			return;
+		}
+		names.emplace_back(column);
+	}
+	if (!names.empty()) {
+		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(names), is_primary_key));
+	}
+}
+
+static void DeclareConstraints(CrossingTable &table, const N6kTableInfo &info) {
+	set<idx_t> not_null;
+	auto add_not_null = [&](const vector<string> &columns) {
+		for (auto &column : columns) {
+			auto position = ColumnPosition(table, column);
+			if (position.IsValid()) {
+				not_null.insert(position.GetIndex());
+			}
+		}
+	};
+	add_not_null(info.not_null);
+	add_not_null(info.primary_keys);
+	for (auto position : not_null) {
+		table.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(position)));
+	}
+	DeclareUnique(table, info.primary_keys, true);
+	for (auto &unique_key : info.unique_keys) {
+		DeclareUnique(table, unique_key, false);
+	}
+}
+
 CrossingTable N6kSource::DescribeIn(const string &schema, const string &name, int64_t txn) {
 	ArrowArrayStream schema_stream;
 	schema_stream.release = nullptr;
@@ -565,6 +552,12 @@ CrossingTable N6kSource::DescribeIn(const string &schema, const string &name, in
 		Connection conn(db);
 		for (int i = 0; i < arrow_schema.n_children; i++) {
 			auto *child = arrow_schema.children[i];
+			ArrowSchemaMetadata metadata(child->metadata);
+			if (metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == n6k::DUCKDB_TYPE_EXTENSION) {
+				table.Column(child->name, n6k::DeserializeTypeFromBase64(
+				                              metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY)));
+				continue;
+			}
 			auto arrow_type = ArrowType::GetArrowLogicalType(*conn.context, *child);
 			table.Column(child->name, arrow_type->GetDuckType(true));
 		}
@@ -591,12 +584,15 @@ CrossingTable N6kSource::DescribeIn(const string &schema, const string &name, in
 			if (StringUtil::CIEquals(row.schema, schema) && StringUtil::CIEquals(row.name, name)) {
 				info.verbs = row.verbs;
 				info.primary_keys = row.primary_keys;
+				info.not_null = row.not_null;
+				info.unique_keys = row.unique_keys;
 			}
 		}
 	}
 	table.verbs = CrossingVerbsNamed(info.verbs);
 	table.key = info.primary_keys;
 	table.key_unique = !table.key.empty();
+	DeclareConstraints(table, info);
 	return table;
 }
 
@@ -633,6 +629,59 @@ CrossingPlan N6kSource::Plan(const CrossingPlanRequest &request) {
 	    MakeFloorNode(0, request.schema, request.table, columns.names, columns.types, floor_catalog));
 }
 
+static bool NamedCallOf(const Expression &expr, string &name, vector<string> &args) {
+	auto add_args = [&](const vector<unique_ptr<Expression>> &children) {
+		for (auto &child : children) {
+			args.push_back(child->GetReturnType().ToString());
+		}
+	};
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &call = expr.Cast<BoundFunctionExpression>();
+		name = call.Function().GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	case ExpressionClass::BOUND_AGGREGATE: {
+		auto &call = expr.Cast<BoundAggregateExpression>();
+		name = call.Function().GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	case ExpressionClass::BOUND_WINDOW: {
+		auto &call = expr.Cast<BoundWindowExpression>();
+		if (!call.AggregateFunction()) {
+			return false;
+		}
+		name = call.AggregateFunction()->GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+bool N6kSource::ServerHasFunction(const string &name, const vector<string> &args) {
+	auto signature = name + "(" + StringUtil::Join(args, ", ") + ")";
+	{
+		lock_guard<mutex> guard(server_functions_lock);
+		auto known = server_functions.find(signature);
+		if (known != server_functions.end()) {
+			return known->second;
+		}
+	}
+	auto exists = session->HasFunction(name, args);
+	lock_guard<mutex> guard(server_functions_lock);
+	server_functions[signature] = exists;
+	return exists;
+}
+
+void N6kSource::ForgetServerFunctions() {
+	lock_guard<mutex> guard(server_functions_lock);
+	server_functions.clear();
+}
+
 CrossingVerdict N6kSource::AcceptsCall(const Expression &expr) {
 	if (!session->HasCapability(n6k::CAP_CROSSING)) {
 		return CrossingVerdict::No("the server does not accept plans");
@@ -640,6 +689,17 @@ CrossingVerdict N6kSource::AcceptsCall(const Expression &expr) {
 	std::string reason;
 	if (!SubstraitCanRenderCall(expr, reason)) {
 		return CrossingVerdict::No(reason);
+	}
+	string name;
+	vector<string> args;
+	if (!NamedCallOf(expr, name, args)) {
+		return CrossingVerdict::Yes();
+	}
+	if (!session->HasCapability(n6k::CAP_HAS_FUNCTION)) {
+		return CrossingVerdict::No("the server cannot say which functions it has");
+	}
+	if (!ServerHasFunction(name, args)) {
+		return CrossingVerdict::No("the server has no function " + name + "(" + StringUtil::Join(args, ", ") + ")");
 	}
 	return CrossingVerdict::Yes();
 }
@@ -699,6 +759,12 @@ int64_t N6kSession::Txn() {
 	return txn;
 }
 
+void N6kSession::RequireTableDdl(const char *what) {
+	if (!session->HasCapability(n6k::CAP_TABLE_DDL)) {
+		throw BinderException("n6k[%s]: the server does not support %s", catalog_name, what);
+	}
+}
+
 vector<string> N6kSession::Tables(const string &schema) {
 	return source.TablesIn(schema, Txn());
 }
@@ -721,22 +787,159 @@ static const char *OnConflictName(OnCreateConflict on_conflict) {
 	}
 }
 
-// Only views reach here: n6k's schema entry sends tables over its own ops.
+static vector<string> UniqueConstraintColumns(const ColumnList &columns, const UniqueConstraint &unique) {
+	vector<string> names;
+	if (unique.HasIndex()) {
+		names.push_back(columns.GetColumn(unique.GetIndex()).Name().GetIdentifierName());
+		return names;
+	}
+	for (auto &column : unique.GetColumnNames()) {
+		names.push_back(column.GetIdentifierName());
+	}
+	return names;
+}
+
+struct N6kTableDefinition {
+	string columns_json;
+	vector<string> primary_key;
+	std::vector<std::vector<std::string>> unique_keys;
+	bool constrained = false;
+};
+
+static N6kTableDefinition TableDefinitionOf(const CreateTableInfo &create) {
+	N6kTableDefinition definition;
+	set<idx_t> not_null;
+	for (auto &constraint : create.constraints) {
+		if (constraint->type == ConstraintType::NOT_NULL) {
+			not_null.insert(constraint->Cast<NotNullConstraint>().index.index);
+		} else if (constraint->type == ConstraintType::UNIQUE) {
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (unique.IsPrimaryKey()) {
+				definition.primary_key = UniqueConstraintColumns(create.columns, unique);
+			} else {
+				definition.unique_keys.push_back(UniqueConstraintColumns(create.columns, unique));
+			}
+		} else {
+			throw BinderException("n6k: CREATE TABLE with the constraint '%s' is not supported on an attached database",
+			                      constraint->ToString());
+		}
+	}
+	definition.constrained = !create.constraints.empty();
+
+	auto *doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
+	auto *columns = duckdb_yyjson::yyjson_mut_arr(doc);
+	duckdb_yyjson::yyjson_mut_doc_set_root(doc, columns);
+	for (auto &column : create.columns.Logical()) {
+		const auto &column_name = column.Name().GetIdentifierName();
+		if (column.Generated() || column.HasDefaultValue()) {
+			duckdb_yyjson::yyjson_mut_doc_free(doc);
+			throw BinderException(
+			    "n6k: CREATE TABLE with a default or generated column '%s' is not supported on an attached database",
+			    column_name);
+		}
+		auto type = column.Type().ToString();
+		auto *entry = duckdb_yyjson::yyjson_mut_obj(doc);
+		duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, entry, "name", column_name.c_str(), column_name.size());
+		duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, entry, "type", type.c_str(), type.size());
+		if (not_null.count(column.Logical().index) != 0) {
+			duckdb_yyjson::yyjson_mut_obj_add_bool(doc, entry, "not_null", true);
+		}
+		duckdb_yyjson::yyjson_mut_arr_append(columns, entry);
+	}
+	definition.columns_json = n6k::SerializeJsonDocAndFree(doc);
+	return definition;
+}
+
+static string AlterBodyOf(const CrossingDdl &ddl, int64_t txn) {
+	if (ddl.alter->type != AlterType::ALTER_TABLE) {
+		throw BinderException("Only ALTER TABLE is supported on n6k attached databases");
+	}
+	auto &alter = ddl.alter->Cast<AlterTableInfo>();
+	string kind;
+	string first_key;
+	string first_value;
+	string second_key;
+	string second_value;
+	switch (alter.alter_table_type) {
+	case AlterTableType::ADD_COLUMN: {
+		auto &add = alter.Cast<AddColumnInfo>();
+		if (add.new_column.HasDefaultValue()) {
+			throw BinderException("ALTER TABLE ADD COLUMN with a default is not supported on n6k attached databases");
+		}
+		kind = "add_column";
+		first_key = "name";
+		first_value = add.new_column.Name().GetIdentifierName();
+		second_key = "type";
+		second_value = add.new_column.Type().ToString();
+		break;
+	}
+	case AlterTableType::REMOVE_COLUMN:
+		kind = "drop_column";
+		first_key = "name";
+		first_value = alter.Cast<RemoveColumnInfo>().removed_column.GetIdentifierName();
+		break;
+	case AlterTableType::RENAME_COLUMN: {
+		auto &rename = alter.Cast<RenameColumnInfo>();
+		kind = "rename_column";
+		first_key = "old_name";
+		first_value = rename.old_name.GetIdentifierName();
+		second_key = "new_name";
+		second_value = rename.new_name.GetIdentifierName();
+		break;
+	}
+	default:
+		throw BinderException(
+		    "ALTER TABLE %s is not supported on n6k attached databases (only ADD COLUMN, DROP COLUMN, RENAME COLUMN)",
+		    alter.ToString());
+	}
+	auto *doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
+	auto *details = duckdb_yyjson::yyjson_mut_obj(doc);
+	duckdb_yyjson::yyjson_mut_doc_set_root(doc, details);
+	duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, details, first_key.c_str(), first_value.c_str(), first_value.size());
+	if (!second_key.empty()) {
+		duckdb_yyjson::yyjson_mut_obj_add_strncpy(doc, details, second_key.c_str(), second_value.c_str(),
+		                                          second_value.size());
+	}
+	return n6k_body::AlterTable(ddl.schema, ddl.table, kind, n6k::SerializeJsonDocAndFree(doc), txn);
+}
+
 void N6kSession::Ddl(ClientContext &context, const CrossingDdl &ddl) {
 	StreamCancelCheck cancel = [&context]() {
 		return context.IsInterrupted();
 	};
+	if (ddl.verb == CrossingVerb::CREATE && !ddl.plan) {
+		auto definition = TableDefinitionOf(ddl.create->Cast<CreateTableInfo>());
+		if (definition.constrained) {
+			RequireTableDdl("CREATE TABLE with constraints");
+		}
+		if (!autocommit) {
+			RequireTableDdl("CREATE TABLE in a transaction");
+		}
+		session->RunOp(n6k::OP_CREATE_TABLE,
+		               n6k_body::CreateTable(ddl.schema, ddl.table, definition.columns_json, definition.primary_key,
+		                                     definition.unique_keys, Txn()),
+		               cancel);
+		return;
+	}
+	if (ddl.verb == CrossingVerb::ALTER) {
+		if (!autocommit) {
+			RequireTableDdl("ALTER TABLE in a transaction");
+		}
+		session->RunOp(n6k::OP_ALTER_TABLE, AlterBodyOf(ddl, Txn()), cancel);
+		return;
+	}
 	if (ddl.verb == CrossingVerb::CREATE && ddl.plan) {
 		auto &view = ddl.create->Cast<CreateViewInfo>();
 		session->RunOp(n6k::OP_CREATE_VIEW,
-		               n6k_body::CreateView(ddl.schema, view.view_name, OnConflictName(view.on_conflict),
-		                                    CrossingViewColumnNames(view), RenderCrossingPlan(*ddl.plan), Txn()),
+		               n6k_body::CreateView(ddl.schema, view.GetViewName().GetIdentifierName(),
+		                                    OnConflictName(view.on_conflict), CrossingViewColumnNames(view),
+		                                    RenderCrossingPlan(*ddl.plan), Txn()),
 		               cancel);
 		return;
 	}
 	if (ddl.verb == CrossingVerb::DROP && ddl.drop->type == CatalogType::VIEW_ENTRY) {
 		session->RunOp(n6k::OP_DROP_VIEW,
-		               n6k_body::DropView(ddl.schema, ddl.drop->name,
+		               n6k_body::DropView(ddl.schema, ddl.drop->GetQualifiedName().Name().GetIdentifierName(),
 		                                  ddl.drop->if_not_found == OnEntryNotFound::RETURN_NULL, Txn()),
 		               cancel);
 		return;
@@ -777,12 +980,11 @@ CrossingWriter N6kSession::Write(ClientContext &context, const CrossingQuery &qu
 	auto &use = query.written;
 	std::string plan_json;
 	std::string arrow;
-	if (ContainsFloor(query.plan)) {
-		plan_json = RenderCrossingPlan(query.plan);
-	} else {
-		auto chunks = EvaluateFeed(
-		    context, const_cast<LogicalOperator &>(query.plan)); // NOLINT(cppcoreguidelines-pro-type-const-cast)
-		vector<LogicalType> types = chunks.empty() ? query.plan.types : chunks[0]->GetTypes();
+	if (query.types.empty()) {
+		// A delete that reads nothing: its plan is a placeholder.
+	} else if (auto rows = SeamRowsOf(query.plan)) {
+		auto &types = rows->Types();
+		auto chunks = ChunksOf(*rows);
 		vector<string> names;
 		for (idx_t i = 0; i < types.size(); i++) {
 			names.push_back("c" + std::to_string(i));
@@ -792,9 +994,11 @@ CrossingWriter N6kSession::Write(ClientContext &context, const CrossingQuery &qu
 		SerializeChunksToArrowIPC(context, types, names, chunks, &ipc_buf);
 		arrow.assign(reinterpret_cast<const char *>(ipc_buf.data), static_cast<size_t>(ipc_buf.size_bytes));
 		ArrowBufferReset(&ipc_buf);
+	} else {
+		plan_json = RenderCrossingPlan(query.plan);
 	}
 	auto body = n6k_body::WritePlan(CrossingVerbName(query.kind), use.schema, use.table, query.key_columns,
-	                                query.set_columns, plan_json, Txn());
+	                                query.set_columns, query.reads_rows, plan_json, Txn());
 	body.push_back('\n');
 	body.append(arrow);
 

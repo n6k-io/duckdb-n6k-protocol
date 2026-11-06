@@ -8,28 +8,39 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 namespace duckdb {
 
-// A PK is a UNIQUE+IsPrimaryKey constraint; single-column is stored as an index, multi-column by name.
-static vector<string> NativeTablePrimaryKey(TableCatalogEntry &table) {
-	for (auto &constraint : table.GetConstraints()) {
-		if (constraint->type != ConstraintType::UNIQUE) {
-			continue;
-		}
-		auto &unique = constraint->Cast<UniqueConstraint>();
-		if (!unique.IsPrimaryKey()) {
-			continue;
-		}
-		if (unique.HasIndex()) {
-			return {table.GetColumn(unique.GetIndex()).GetName()};
-		}
-		return unique.GetColumnNames();
+// A UNIQUE constraint on a single column is stored as an index, on several by name.
+static vector<string> UniqueConstraintColumns(TableCatalogEntry &table, const UniqueConstraint &unique) {
+	if (unique.HasIndex()) {
+		return {table.GetColumn(unique.GetIndex()).GetName().GetIdentifierName()};
 	}
-	return {};
+	vector<string> column_names;
+	for (auto &column_name : unique.GetColumnNames()) {
+		column_names.push_back(column_name.GetIdentifierName());
+	}
+	return column_names;
+}
+
+static void AddNativeTableConstraints(TableCatalogEntry &table, TablePermissionRow &row) {
+	for (auto &constraint : table.GetConstraints()) {
+		if (constraint->type == ConstraintType::NOT_NULL) {
+			auto &not_null = constraint->Cast<NotNullConstraint>();
+			row.not_null.push_back(table.GetColumn(not_null.index).GetName().GetIdentifierName());
+		} else if (constraint->type == ConstraintType::UNIQUE) {
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (unique.IsPrimaryKey()) {
+				row.primary_key = UniqueConstraintColumns(table, unique);
+			} else {
+				row.unique_keys.push_back(UniqueConstraintColumns(table, unique));
+			}
+		}
+	}
 }
 
 static vector<string> NativeTableVerbs() {
@@ -42,7 +53,7 @@ static vector<string> NativeViewVerbs() {
 
 static void CollectNativeSchemaPermissions(ClientContext &context, SchemaCatalogEntry &schema,
                                            optional_ptr<const string> table_filter, vector<TablePermissionRow> &out) {
-	const auto &schema_name = schema.name;
+	const auto &schema_name = schema.name.GetIdentifierName();
 	case_insensitive_set_t seen;
 	const auto matches = [&](const string &n) {
 		return !table_filter || StringUtil::CIEquals(n, *table_filter);
@@ -50,16 +61,18 @@ static void CollectNativeSchemaPermissions(ClientContext &context, SchemaCatalog
 	// Tables and views share one catalog set, so classify on actual type and dedup via `seen`.
 	auto scan_type = [&](CatalogType type) {
 		schema.Scan(context, type, [&](CatalogEntry &e) {
-			if (!matches(e.name) || seen.count(e.name)) {
+			auto &entry_name = e.name.GetIdentifierName();
+			if (!matches(entry_name) || seen.count(entry_name)) {
 				return;
 			}
 			if (e.type == CatalogType::VIEW_ENTRY) {
-				seen.insert(e.name);
-				out.push_back({schema_name, e.name, "native_view", NativeViewVerbs(), {}});
+				seen.insert(entry_name);
+				out.push_back({schema_name, entry_name, "native_view", NativeViewVerbs(), {}, {}, {}});
 			} else if (e.type == CatalogType::TABLE_ENTRY) {
-				seen.insert(e.name);
-				out.push_back({schema_name, e.name, "native_table", NativeTableVerbs(),
-				               NativeTablePrimaryKey(e.Cast<TableCatalogEntry>())});
+				seen.insert(entry_name);
+				TablePermissionRow row {schema_name, entry_name, "native_table", NativeTableVerbs(), {}, {}, {}};
+				AddNativeTableConstraints(e.Cast<TableCatalogEntry>(), row);
+				out.push_back(std::move(row));
 			}
 		});
 	};
@@ -74,7 +87,7 @@ static void CollectCatalogPermissionsHonoringReadOnlyAttach(ClientContext &conte
 	// Two-pass: gather schema refs under the catalog's schema lock, then scan each after it releases.
 	vector<reference<SchemaCatalogEntry>> schemas;
 	catalog.ScanSchemas(context, [&](SchemaCatalogEntry &s) {
-		if (schema_filter && !StringUtil::CIEquals(s.name, *schema_filter)) {
+		if (schema_filter && !StringUtil::CIEquals(s.name.GetIdentifierName(), *schema_filter)) {
 			return;
 		}
 		schemas.push_back(s);
@@ -110,7 +123,7 @@ PermissionsArgs ParsePermissionsArgs(TableFunctionBindInput &input) {
 	return args;
 }
 
-static void SetTablePermissionsReturnSchema(vector<LogicalType> &return_types, vector<string> &names) {
+static void SetTablePermissionsReturnSchema(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"schema", "name", "kind", "verbs", "primary_key"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
@@ -141,15 +154,15 @@ static void TablePermissionsScan(ClientContext &context, TableFunctionInput &dat
 	idx_t count = 0;
 	while (state.offset < bind_data.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = bind_data.rows[state.offset];
-		output.SetValue(0, count, Value(row.schema));
-		output.SetValue(1, count, Value(row.name));
-		output.SetValue(2, count, Value(row.kind));
-		output.SetValue(3, count, VarcharList(row.verbs));
-		output.SetValue(4, count, VarcharList(row.primary_key));
+		output.data[0].SetValue(count, Value(row.schema));
+		output.data[1].SetValue(count, Value(row.name));
+		output.data[2].SetValue(count, Value(row.kind));
+		output.data[3].SetValue(count, VarcharList(row.verbs));
+		output.data[4].SetValue(count, VarcharList(row.primary_key));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 namespace {
@@ -213,12 +226,12 @@ static void CollectVirtualCatalogPermissions(ClientContext &context, Catalog &ca
                                              optional_ptr<const string> schema_filter,
                                              optional_ptr<const string> table_filter, vector<TablePermissionRow> &out) {
 	string sql = "SELECT schema, name, kind, primary_key, verbs FROM " + string(function) + "(" +
-	             KeywordHelper::WriteQuoted(catalog.GetName(), '\'');
+	             StringUtil::Format("%s", SQLString(catalog.GetName().GetIdentifierName()));
 	if (schema_filter) {
-		sql += ", schema := " + KeywordHelper::WriteQuoted(*schema_filter, '\'');
+		sql += StringUtil::Format(", schema := %s", SQLString(*schema_filter));
 	}
 	if (table_filter) {
-		sql += ", \"table\" := " + KeywordHelper::WriteQuoted(*table_filter, '\'');
+		sql += StringUtil::Format(", \"table\" := %s", SQLString(*table_filter));
 	}
 	sql += ") ORDER BY schema, name";
 
@@ -274,11 +287,15 @@ void CollectCatalogPermissions(ClientContext &context, Catalog &catalog, optiona
 	CollectCatalogPermissionsHonoringReadOnlyAttach(context, catalog, schema_filter, table_filter, out);
 }
 
-void CollectSchemaPermissions(ClientContext &context, Catalog &catalog, optional_ptr<const string> schema_filter,
-                              vector<SchemaPermissionRow> &out) {
+bool CatalogGrantsCreate(ClientContext &context, Catalog &catalog) {
 	const bool plain = !LookupPermissionCollector(context, catalog.GetCatalogType()) &&
 	                   !VirtualCatalogPermissionsFunction(catalog.GetCatalogType());
-	const bool creates = plain && !catalog.GetAttached().IsReadOnly();
+	return plain && !catalog.GetAttached().IsReadOnly();
+}
+
+void CollectSchemaPermissions(ClientContext &context, Catalog &catalog, optional_ptr<const string> schema_filter,
+                              vector<SchemaPermissionRow> &out) {
+	const bool creates = CatalogGrantsCreate(context, catalog);
 	vector<string> names;
 	ListCatalogSchemas(context, catalog, names);
 	for (auto &name : names) {
@@ -290,11 +307,11 @@ void CollectSchemaPermissions(ClientContext &context, Catalog &catalog, optional
 }
 
 static unique_ptr<FunctionData> TablePermissionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	SetTablePermissionsReturnSchema(return_types, names);
 
 	auto args = ParsePermissionsArgs(input);
-	auto &catalog = Catalog::GetCatalog(context, args.catalog);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(args.catalog));
 	auto result = make_uniq<TablePermissionsBindData>();
 	optional_ptr<const string> table_arg = args.has_table ? optional_ptr<const string>(&args.table) : nullptr;
 	optional_ptr<const string> schema_arg = args.has_schema ? optional_ptr<const string>(&args.schema) : nullptr;
@@ -305,8 +322,10 @@ static unique_ptr<FunctionData> TablePermissionsBind(ClientContext &context, Tab
 void RegisterTablePermissionsFunction(ExtensionLoader &loader) {
 	TableFunction func("n6k_table_permissions", {LogicalType::VARCHAR}, TablePermissionsScan, TablePermissionsBind,
 	                   TablePermissionsInitGlobal);
-	func.named_parameters["schema"] = LogicalType::VARCHAR;
-	func.named_parameters["table"] = LogicalType::VARCHAR;
+	func.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("schema", LogicalType::VARCHAR);
+		options.Add("table", LogicalType::VARCHAR);
+	});
 	CreateTableFunctionInfo info(std::move(func));
 	info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 	loader.RegisterFunction(std::move(info));

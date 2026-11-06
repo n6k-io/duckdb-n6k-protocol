@@ -18,8 +18,8 @@ describeCoi(
       await h?.cleanup();
     });
 
-    test("CONCURRENT send() ON ONE CONNECTION silently splits one query's rows", async () => {
-      const { counts, total } = await h.page.evaluate(async (cat: string) => {
+    test("CONCURRENT send() ON ONE CONNECTION fails", async () => {
+      const errors = await h.page.evaluate(async (cat: string) => {
         const t = globalThis.__n6kTest!;
         type SConn = {
           query(sql: string): Promise<unknown>;
@@ -38,13 +38,18 @@ describeCoi(
           for await (const b of r) n += b.numRows ?? 0;
           return n;
         };
-        const counts = await Promise.all([0, 1, 2].map(() => rowCount()));
-        await shared.close();
-        return { counts, total: counts.reduce((a, b) => a + b, 0) };
+        const settled = await Promise.allSettled(
+          [0, 1, 2].map(() => rowCount()),
+        );
+        await shared.close().catch(() => {});
+        return settled.flatMap((s) =>
+          s.status === "rejected" ? [String(s.reason)] : [],
+        );
       }, catalog);
-      console.log(`[lease] shared connection  -> ${JSON.stringify(counts)}`);
-      expect(counts.every((n) => n < 6)).toBe(true);
-      expect(total).toBeLessThan(18);
+      expect(errors.length).toBeGreaterThan(0);
+      for (const error of errors) {
+        expect(error).toContain("no active pending query");
+      }
     }, 30_000);
 
     test("CONCURRENT send() ON ITS OWN CONNECTION delivers every row", async () => {

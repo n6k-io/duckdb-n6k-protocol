@@ -1,6 +1,6 @@
 [project]
 name = "n6k-duckdb"
-version = "0.12.3"
+version = "0.13.0"
 description = "n6k protocol definitions and the Python host for the n6k_server DuckDB extension"
 readme = "README.md"
 authors = [
@@ -16,13 +16,13 @@ requires-python = ">=3.9"
 dependencies = ["pyarrow", "numpy", "msgpack", "jsonschema", "typing_extensions"]
 
 [project.optional-dependencies]
-duckdb = ["duckdb>=1.5.6"]
+duckdb = ["duckdb>=2.0.0"]
 fastapi = ["fastapi>=0.100", "starlette"]
 mcp = ["mcp>=2.3,<3; python_version >= '3.10'"]
 # watchfiles is not optional for the reload path: without it uvicorn falls back to
 # StatReload, which hardcodes rglob("*.py") and ignores reload_includes entirely —
 # so a rebuilt .duckdb_extension would never trigger a restart.
-test-server = ["fastapi>=0.100", "uvicorn>=0.27", "watchfiles>=0.21", "python-dotenv>=1", "duckdb>=1.5.6", "duckdb-virtual-catalog>=0.1.1"]
+test-server = ["fastapi>=0.100", "uvicorn>=0.27", "watchfiles>=0.21", "python-dotenv>=1", "duckdb>=2.0.0", "duckdb-virtual-catalog>=0.1.3"]
 
 [project.scripts]
 n6k-docs = "n6k_protocol.scripts.docgen:main"
@@ -41,8 +41,8 @@ dev = [
     "websockets>=12",
     "httpx>=0.27",  # for fastapi.TestClient in framework unit tests
     "fastapi>=0.100",  # framework/adapter unit tests
-    "duckdb>=1.5.6",  # duckdb-backed tests (duckdb is no longer a core dep)
-    "duckdb-virtual-catalog>=0.1.1",
+    "duckdb>=2.0.0",  # duckdb-backed tests
+    "duckdb-virtual-catalog>=0.1.3",
     "pandas>=2",  # Categorical round-trip tests
     "black>=24",
     "flake8>=7",

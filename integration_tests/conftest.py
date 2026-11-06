@@ -4,7 +4,7 @@ These tests run against the already-running test server on :8099 (`uv run
 test-server`), which exposes every auth mode by URL prefix — open at the root,
 static-token under `/auth`, and OAuth-JWT under `/oauth`, with the OAuth AS
 mounted on the same server. Tests pick a mode by attaching to
-`n6k://localhost:8099/<mode>`; none of them spawn their own server.
+`n6k://localhost:8099/<mode>`. A few files start their own server instead.
 """
 
 import duckdb

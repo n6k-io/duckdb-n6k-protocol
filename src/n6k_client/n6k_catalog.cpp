@@ -1,9 +1,12 @@
+#include "n6k_body_builders.hpp"
 #include "n6k_catalog.hpp"
 #include "n6k_protocol_generated.hpp"
 #include "n6k_schema_entry.hpp"
-#include "n6k_insert.hpp"
+#include "n6k_source.hpp"
 #include "ws_json.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -23,7 +26,8 @@ namespace duckdb {
 
 N6kCatalog::N6kCatalog(AttachedDatabase &db, string base_url_p, std::shared_ptr<CatalogSession> session_p)
     : Catalog(db), base_url(std::move(base_url_p)), session(std::move(session_p)),
-      attach(db, Crossing<N6kSource>::Adapt(make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName()))) {
+      attach(db, Crossing<N6kSource>::Adapt(
+                     make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName().GetIdentifierName()))) {
 	session->SetPushHandler([this](uint8_t op, const std::string &body) {
 		if (op == n6k::OP_CATALOG_INVALIDATED) {
 			HandlePushInvalidate(body);
@@ -60,12 +64,13 @@ void N6kCatalog::HandlePushInvalidate(const std::string &body) {
 	for (auto &name : schema_names) {
 		joined += (joined.empty() ? "" : ",") + name;
 	}
-	n6k::RunScriptOnMainAsync("n6k.invalidated('" + n6k::EscapeSingleQuotedJsLiteral(GetName()) + "', '" +
-	                          n6k::EscapeSingleQuotedJsLiteral(joined) + "')");
+	n6k::RunScriptOnMainAsync("n6k.invalidated('" + n6k::EscapeSingleQuotedJsLiteral(GetName().GetIdentifierName()) +
+	                          "', '" + n6k::EscapeSingleQuotedJsLiteral(joined) + "')");
 #endif
 }
 
 void N6kCatalog::InvalidateSchemas(const std::vector<std::string> &schema_names) {
+	Source().ForgetServerFunctions();
 	for (auto &name : schema_names) {
 		attach.Refresh(name);
 	}
@@ -86,7 +91,7 @@ N6kSchemaEntry &N6kCatalog::GetOrCreateSchema(CatalogTransaction transaction, co
 	}
 
 	CreateSchemaInfo info;
-	info.schema = schema_name;
+	info.SetQualifiedName(QualifiedName(GetName(), Identifier(schema_name), Identifier()));
 	auto schema_entry = make_uniq<N6kSchemaEntry>(*this, info, session);
 	auto &result = *schema_entry;
 	schemas[schema_name] = std::move(schema_entry);
@@ -108,18 +113,37 @@ void N6kCatalog::LoadSchemasOnce() {
 }
 
 optional_ptr<CatalogEntry> N6kCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	lock_guard<mutex> lock(schemas_lock);
-	auto it = schemas.find(info.schema);
-	if (it != schemas.end()) {
-		if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-			return it->second.get();
-		}
-		throw CatalogException("Schema '%s' already exists", info.schema);
+	const string catalog_name = GetName().GetIdentifierName();
+	if (!transaction.HasContext()) {
+		throw BinderException("n6k[%s]: CREATE SCHEMA needs a client context", catalog_name);
 	}
-	auto schema_entry = make_uniq<N6kSchemaEntry>(*this, info, session);
-	auto result = schema_entry.get();
-	schemas[info.schema] = std::move(schema_entry);
-	return result;
+	auto &context = transaction.GetContext();
+	if (info.IsNested()) {
+		throw BinderException("n6k[%s]: nested schemas are not supported", catalog_name);
+	}
+	string on_conflict;
+	switch (info.on_conflict) {
+	case OnCreateConflict::ERROR_ON_CONFLICT:
+		on_conflict = "error";
+		break;
+	case OnCreateConflict::IGNORE_ON_CONFLICT:
+		on_conflict = "ignore";
+		break;
+	default:
+		throw BinderException("n6k[%s]: CREATE OR REPLACE SCHEMA is not supported", catalog_name);
+	}
+	if (!context.transaction.IsAutoCommit()) {
+		throw BinderException("n6k[%s]: CREATE SCHEMA is not supported in a transaction", catalog_name);
+	}
+	if (!session->HasCapability(n6k::CAP_SCHEMA_DDL)) {
+		throw BinderException("n6k[%s]: the server does not support CREATE SCHEMA", catalog_name);
+	}
+	const string schema_name = info.SchemaName().GetIdentifierName();
+	session->RunOp(n6k::OP_CREATE_SCHEMA, n6k_body::CreateSchema(schema_name, on_conflict),
+	               [&context]() { return context.IsInterrupted(); });
+	attach.Refresh();
+	Source().ForgetListing();
+	return &GetOrCreateSchema(transaction, schema_name);
 }
 
 optional_ptr<SchemaCatalogEntry> N6kCatalog::LookupSchema(CatalogTransaction transaction,
@@ -154,11 +178,7 @@ void N6kCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 
 PhysicalOperator &N6kCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                 LogicalCreateTable &op, PhysicalOperator &plan) {
-	auto &schema = op.schema.Cast<N6kSchemaEntry>();
-	auto &insert = planner.Make<N6kInsert>(schema, std::move(op.info), vector<LogicalType> {LogicalType::BIGINT},
-	                                       op.estimated_cardinality);
-	insert.children.push_back(plan);
-	return insert;
+	return Attach().PlanCreateTableAs(context, planner, op, plan);
 }
 
 PhysicalOperator &N6kCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,

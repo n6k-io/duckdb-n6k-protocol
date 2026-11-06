@@ -63,7 +63,7 @@ unique_ptr<GlobalTableFunctionState> ExceptionTypesInitGlobal(ClientContext &, T
 }
 
 unique_ptr<FunctionData> ExceptionTypesBind(ClientContext &, TableFunctionBindInput &,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"exception_type", "duckdb_name", "message_prefix", "retriable"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
 	return make_uniq<ExceptionTypesBindData>();
@@ -76,14 +76,14 @@ void ExceptionTypesScan(ClientContext &, TableFunctionInput &data_p, DataChunk &
 	idx_t count = 0;
 	while (state.offset < total && count < STANDARD_VECTOR_SIZE) {
 		auto &entry = WIRE_EXCEPTION_MAP[state.offset];
-		output.SetValue(0, count, Value(entry.wire_name));
-		output.SetValue(1, count, Value(Exception::ExceptionTypeToString(entry.type)));
-		output.SetValue(2, count, Value(MessagePrefix(entry.type)));
-		output.SetValue(3, count, Value::BOOLEAN(IsRetriableExceptionType(entry.type)));
+		output.data[0].SetValue(count, Value(entry.wire_name));
+		output.data[1].SetValue(count, Value(Exception::ExceptionTypeToString(entry.type)));
+		output.data[2].SetValue(count, Value(MessagePrefix(entry.type)));
+		output.data[3].SetValue(count, Value::BOOLEAN(IsRetriableExceptionType(entry.type)));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

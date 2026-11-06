@@ -184,7 +184,11 @@ export function createN6kWorker({
   // Private channel for n6k control frames; keeps them off duckdb-wasm's RPC postMessage binding.
   const n6kChannel = new MessageChannel();
 
-  const worker = new Worker(duckdbWorkerUrl, { type: "classic" });
+  // Emscripten spawns pthreads from this worker's own URL; the hash tells them which duckdb bundle to run
+  // (loaded in duckdb-worker.ts).
+  const workerUrl = new URL(duckdbWorkerUrl, globalThis.location?.href);
+  workerUrl.hash = encodeURIComponent(mainWorkerUrl);
+  const worker = new Worker(workerUrl, { type: "classic" });
   trackWorker(worker, `#${instanceId} duckdb-worker`);
   worker.addEventListener("error", function (e) {
     log.error("duckdb-worker error:", e.message || e);

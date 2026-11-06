@@ -12,7 +12,7 @@
 
 namespace duckdb {
 
-struct N6kStreamData {
+struct N6kStreamData : public ArrowScanFactory {
 	ArrowArrayStream stream;
 	bool consumed;
 
@@ -20,38 +20,40 @@ struct N6kStreamData {
 		stream.release = nullptr;
 	}
 
-	~N6kStreamData() {
+	~N6kStreamData() override {
 		if (stream.release) {
 			stream.release(&stream);
 		}
 	}
+
+	void GetSchema(ArrowSchema &schema) override {
+		if (!stream.release || stream.get_schema(&stream, &schema) != 0) {
+			throw IOException("n6k: failed to read result schema");
+		}
+	}
+
+	unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &parameters) override {
+		auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
+		if (consumed) {
+			wrapper->arrow_array_stream.release = nullptr;
+			return wrapper;
+		}
+
+		wrapper->arrow_array_stream = stream;
+		stream.release = nullptr;
+		consumed = true;
+		return wrapper;
+	}
 };
 
 struct N6kScanFunctionData : public ArrowScanFunctionData {
-	unique_ptr<N6kStreamData> owned_stream_data;
+	shared_ptr<N6kStreamData> owned_stream_data;
 
-	N6kScanFunctionData(stream_factory_produce_t producer, unique_ptr<N6kStreamData> stream_data)
-	    : ArrowScanFunctionData(producer, reinterpret_cast<uintptr_t>(stream_data.get())),
-	      owned_stream_data(std::move(stream_data)) {
+	explicit N6kScanFunctionData(shared_ptr<N6kStreamData> stream_data)
+	    : ArrowScanFunctionData(stream_data), owned_stream_data(std::move(stream_data)) {
 		// Full materialization at bind can't honor projected column_ids; disable pushdown (must match table fns).
 		projection_pushdown_enabled = false;
 	}
 };
-
-static unique_ptr<ArrowArrayStreamWrapper> N6kProduceStream(uintptr_t factory_ptr, ArrowStreamParameters &parameters) {
-	auto *stream_data = reinterpret_cast<N6kStreamData *>(factory_ptr);
-
-	auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
-	if (stream_data->consumed) {
-		wrapper->arrow_array_stream.release = nullptr;
-		return wrapper;
-	}
-
-	wrapper->arrow_array_stream = stream_data->stream;
-	stream_data->stream.release = nullptr;
-	stream_data->consumed = true;
-	wrapper->number_of_rows = -1;
-	return wrapper;
-}
 
 } // namespace duckdb

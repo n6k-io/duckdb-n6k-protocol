@@ -42,8 +42,23 @@ std::string BuildTableSchemaSql(const std::string &catalog, const std::string &s
 	return "SELECT * FROM " + QuoteQualifiedTable(catalog, schema, table) + " LIMIT 0";
 }
 
+static std::string QuotedColumnList(const std::vector<std::string> &columns) {
+	if (columns.empty()) {
+		throw InvalidInputException("n6k: a table constraint requires at least one column");
+	}
+	std::string out;
+	for (auto &column : columns) {
+		if (!out.empty()) {
+			out += ", ";
+		}
+		out += QuoteIdent(column);
+	}
+	return out;
+}
+
 std::string BuildCreateTableSql(const std::string &catalog, const std::string &schema, const std::string &name,
-                                duckdb_yyjson::yyjson_val *columns) {
+                                duckdb_yyjson::yyjson_val *columns, const std::vector<std::string> &primary_key,
+                                const std::vector<std::vector<std::string>> &unique_keys) {
 	using namespace duckdb_yyjson; // NOLINT
 	if (!columns || !yyjson_is_arr(columns)) {
 		throw InvalidInputException("n6k: create_table requires a \"columns\" array");
@@ -61,8 +76,29 @@ std::string BuildCreateTableSql(const std::string &catalog, const std::string &s
 			col_defs += ", ";
 		}
 		col_defs += QuoteIdent(cname) + " " + ctype;
+		if (JsonGetBool(col, "not_null")) {
+			col_defs += " NOT NULL";
+		}
+	}
+	if (!primary_key.empty()) {
+		col_defs += ", PRIMARY KEY (" + QuotedColumnList(primary_key) + ")";
+	}
+	for (auto &unique_key : unique_keys) {
+		col_defs += ", UNIQUE (" + QuotedColumnList(unique_key) + ")";
 	}
 	return "CREATE TABLE " + QuoteQualifiedTable(catalog, schema, name) + " (" + col_defs + ")";
+}
+
+std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &schema,
+                                 const std::string &on_conflict) {
+	const auto qualified = QuoteIdent(catalog) + "." + QuoteIdent(schema);
+	if (on_conflict == "error") {
+		return "CREATE SCHEMA " + qualified;
+	}
+	if (on_conflict == "ignore") {
+		return "CREATE SCHEMA IF NOT EXISTS " + qualified;
+	}
+	throw InvalidInputException("n6k: create_schema \"on_conflict\" must be error or ignore");
 }
 
 std::string BuildAlterSql(const std::string &catalog, const std::string &schema, const std::string &table,
