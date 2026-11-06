@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "connection_hub.hpp"
 #include "duckdb/common/exception.hpp"
+#include "framework/n6k_peer.hpp"
 #include "hub_session.hpp"
 #include "n6k_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
@@ -20,6 +21,8 @@
 #include <vector>
 
 using namespace duckdb;
+using n6k_test::PackHelloAck;
+using n6k_test::PackOpenAck;
 
 namespace {
 
@@ -42,36 +45,6 @@ struct OpenPendingResult {
 	// (OPENs seen before it, ns)
 	std::vector<std::pair<int32_t, int64_t>> cancels;
 };
-
-std::string PackHelloAck() {
-	msgpack::sbuffer sbuf;
-	msgpack::packer<msgpack::sbuffer> pk(&sbuf);
-	pk.pack_map(3);
-	n6k::PackString(pk, "t");
-	pk.pack(static_cast<int>(n6k::FrameType::HELLO_ACK));
-	n6k::PackString(pk, "protocol_version");
-	pk.pack(n6k::N6K_PROTOCOL_VERSION);
-	n6k::PackString(pk, "capabilities");
-	pk.pack_array(0);
-	return std::string(sbuf.data(), sbuf.size());
-}
-
-std::string PackOpenAck(int64_t ns) {
-	msgpack::sbuffer sbuf;
-	msgpack::packer<msgpack::sbuffer> pk(&sbuf);
-	pk.pack_map(5);
-	n6k::PackString(pk, "t");
-	pk.pack(static_cast<int>(n6k::FrameType::OPEN_ACK));
-	n6k::PackString(pk, "ns");
-	pk.pack(ns);
-	n6k::PackString(pk, "max_concurrent_reqs");
-	pk.pack(8);
-	n6k::PackString(pk, "default_batch_credits");
-	pk.pack(8);
-	n6k::PackString(pk, "capabilities");
-	pk.pack_array(0);
-	return std::string(sbuf.data(), sbuf.size());
-}
 
 std::string PackOpenErr(int64_t ns, const std::string &message) {
 	msgpack::sbuffer sbuf;

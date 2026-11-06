@@ -1,5 +1,6 @@
 #include "catch.hpp"
 #include "connection_hub.hpp"
+#include "framework/n6k_peer.hpp"
 #include "hub_session.hpp"
 #include "n6k_msgpack.hpp"
 #include "n6k_protocol_generated.hpp"
@@ -10,7 +11,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <poll.h>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -18,6 +18,9 @@
 #include <vector>
 
 using namespace duckdb;
+using n6k_test::PackHelloAck;
+using n6k_test::ReadExactWithin;
+using n6k_test::WriteFramed;
 
 namespace {
 
@@ -58,57 +61,6 @@ std::string MakeFrame(int64_t ns, int64_t t = T_RESP_CHUNK, int64_t id = -1) {
 		pk.pack(id);
 	}
 	return std::string(sb.data(), sb.size());
-}
-
-std::string MakeHelloAck() {
-	msgpack::sbuffer sb;
-	msgpack::packer<msgpack::sbuffer> pk(&sb);
-	pk.pack_map(3);
-	n6k::PackString(pk, "t");
-	pk.pack(static_cast<int>(n6k::FrameType::HELLO_ACK));
-	n6k::PackString(pk, "protocol_version");
-	pk.pack(static_cast<int>(n6k::N6K_PROTOCOL_VERSION));
-	n6k::PackString(pk, "capabilities");
-	pk.pack_array(0);
-	return std::string(sb.data(), sb.size());
-}
-
-bool WriteFramed(int fd, const std::string &frame) {
-	std::string buf;
-	n6k::AppendStreamHeader(buf, n6k::StreamFrameType::N6K, frame.size());
-	buf.append(frame);
-	size_t sent = 0;
-	while (sent < buf.size()) {
-		ssize_t w = ::write(fd, buf.data() + sent, buf.size() - sent);
-		if (w <= 0) {
-			return false;
-		}
-		sent += static_cast<size_t>(w);
-	}
-	return true;
-}
-
-bool ReadExactWithin(int fd, char *buf, size_t n, std::chrono::steady_clock::time_point deadline) {
-	size_t got = 0;
-	while (got < n) {
-		auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-		if (left.count() <= 0) {
-			return false;
-		}
-		struct pollfd pfd;
-		pfd.fd = fd;
-		pfd.events = POLLIN;
-		pfd.revents = 0;
-		if (::poll(&pfd, 1, static_cast<int>(left.count())) <= 0) {
-			return false;
-		}
-		ssize_t r = ::read(fd, buf + got, n - got);
-		if (r <= 0) {
-			return false;
-		}
-		got += static_cast<size_t>(r);
-	}
-	return true;
 }
 
 bool PeerSaw(int fd, int64_t t, int64_t ns, int64_t id) {
@@ -221,7 +173,7 @@ HubRoutingResult RunHubRouting() {
 		opts.endpoint = "test socket";
 		auto hub = n6k::ConnectionHub::Create(nullptr, std::move(opts));
 		// Queued ahead, so the hub's HELLO finds its answer already waiting.
-		WriteFramed(peer_fd, MakeHelloAck());
+		WriteFramed(peer_fd, PackHelloAck());
 		hub->EnsureConnected(nullptr);
 
 		n6k::HubSession s1(hub, /*ns=*/1);

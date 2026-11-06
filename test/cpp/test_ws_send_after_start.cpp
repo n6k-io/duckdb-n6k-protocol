@@ -1,7 +1,6 @@
 #include "catch.hpp"
 #include "connection_hub.hpp"
-#include "n6k_msgpack.hpp"
-#include "n6k_protocol_generated.hpp"
+#include "framework/n6k_peer.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -30,19 +29,6 @@ const char *const kProbe = "N6K-SEND-AFTER-START-PROBE";
 // depend on this bound.
 constexpr int kProbeWaitMs = 3000;
 
-std::string PackHelloAck() {
-	msgpack::sbuffer sbuf;
-	msgpack::packer<msgpack::sbuffer> pk(&sbuf);
-	pk.pack_map(3);
-	n6k::PackString(pk, "t");
-	pk.pack(static_cast<int>(n6k::FrameType::HELLO_ACK));
-	n6k::PackString(pk, "protocol_version");
-	pk.pack(n6k::N6K_PROTOCOL_VERSION);
-	n6k::PackString(pk, "capabilities");
-	pk.pack_array(0);
-	return std::string(sbuf.data(), sbuf.size());
-}
-
 // ix::SocketServer::getPort() reports the requested port verbatim, so port 0 would leave no URL to dial.
 int CandidateBasePort() {
 	const auto tid = std::hash<std::thread::id> {}(std::this_thread::get_id());
@@ -69,7 +55,7 @@ SendAfterStartResult RunSendAfterStart() {
 			if (msg->str == kProbe) {
 				saw_probe.store(true, std::memory_order_release);
 			} else {
-				ws.sendBinary(PackHelloAck());
+				ws.sendBinary(n6k_test::PackHelloAck());
 			}
 		});
 		if (!candidate->listen().first) {

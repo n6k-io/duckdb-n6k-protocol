@@ -12,6 +12,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 
 #include <algorithm>
 #include <mutex>
@@ -26,6 +27,7 @@
 namespace duckdb {
 
 constexpr const char *FILTER = "filter";
+constexpr const char *AGGREGATE = "aggregate";
 
 struct TwinPlan {
 	std::set<std::string> rels;
@@ -39,14 +41,20 @@ struct TwinPlan {
 	}
 };
 
-class N6kTwin {
+inline unique_ptr<QueryResult> TwinRun(Connection &connection, const std::string &sql) {
+	unique_ptr<QueryResult> result = connection.Query(sql);
+	if (result->HasError()) {
+		throw std::runtime_error(sql + "\n" + result->GetError());
+	}
+	return result;
+}
+
+class TwinClient {
 public:
-	N6kTwin() : far(nullptr), far_con(far) {
-		ExtensionLoader far_loader(*far.instance, "n6k_server");
-		N6kServerLoadInternal(far_loader);
+	TwinClient(DuckDB &far_p, Connection &far_con_p, std::vector<std::string> catalogs_p)
+	    : far(far_p), far_con(far_con_p), catalogs(std::move(catalogs_p)) {
 		ExtensionLoader near_loader(*near_db->instance, "n6k_client");
 		LoadInternal(near_loader);
-		Run(far_con, "ATTACH ':memory:' AS db");
 		if (::socketpair(AF_UNIX, SOCK_STREAM, 0, near_pair) != 0 ||
 		    ::socketpair(AF_UNIX, SOCK_STREAM, 0, far_pair) != 0) {
 			throw std::runtime_error("socketpair failed");
@@ -55,7 +63,7 @@ public:
 		SetNoSigPipe(far_pair[0]);
 	}
 
-	~N6kTwin() {
+	~TwinClient() {
 		con.reset();
 		near_db.reset();
 		for (int fd : {near_pair[0], near_pair[1], far_pair[0], far_pair[1]}) {
@@ -71,23 +79,24 @@ public:
 		}
 	}
 
-	N6kTwin(const N6kTwin &) = delete;
-	N6kTwin &operator=(const N6kTwin &) = delete;
-
-	void Far(const std::string &sql) {
-		Run(far_con, sql);
-	}
+	TwinClient(const TwinClient &) = delete;
+	TwinClient &operator=(const TwinClient &) = delete;
 
 	void Attach() {
 		to_far = std::thread([this] { Pump(near_pair[1], far_pair[0], true); });
 		to_near = std::thread([this] { Pump(far_pair[0], near_pair[1], false); });
 
 		auto session =
-		    Run(far_con, "SELECT session_id FROM n6k_serve_create_session(" + std::to_string(far_pair[1]) + ")");
+		    TwinRun(far_con, "SELECT session_id FROM n6k_serve_create_session(" + std::to_string(far_pair[1]) + ")");
 		const auto session_id = session->Collection().GetValue(0, 0).ToString();
+		std::string serve_sql = "CALL n6k_serve_fd('" + session_id + "'::UUID";
+		for (auto &catalog : catalogs) {
+			serve_sql += ", '" + catalog + "'";
+		}
+		serve_sql += ")";
 		serve_con = make_uniq<Connection>(far);
-		serve = std::thread([this, session_id] {
-			auto result = serve_con->Query("CALL n6k_serve_fd('" + session_id + "'::UUID, 'db')");
+		serve = std::thread([this, serve_sql] {
+			auto result = serve_con->Query(serve_sql);
 			if (result->HasError()) {
 				std::lock_guard<std::mutex> lk(lock);
 				serve_error = result->GetError();
@@ -95,23 +104,84 @@ public:
 		});
 
 		con = make_uniq<Connection>(*near_db);
-		auto connected = Run(*con, "SELECT connection_id FROM n6k_connect(wsFd => " + std::to_string(near_pair[0]) +
-		                               ", token => '')");
-		Run(*con, "ATTACH '' AS db (TYPE n6k, CONNECTION '" + connected->Collection().GetValue(0, 0).ToString() + "')");
+		auto connected = TwinRun(*con, "SELECT connection_id FROM n6k_connect(wsFd => " + std::to_string(near_pair[0]) +
+		                                   ", token => '')");
+		const auto connection_id = connected->Collection().GetValue(0, 0).ToString();
+		for (auto &catalog : catalogs) {
+			TwinRun(*con, "ATTACH '' AS " + catalog + " (TYPE n6k, CONNECTION '" + connection_id + "')");
+		}
+	}
+
+	unique_ptr<QueryResult> Near(const std::string &sql) {
+		return TwinRun(*con, sql);
+	}
+
+	void NearFails(const std::string &sql, ExceptionType type, const std::string &message) {
+		INFO(sql);
+		auto result = con->Query(sql);
+		REQUIRE(result->HasError());
+		INFO(result->GetError());
+		REQUIRE(result->GetErrorType() == type);
+		REQUIRE(result->GetError().find(message) != std::string::npos);
+	}
+
+	void NearFunction(ScalarFunction function) {
+		CreateScalarFunctionInfo info(std::move(function));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		con->context->RegisterFunction(info);
+	}
+
+	std::vector<std::string> Rows(const std::string &sql) {
+		auto result = Near(sql);
+		auto values = result->Collection().GetRows();
+		std::vector<std::string> rows;
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			std::string cells;
+			for (idx_t column = 0; column < result->GetTypes().size(); column++) {
+				cells += (column == 0 ? "" : "|") + values.GetValue(column, row).ToString();
+			}
+			rows.push_back(cells);
+		}
+		return rows;
+	}
+
+	std::string Explain(const std::string &sql) {
+		auto result = Near("EXPLAIN " + sql);
+		std::string plan;
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			plan += result->Collection().GetValue(1, row).ToString() + "\n";
+		}
+		return plan;
+	}
+
+	void Crosses(const std::string &sql) {
+		INFO(sql);
+		const auto plan = Explain(sql);
+		INFO(plan);
+		REQUIRE(plan.find("Crossing Read") != std::string::npos);
+	}
+
+	void Folds(const std::string &sql) {
+		INFO(sql);
+		const auto plan = Explain(sql);
+		INFO(plan);
+		REQUIRE(plan.substr(0, plan.find('\n')).find("Crossing Read") != std::string::npos);
 	}
 
 	void Same(const std::string &sql) {
 		INFO(sql);
-		auto expected = Run(far_con, sql);
-		auto got = Run(*con, sql);
+		auto expected = TwinRun(far_con, sql);
+		auto got = TwinRun(*con, sql);
 
 		REQUIRE(got->GetTypes() == expected->GetTypes());
 		REQUIRE(Names(*got) == Names(*expected));
 		REQUIRE(got->RowCount() == expected->RowCount());
+		auto got_values = got->Collection().GetRows();
+		auto expected_values = expected->Collection().GetRows();
 		for (idx_t row = 0; row < expected->RowCount(); row++) {
 			for (idx_t column = 0; column < expected->GetTypes().size(); column++) {
-				const auto have = got->Collection().GetValue(column, row);
-				const auto want = expected->Collection().GetValue(column, row);
+				const auto have = got_values.GetValue(column, row);
+				const auto want = expected_values.GetValue(column, row);
 				INFO("row " << row << " column " << column << ": have " << have.ToString() << " want "
 				            << want.ToString());
 				REQUIRE(ValueOperations::NotDistinctFrom(have, want));
@@ -141,20 +211,25 @@ public:
 		throw std::runtime_error("no plan crossed the wire");
 	}
 
+	size_t SentCount(n6k::FrameType type) {
+		std::lock_guard<std::mutex> lk(lock);
+		size_t count = 0;
+		for (auto &frame : sent) {
+			size_t offset = 0;
+			auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
+			if (n6k::GetInt(handle.get(), "t", -1) == static_cast<int64_t>(type)) {
+				count++;
+			}
+		}
+		return count;
+	}
+
 	std::string ServeError() {
 		std::lock_guard<std::mutex> lk(lock);
 		return serve_error;
 	}
 
 private:
-	static unique_ptr<QueryResult> Run(Connection &connection, const std::string &sql) {
-		unique_ptr<QueryResult> result = connection.Query(sql);
-		if (result->HasError()) {
-			throw std::runtime_error(sql + "\n" + result->GetError());
-		}
-		return result;
-	}
-
 	static std::vector<std::string> Names(QueryResult &result) {
 		std::vector<std::string> names;
 		for (auto &name : result.GetNames()) {
@@ -250,8 +325,10 @@ private:
 		}
 	}
 
-	DuckDB far;
-	Connection far_con;
+	DuckDB &far;
+	Connection &far_con;
+	std::vector<std::string> catalogs;
+
 	unique_ptr<DuckDB> near_db = make_uniq<DuckDB>(nullptr);
 	unique_ptr<Connection> con;
 	unique_ptr<Connection> serve_con;
@@ -265,6 +342,79 @@ private:
 	std::mutex lock;
 	std::vector<std::string> sent;
 	std::string serve_error;
+};
+
+class N6kTwin {
+public:
+	explicit N6kTwin(std::vector<std::string> catalogs_p = {"db"})
+	    : far(nullptr), far_con(far), catalogs(std::move(catalogs_p)) {
+		ExtensionLoader far_loader(*far.instance, "n6k_server");
+		N6kServerLoadInternal(far_loader);
+		for (auto &catalog : catalogs) {
+			TwinRun(far_con, "ATTACH ':memory:' AS " + catalog);
+		}
+	}
+
+	N6kTwin(const N6kTwin &) = delete;
+	N6kTwin &operator=(const N6kTwin &) = delete;
+
+	void Far(const std::string &sql) {
+		TwinRun(far_con, sql);
+	}
+
+	TwinClient &Client() {
+		clients.push_back(make_uniq<TwinClient>(far, far_con, catalogs));
+		clients.back()->Attach();
+		return *clients.back();
+	}
+
+	void Attach() {
+		Client();
+	}
+
+	unique_ptr<QueryResult> Near(const std::string &sql) {
+		return First().Near(sql);
+	}
+	void NearFails(const std::string &sql, ExceptionType type, const std::string &message) {
+		First().NearFails(sql, type, message);
+	}
+	void NearFunction(ScalarFunction function) {
+		First().NearFunction(std::move(function));
+	}
+	std::vector<std::string> Rows(const std::string &sql) {
+		return First().Rows(sql);
+	}
+	std::string Explain(const std::string &sql) {
+		return First().Explain(sql);
+	}
+	void Crosses(const std::string &sql) {
+		First().Crosses(sql);
+	}
+	void Folds(const std::string &sql) {
+		First().Folds(sql);
+	}
+	void Same(const std::string &sql) {
+		First().Same(sql);
+	}
+	TwinPlan LastPlan() {
+		return First().LastPlan();
+	}
+	size_t SentCount(n6k::FrameType type) {
+		return First().SentCount(type);
+	}
+	std::string ServeError() {
+		return First().ServeError();
+	}
+
+private:
+	TwinClient &First() {
+		return *clients.front();
+	}
+
+	DuckDB far;
+	Connection far_con;
+	std::vector<std::string> catalogs;
+	std::vector<unique_ptr<TwinClient>> clients;
 };
 
 } // namespace duckdb
