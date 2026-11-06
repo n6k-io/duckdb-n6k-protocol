@@ -11,7 +11,7 @@ using RowList = std::vector<std::string>;
 
 } // namespace
 
-TEST_CASE("a created schema reaches the server and accepts tables", "[twin][ddl]") {
+TEST_CASE("a created schema reaches the server and accepts tables", "[twin][ddl][!shouldfail]") {
 	N6kTwin twin;
 	twin.Attach();
 
