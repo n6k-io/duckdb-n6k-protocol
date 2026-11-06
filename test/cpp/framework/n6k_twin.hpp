@@ -405,6 +405,10 @@ public:
 		return serve_error;
 	}
 
+	void HoldCreditsUntilPause() {
+		hold_credits.store(true);
+	}
+
 private:
 	static std::vector<std::string> Names(QueryResult &result) {
 		std::vector<std::string> names;
@@ -450,6 +454,24 @@ private:
 		return true;
 	}
 
+	static bool IsCredit(const std::string &frame) {
+		size_t offset = 0;
+		auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
+		return n6k::GetInt(handle.get(), "t", -1) == static_cast<int64_t>(n6k::FrameType::CREDIT);
+	}
+
+	void AwaitCreditPause() {
+		Connection stats(far);
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		while (std::chrono::steady_clock::now() < deadline) {
+			auto result = stats.Query("SELECT credit_pauses FROM n6k_serve_stats()");
+			if (result->HasError() || result->Collection().GetValue(0, 0).GetValue<int64_t>() >= 1) {
+				return;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	}
+
 	void Pump(int from, int to, bool record) {
 		char header[n6k::STREAM_HEADER_BYTES];
 		while (ReadExact(from, header, sizeof(header))) {
@@ -459,8 +481,14 @@ private:
 			}
 			if (record &&
 			    static_cast<unsigned char>(header[4]) == static_cast<unsigned char>(n6k::StreamFrameType::N6K)) {
-				std::lock_guard<std::mutex> lk(lock);
-				sent.push_back(payload);
+				{
+					std::lock_guard<std::mutex> lk(lock);
+					sent.push_back(payload);
+				}
+				if (hold_credits.load() && IsCredit(payload)) {
+					AwaitCreditPause();
+					hold_credits.store(false);
+				}
 			}
 			if (!WriteAll(to, header, sizeof(header)) || !WriteAll(to, payload.data(), payload.size())) {
 				break;
@@ -523,6 +551,7 @@ private:
 	std::mutex lock;
 	std::vector<std::string> sent;
 	std::string serve_error;
+	std::atomic<bool> hold_credits {false};
 };
 
 class TwinNear {
@@ -659,6 +688,9 @@ public:
 	}
 	std::string ServeError() {
 		return First().ServeError();
+	}
+	void HoldCreditsUntilPause() {
+		First().HoldCreditsUntilPause();
 	}
 
 private:

@@ -172,6 +172,7 @@ TEST_CASE("a long stream is paced by credits and a full drain sends no cancel", 
 	REQUIRE(twin.SentCount(n6k::FrameType::CANCEL) == 0);
 	REQUIRE(twin.FarRows("SELECT cancels FROM n6k_serve_stats()") == RowList {"0"});
 
+	twin.HoldCreditsUntilPause();
 	REQUIRE(twin.Rows("SELECT n FROM db.n6k_testing_stream_counter(40000)").size() == 40000);
 	REQUIRE(twin.SentCount(n6k::FrameType::CREDIT) >= 1);
 	REQUIRE(twin.SentCount(n6k::FrameType::CANCEL) == 0);
