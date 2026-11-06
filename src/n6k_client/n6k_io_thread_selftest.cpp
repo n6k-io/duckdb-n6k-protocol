@@ -275,7 +275,7 @@ struct N6kIoThreadSelftestState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"mode", "ok", "spawned", "joined", "doorbell_woke", "frames_expected", "frames_drained", "elapsed_ms"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
 	                LogicalType::BOOLEAN, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER};
@@ -289,21 +289,21 @@ unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &, TableFunctionIn
 void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kIoThreadSelftestState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
 
 	const IoSelftestResult r = RunIoSelftest();
-	output.SetValue(0, 0, Value(r.mode));
-	output.SetValue(1, 0, Value::BOOLEAN(r.ok));
-	output.SetValue(2, 0, Value::BOOLEAN(r.spawned));
-	output.SetValue(3, 0, Value::BOOLEAN(r.joined));
-	output.SetValue(4, 0, Value::BOOLEAN(r.doorbell_woke));
-	output.SetValue(5, 0, Value::INTEGER(r.frames_expected));
-	output.SetValue(6, 0, Value::INTEGER(r.frames_drained));
-	output.SetValue(7, 0, Value::INTEGER(static_cast<int32_t>(r.elapsed_ms)));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value(r.mode));
+	output.data[1].SetValue(0, Value::BOOLEAN(r.ok));
+	output.data[2].SetValue(0, Value::BOOLEAN(r.spawned));
+	output.data[3].SetValue(0, Value::BOOLEAN(r.joined));
+	output.data[4].SetValue(0, Value::BOOLEAN(r.doorbell_woke));
+	output.data[5].SetValue(0, Value::INTEGER(r.frames_expected));
+	output.data[6].SetValue(0, Value::INTEGER(r.frames_drained));
+	output.data[7].SetValue(0, Value::INTEGER(static_cast<int32_t>(r.elapsed_ms)));
+	output.SetChildCardinality(1);
 }
 
 } // namespace

@@ -9,9 +9,7 @@ export type Capability =
 
 export type BackendCapabilities = Record<Capability, boolean>;
 
-// coi-only: the wasm extension is built for shared memory (wasm_threads), which
-// only the browser coi bundle can load. The old node-eh (`wasm-node`) and
-// browser-eh (`browser`) backends can't load it and were retired.
+// Only the browser coi bundle can load the wasm extension (npm_db_wasm in the Makefile).
 export type BackendName = "native" | "browser-threads";
 
 export type BackendSetupOptions = {

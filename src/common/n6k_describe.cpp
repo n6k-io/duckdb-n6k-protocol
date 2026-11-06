@@ -46,7 +46,7 @@ static LogicalType ColumnStructType() {
 	return LogicalType::STRUCT(std::move(children));
 }
 
-static void SetTableDescribeReturnSchema(vector<LogicalType> &return_types, vector<string> &names) {
+static void SetTableDescribeReturnSchema(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"columns", "primary_key", "verbs", "enums"};
 	return_types = {LogicalType::LIST(ColumnStructType()), LogicalType::LIST(LogicalType::VARCHAR),
 	                LogicalType::LIST(LogicalType::VARCHAR),
@@ -74,7 +74,7 @@ static void DescribeTableColumns(TableCatalogEntry &table, vector<DescribeColumn
 	}
 	for (auto &col : table.GetColumns().Logical()) {
 		DescribeColumn dc;
-		dc.name = col.Name();
+		dc.name = col.Name().GetIdentifierName();
 		dc.type = col.Type().ToString();
 		dc.nullable = not_null.find(col.Logical().index) == not_null.end();
 		dc.has_default = col.HasDefaultValue();
@@ -98,7 +98,7 @@ static void BindViewAndCollectColumns(ClientContext &context, ViewCatalogEntry &
 	}
 	for (idx_t i = 0; i < info->types.size(); i++) {
 		DescribeColumn dc;
-		dc.name = i < info->names.size() ? info->names[i] : "col" + std::to_string(i);
+		dc.name = i < info->names.size() ? info->names[i].GetIdentifierName() : "col" + std::to_string(i);
 		dc.type = info->types[i].ToString();
 		dc.enum_values = EnumLabels(info->types[i]);
 		out.push_back(std::move(dc));
@@ -106,7 +106,7 @@ static void BindViewAndCollectColumns(ClientContext &context, ViewCatalogEntry &
 }
 
 static unique_ptr<FunctionData> TableDescribeBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	SetTableDescribeReturnSchema(return_types, names);
 
 	auto args = ParsePermissionsArgs(input);
@@ -116,9 +116,9 @@ static unique_ptr<FunctionData> TableDescribeBind(ClientContext &context, TableF
 	}
 	string schema_name = args.has_schema ? args.schema : string(DEFAULT_SCHEMA);
 
-	auto &catalog = Catalog::GetCatalog(context, args.catalog);
-	auto entry =
-	    catalog.GetEntry(context, CatalogType::TABLE_ENTRY, schema_name, args.table, OnEntryNotFound::RETURN_NULL);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(args.catalog));
+	auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(schema_name), Identifier(args.table),
+	                              OnEntryNotFound::RETURN_NULL);
 	if (!entry) {
 		throw CatalogException("n6k_table_describe: table \"%s.%s.%s\" not found", args.catalog, schema_name,
 		                       args.table);
@@ -155,7 +155,7 @@ static void TableDescribeScan(ClientContext &context, TableFunctionInput &data_p
 	auto &bind_data = data_p.bind_data->Cast<TableDescribeBindData>();
 	auto &state = data_p.global_state->Cast<TableDescribeState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -168,10 +168,10 @@ static void TableDescribeScan(ClientContext &context, TableFunctionInput &data_p
 		fields.push_back(make_pair("default", c.has_default ? Value(c.default_value) : Value(LogicalType::VARCHAR)));
 		column_vals.push_back(Value::STRUCT(std::move(fields)));
 	}
-	output.SetValue(0, 0, Value::LIST(ColumnStructType(), std::move(column_vals)));
+	output.data[0].SetValue(0, Value::LIST(ColumnStructType(), std::move(column_vals)));
 
-	output.SetValue(1, 0, VarcharList(bind_data.primary_key));
-	output.SetValue(2, 0, VarcharList(bind_data.verbs));
+	output.data[1].SetValue(0, VarcharList(bind_data.primary_key));
+	output.data[2].SetValue(0, VarcharList(bind_data.verbs));
 
 	vector<Value> enum_keys;
 	vector<Value> enum_values;
@@ -186,19 +186,20 @@ static void TableDescribeScan(ClientContext &context, TableFunctionInput &data_p
 		}
 		enum_values.push_back(Value::LIST(LogicalType::VARCHAR, std::move(labels)));
 	}
-	output.SetValue(3, 0,
-	                Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), std::move(enum_keys),
-	                           std::move(enum_values)));
+	output.data[3].SetValue(0, Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR),
+	                                      std::move(enum_keys), std::move(enum_values)));
 
 	state.done = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 void RegisterTableDescribeFunction(ExtensionLoader &loader) {
 	TableFunction func("n6k_table_describe", {LogicalType::VARCHAR}, TableDescribeScan, TableDescribeBind,
 	                   TableDescribeInitGlobal);
-	func.named_parameters["schema"] = LogicalType::VARCHAR;
-	func.named_parameters["table"] = LogicalType::VARCHAR;
+	func.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("schema", LogicalType::VARCHAR);
+		options.Add("table", LogicalType::VARCHAR);
+	});
 	CreateTableFunctionInfo info(std::move(func));
 	info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 	loader.RegisterFunction(std::move(info));

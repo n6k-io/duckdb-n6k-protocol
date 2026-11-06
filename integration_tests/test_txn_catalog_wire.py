@@ -1,4 +1,4 @@
-"""OP_TABLES_LIST / OP_TABLE_SCHEMA inside an open transaction (`txn`).
+"""OP_TABLES_LIST / OP_TABLE_SCHEMA / OP_CREATE_TABLE / OP_ALTER_TABLE inside an open transaction (`txn`).
 
 Run:
     uv run pytest integration_tests/test_txn_catalog_wire.py -v
@@ -15,6 +15,8 @@ from n6k_protocol.protocol import (
     FT_RESP_CHUNK,
     FT_RESP_END,
     FT_RESP_SCHEMA,
+    OP_ALTER_TABLE,
+    OP_CREATE_TABLE,
     OP_TABLE_SCHEMA,
     OP_TABLES_LIST,
     OP_TXN_BEGIN,
@@ -25,6 +27,22 @@ from n6k_protocol.protocol import (
 async def _begin(client) -> int:
     frames = await client.request(OP_TXN_BEGIN)
     return [h for h, _ in frames if h["t"] == FT_RESP_END][0]["txn"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", TARGETS, ids=str)
+@pytest.mark.parametrize(
+    "op, args",
+    [
+        (OP_CREATE_TABLE, {"schema": "main", "name": "never", "columns": [{"name": "id", "type": "INTEGER"}]}),
+        (OP_ALTER_TABLE, {"schema": "main", "table": "users", "kind": "drop_column", "details": {"name": "id"}}),
+    ],
+    ids=["create", "alter"],
+)
+async def test_table_ddl_in_an_unknown_transaction_is_refused(target: Target, op: int, args: dict) -> None:
+    async with connect(target) as (client, _hello):
+        err = await client.error(op, txn=987654, **args)
+        assert err["exception_type"] == "TransactionException"
 
 
 @pytest.mark.asyncio

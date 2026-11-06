@@ -119,7 +119,7 @@ def test_a_join_across_a_shared_connection_is_one_read():
         _attach(c, conn_id, "y1", "b")
         sql = "SELECT x.catalog, y.catalog FROM x1.main.marker x JOIN y1.main.marker y ON x.catalog <> y.catalog"
         plan = "\n".join(r[1] for r in c.execute(f"EXPLAIN {sql}").fetchall())
-        assert plan.count("CROSSING_READ") == 1
+        assert plan.count("Crossing Read") == 1
         assert c.execute(sql).fetchall() == [("a", "b")]
     finally:
         c.close()

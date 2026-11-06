@@ -82,7 +82,6 @@ jobs:
             exit 1
           fi
 
-  # Windows (windows_amd64 and windows_amd64_mingw) is not built or shipped.
   # One build per arch compiles EVERY extension declared in
   # extension_config.cmake — the build command is a blanket `make`, the extension
   # set is driven entirely by that config, not by extension_name.
@@ -92,13 +91,13 @@ jobs:
   duckdb-stable-build:
     name: Build n6k extension binaries
     needs: version-check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.6
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5.6
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
       extension_name: n6k_client
-      # coi-only: build wasm_threads, never eh/mvp (they can't load a shared-memory
-      # extension). On PRs also drop the non-amd64 native arches for speed.
+      # wasm_threads is the only wasm variant: see npm_db_wasm in the Makefile.
+      # Off main, also drop the arm64 and osx native arches for speed.
       exclude_archs: ${{ github.ref != 'refs/heads/main' && 'linux_arm64;osx_amd64;osx_arm64;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh' || 'windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh' }}
       opt_in_archs: 'linux_amd64_musl'
       upload_all_extensions: true
@@ -106,12 +105,39 @@ jobs:
   code-quality-check:
     name: Code Quality Check
     needs: version-check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.6
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5.6
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
       extension_name: n6k_client
       format_checks: 'format;tidy'
+
+  cpp-test:
+    name: C++ tests
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache libssl-dev
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: cpp-test-ccache-${{ github.sha }}
+          restore-keys: cpp-test-ccache-
+      - name: Build
+        run: GEN=ninja make release
+      - name: Test
+        run: make cpp-test
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-test-logs
+          path: build/test-logs/
 
   duckdb-stable-deploy:
     name: Deploy n6k extensions (${{ matrix.duckdb_arch }})
@@ -129,7 +155,6 @@ jobs:
           - linux_amd64_musl
           - osx_amd64
           - osx_arm64
-          # coi-only: only the shared-memory (wasm_threads) extension is built/shipped.
           - wasm_threads
     steps:
       - uses: actions/checkout@v4
@@ -143,13 +168,13 @@ jobs:
             git clone https://github.com/duckdb/duckdb.git
           fi
           cd duckdb
-          git checkout v1.5.6
+          git checkout v2.0.0
 
       # One artifact per arch holds every extension built for it, nested under the
       # repository/ tree — staged here, then flattened + uploaded one extension at a time.
       - uses: actions/download-artifact@v4
         with:
-          name: n6k_client-v1.5.6-extension-${{ matrix.duckdb_arch }}
+          name: n6k_client-v2.0.0-extension-${{ matrix.duckdb_arch }}
           path: /tmp/artifact
 
       - uses: ./.github/actions/setup-gcloud

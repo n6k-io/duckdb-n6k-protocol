@@ -101,6 +101,8 @@ OP_CATALOG_LIST: Final = 19
 OP_CATALOGS_CHANGED: Final = 20
 OP_CREATE_VIEW: Final = 21
 OP_DROP_VIEW: Final = 22
+OP_HAS_FUNCTION: Final = 23
+OP_CREATE_SCHEMA: Final = 24
 
 _OPS = [
     ("SCHEMA_LIST", OP_SCHEMA_LIST),
@@ -123,6 +125,8 @@ _OPS = [
     ("CATALOGS_CHANGED", OP_CATALOGS_CHANGED),
     ("CREATE_VIEW", OP_CREATE_VIEW),
     ("DROP_VIEW", OP_DROP_VIEW),
+    ("HAS_FUNCTION", OP_HAS_FUNCTION),
+    ("CREATE_SCHEMA", OP_CREATE_SCHEMA),
 ]
 
 
@@ -155,7 +159,9 @@ _F_ID: Any = ("id", "integer", True)
 _F_NS: Any = ("ns", "integer", False)
 _F_NS_REQUIRED: Any = ("ns", "integer", True)
 _ARRAY_OF_STR: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
-# Each TABLES_LIST entry is a row object ({schema, name, verbs, primary_keys}); each schema entry {name, verbs}.
+_ARRAY_OF_STR_ARRAYS: dict[str, Any] = {"type": "array", "items": _ARRAY_OF_STR}
+# Each TABLES_LIST entry is a row object ({schema, name, verbs, primary_keys, not_null, unique_keys}); each schema
+# entry {name, verbs}.
 _ARRAY_OF_OBJ: dict[str, Any] = {"type": "array", "items": {"type": "object"}}
 
 # variant: {"name", "t", optional "op", "fields": [field, ...], optional
@@ -272,6 +278,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("cancelled", "boolean", False),
             ("ok", "boolean", False),
             ("txn", "integer", False),
+            ("exists", "boolean", False),
         ],
     },
     # ── Requests (t=REQ, discriminated on op) ────────────────────────────────
@@ -314,6 +321,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("table", "string", True),
             ("key_columns", _ARRAY_OF_STR, True),
             ("set_columns", _ARRAY_OF_STR, True),
+            ("reads_rows", "boolean", False),
             ("plan", "string", True),
             ("txn", "integer", False),
         ],
@@ -346,7 +354,15 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         "name": "REQ_CREATE_TABLE",
         "t": FT_REQ,
         "op": OP_CREATE_TABLE,
-        "fields": [_F_ID, ("schema", "string", True), ("name", "string", True), ("columns", "array", True)],
+        "fields": [
+            _F_ID,
+            ("schema", "string", True),
+            ("name", "string", True),
+            ("columns", "array", True),
+            ("primary_key", _ARRAY_OF_STR, False),
+            ("unique_keys", _ARRAY_OF_STR_ARRAYS, False),
+            ("txn", "integer", False),
+        ],
     },
     # `plan` is the view's body as Substrait JSON, floors only; its columns are `names`, in order.
     {
@@ -376,6 +392,19 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         ],
     },
     {
+        "name": "REQ_CREATE_SCHEMA",
+        "t": FT_REQ,
+        "op": OP_CREATE_SCHEMA,
+        "fields": [_F_ID, ("schema", "string", True), ("on_conflict", "string", True)],
+    },
+    # `args` are the argument types of a bound call, as DuckDB spells them.
+    {
+        "name": "REQ_HAS_FUNCTION",
+        "t": FT_REQ,
+        "op": OP_HAS_FUNCTION,
+        "fields": [_F_ID, ("name", "string", True), ("args", _ARRAY_OF_STR, True)],
+    },
+    {
         "name": "REQ_ALTER_TABLE",
         "t": FT_REQ,
         "op": OP_ALTER_TABLE,
@@ -385,6 +414,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("table", "string", True),
             ("kind", "string", True),
             ("details", "object", False),
+            ("txn", "integer", False),
         ],
     },
 ]
@@ -513,9 +543,12 @@ CAP_CROSSING: Final = "crossing"
 CAP_JSONRPC: Final = "jsonrpc"
 CAP_MCP: Final = "mcp"
 CAP_CATALOG_PLANS: Final = "catalog_plans"
+CAP_HAS_FUNCTION: Final = "has_function"
+CAP_TABLE_DDL: Final = "table_ddl"
+CAP_SCHEMA_DDL: Final = "schema_ddl"
 
 # What this implementation supports at each level; client and server both send their set.
 HELLO_CAPS: Final = (CAP_CROSSING, CAP_JSONRPC, CAP_MCP)
 # The subset of HELLO_CAPS the server grants only when the app serving the socket provides it.
 APP_HELLO_CAPS: Final = (CAP_JSONRPC, CAP_MCP)
-OPEN_CAPS: Final = (CAP_CATALOG_PLANS,)
+OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_TABLE_DDL, CAP_SCHEMA_DDL)

@@ -120,7 +120,7 @@ static vector<string> ListCatalogs(ClientContext &context, const hugeint_t &conn
 #endif
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
 	names = {"catalog_name"};
 	return_types = {LogicalType::VARCHAR};
 	n6k::ThrowIfServed(context, FN_NAME);
@@ -153,18 +153,19 @@ void Scan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<N6kListCatalogsState>();
 	idx_t count = 0;
 	while (state.offset < state.catalogs.size() && count < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, count, Value(state.catalogs[state.offset]));
+		output.data[0].SetValue(count, Value(state.catalogs[state.offset]));
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace
 
 void RegisterN6kListCatalogs(ExtensionLoader &loader) {
 	TableFunction fn(FN_NAME, {}, Scan, Bind, InitGlobal);
-	fn.named_parameters["connection"] = LogicalType::UUID;
+	fn.GetSignature().WithTypedKwargs("options",
+	                                  [](TypedKwargs &options) { options.Add("connection", LogicalType::UUID); });
 	loader.RegisterFunction(fn);
 }
 

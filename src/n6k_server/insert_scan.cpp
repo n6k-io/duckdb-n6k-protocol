@@ -78,65 +78,69 @@ int64_t CountArrowIpcRows(const uint8_t *data, size_t len) {
 }
 
 namespace {
-struct InsertStreamData {
+struct InsertStreamData : public ArrowScanFactory {
 	ArrowArrayStream stream;
 	bool consumed = false;
 
 	InsertStreamData() {
 		stream.release = nullptr;
 	}
-	~InsertStreamData() {
+	~InsertStreamData() override {
 		if (stream.release) {
 			stream.release(&stream);
 		}
 	}
+
+	void GetSchema(ArrowSchema &schema) override {
+		if (!stream.release || stream.get_schema(&stream, &schema) != 0) {
+			throw InvalidInputException("n6k_server: malformed Arrow IPC insert payload (schema unreadable)");
+		}
+	}
+
+	unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &) override {
+		if (consumed) {
+			throw InternalException("n6k_server: insert stream produced twice");
+		}
+		auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
+		wrapper->arrow_array_stream = stream;
+		stream.release = nullptr;
+		consumed = true;
+		return wrapper;
+	}
 };
 
-unique_ptr<ArrowArrayStreamWrapper> TakeInsertStreamOnce(uintptr_t factory_ptr, ArrowStreamParameters &) {
-	auto *sd = reinterpret_cast<InsertStreamData *>(factory_ptr);
-	if (sd->consumed) {
-		throw InternalException("n6k_server: insert stream produced twice");
-	}
-	auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
-	wrapper->arrow_array_stream = sd->stream;
-	sd->stream.release = nullptr;
-	sd->consumed = true;
-	wrapper->number_of_rows = -1;
-	return wrapper;
-}
-
 struct InsertScanData : public ArrowScanFunctionData {
-	unique_ptr<InsertStreamData> data_stream;
+	shared_ptr<InsertStreamData> data_stream;
 	unique_ptr<InsertStreamData> schema_stream;
 
-	InsertScanData(stream_factory_produce_t producer, unique_ptr<InsertStreamData> ds, unique_ptr<InsertStreamData> ss)
-	    : ArrowScanFunctionData(producer, reinterpret_cast<uintptr_t>(ds.get())), data_stream(std::move(ds)),
-	      schema_stream(std::move(ss)) {
+	InsertScanData(shared_ptr<InsertStreamData> ds, unique_ptr<InsertStreamData> ss)
+	    : ArrowScanFunctionData(ds), data_stream(std::move(ds)), schema_stream(std::move(ss)) {
 	}
 };
 } // namespace
 
 static unique_ptr<FunctionData> InsertScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto *bytes = reinterpret_cast<InsertArrowBytes *>(input.inputs[0].GetPointer());
 
 	// Decode twice: one stream feeds the scan, the other yields the schema for bind.
-	auto data_stream = make_uniq<InsertStreamData>();
+	auto data_stream = make_shared_ptr<InsertStreamData>();
 	OpenIpcReaderOverOwnedBuffer(CopyBytes(bytes->data, bytes->len), static_cast<int64_t>(bytes->len),
 	                             &data_stream->stream);
 	auto schema_stream = make_uniq<InsertStreamData>();
 	OpenIpcReaderOverOwnedBuffer(CopyBytes(bytes->data, bytes->len), static_cast<int64_t>(bytes->len),
 	                             &schema_stream->stream);
 
-	auto result = make_uniq<InsertScanData>(reinterpret_cast<stream_factory_produce_t>(TakeInsertStreamOnce),
-	                                        std::move(data_stream), std::move(schema_stream));
+	auto result = make_uniq<InsertScanData>(std::move(data_stream), std::move(schema_stream));
 
 	auto *sp = result->schema_stream.get();
 	if (sp->stream.get_schema(&sp->stream, &result->schema_root.arrow_schema) != 0) {
 		throw InvalidInputException("n6k_server: malformed Arrow IPC insert payload (schema unreadable)");
 	}
 	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, result->schema_root.arrow_schema);
-	names = result->arrow_table.GetNames();
+	for (auto &column_name : result->arrow_table.GetNames()) {
+		names.emplace_back(column_name);
+	}
 	return_types = result->arrow_table.GetTypes();
 	result->all_types = return_types;
 	return std::move(result);

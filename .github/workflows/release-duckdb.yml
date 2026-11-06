@@ -1,7 +1,7 @@
 name: Publish duckdb extensions
 
-# Triggered by pushing a tag like `duckdb/v0.1.0` on a main commit. Copies the build that main
-# already deployed under the commit's short sha to v<major>, v<major>.<minor> and the exact tag.
+# Copies the build duckdb-stable-deploy (MainDistributionPipeline.yml) published under the tagged
+# commit's short sha, so the tag must be on a main commit that has deployed.
 
 on:
   push:

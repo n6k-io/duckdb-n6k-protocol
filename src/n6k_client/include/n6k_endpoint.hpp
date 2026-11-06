@@ -23,7 +23,8 @@ struct N6kEndpoint {
 N6kEndpoint ParseN6kEndpoint(const string &url);
 
 // The path secrets are looked up by: n6k(s)://host:port[/prefix]/, with the scheme's default port filled in. No scheme
-// reads as n6k://. A browser-relative /prefix stays relative, as /prefix/.
+// reads as n6k://. A browser-relative /prefix stays relative, as /prefix/; anything else throws as ParseN6kEndpoint
+// does.
 string SecretLookupKey(const string &url);
 
 // What a secret stores for its SCOPE. DuckDB matches secrets with a plain StartsWith, so each stored prefix ends on a

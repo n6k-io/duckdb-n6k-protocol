@@ -2,7 +2,6 @@
 anything, and refuses through FT_HELLO_ERR."""
 
 import asyncio
-import concurrent.futures
 import contextlib
 import json
 import socket
@@ -13,6 +12,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional, Sequence
 
+import anyio
 import duckdb
 import pyarrow as pa
 import pytest
@@ -49,7 +49,7 @@ from virtual_catalog.provider import Provider, _catalogs, register_provider, rel
 from n6k_server import context
 from n6k_server.jsonrpc import JsonRpc, JsonRpcApp
 from n6k_server.pump import Authorized, LazyCatalog, PendingCatalog, WsReject, build_serve_sql
-from n6k_server.server_fastapi.register import register
+from n6k_server.server_fastapi.register import register, serve_ws
 
 
 def _never_connect(ws: Any, **_: Any) -> Any:
@@ -312,7 +312,24 @@ def test_a_drop_mid_authenticate_closes_con_only_after_authenticate_returns():
         host.cons[0].execute("SELECT 1")
 
 
-def test_an_authenticate_outliving_the_join_timeout_still_closes_con(monkeypatch: pytest.MonkeyPatch):
+@pytest.fixture
+def close_finished(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    finished = threading.Event()
+    close_con = pump._close_con
+
+    def traced(con: duckdb.DuckDBPyConnection, on_close: Any) -> None:
+        try:
+            close_con(con, on_close)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(pump, "_close_con", traced)
+    return finished
+
+
+def test_an_authenticate_outliving_the_join_timeout_still_closes_con(
+    monkeypatch: pytest.MonkeyPatch, close_finished: threading.Event
+):
     monkeypatch.setattr(pump, "SERVE_JOIN_TIMEOUT_S", 0.05)
 
     async def slow(con: duckdb.DuckDBPyConnection, token: str) -> list[str]:
@@ -329,40 +346,114 @@ def test_an_authenticate_outliving_the_join_timeout_still_closes_con(monkeypatch
             host.wait_for("teardown")
         assert "authenticate-done" not in host.events
         host.wait_for("authenticate-done")
-        deadline = time.monotonic() + 10
-        while True:
-            try:
+        assert close_finished.wait(10)
+        with pytest.raises(duckdb.ConnectionException):
+            host.cons[0].execute("SELECT 1")
+
+
+@pytest.mark.xfail(strict=True, reason="a refused con.close() is never retried, and the error is lost")
+def test_a_late_close_refused_by_a_running_query_still_closes_con(
+    monkeypatch: pytest.MonkeyPatch, close_finished: threading.Event
+):
+    monkeypatch.setattr(pump, "SERVE_JOIN_TIMEOUT_S", 0.05)
+    entered = threading.Event()
+    release = threading.Event()
+    queries: list[threading.Thread] = []
+
+    def block() -> int:
+        entered.set()
+        release.wait()
+        return 1
+
+    def start_query(con: duckdb.DuckDBPyConnection) -> None:
+        con.create_function("block", block, [], "BIGINT", side_effects=True)
+        query = threading.Thread(target=lambda: con.execute("SELECT block()"), daemon=True)
+        queries.append(query)
+        query.start()
+        assert entered.wait(10)
+
+    async def slow(con: duckdb.DuckDBPyConnection, token: str) -> list[str]:
+        await asyncio.sleep(0.5)
+        return _attach_db(con, token)
+
+    host = _Host(slow, on_close=start_query)
+    try:
+        with TestClient(host.app()) as client:
+            with client.websocket_connect("/ws") as ws:
+                ws.send_bytes(pack_frame({"t": FT_HELLO, "token": "x", "protocol_version": N6K_PROTOCOL_VERSION}))
+                host.wait_for("authenticate:x")
+                ws.close()
+                host.wait_for("teardown")
+            assert close_finished.wait(10)
+            release.set()
+            queries[0].join(10)
+            with pytest.raises(duckdb.ConnectionException):
                 host.cons[0].execute("SELECT 1")
-            except duckdb.ConnectionException:
-                break
-            assert time.monotonic() < deadline
-            time.sleep(0.02)
+    finally:
+        release.set()
+
+
+class _HelloSocket:
+    def __init__(self) -> None:
+        self._inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        hello = pack_frame({"t": FT_HELLO, "token": "x", "protocol_version": N6K_PROTOCOL_VERSION})
+        self._inbox.put_nowait({"type": "websocket.receive", "bytes": hello})
+        self.acked = asyncio.Event()
+
+    async def receive(self) -> dict[str, Any]:
+        return await self._inbox.get()
+
+    async def send_bytes(self, data: bytes) -> None:
+        if unpack_frame(data)[0]["t"] == FT_HELLO_ACK:
+            self.acked.set()
+
+    async def send_text(self, data: str) -> None:
+        pass
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        pass
 
 
 def test_a_serve_cancelled_mid_call_still_ends_the_call():
-    # TestClient's exit cancels the app task while CALL n6k_serve_fd is running; anyio re-cancels
-    # every await in the pump's teardown, so the host's own con.close() is all that is left.
-    closed = threading.Event()
+    # An anyio scope re-cancels every await in the pump's teardown, so the host's own con.close() is
+    # all that is left.
+    async def serve_then_cancel() -> tuple[threading.Thread, duckdb.DuckDBPyConnection]:
+        cons: list[duckdb.DuckDBPyConnection] = []
 
-    async def connect(ws: Any) -> AsyncIterator[duckdb.DuckDBPyConnection]:
-        con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-        load_n6k_server(con)
-        try:
-            yield con
-        finally:
-            con.close()
-            closed.set()
+        async def connect(ws: Any) -> AsyncIterator[duckdb.DuckDBPyConnection]:
+            con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+            load_n6k_server(con)
+            cons.append(con)
+            try:
+                yield con
+            finally:
+                # test_a_late_close_refused_by_a_running_query_still_closes_con covers a refusal.
+                with contextlib.suppress(duckdb.ResourceInUseException):
+                    con.close()
 
-    def serve() -> None:
-        app = FastAPI()
-        register(app, prefix="", connect=connect, authenticate=lambda ws, con, token: _attach_db(con, token))
-        with pytest.raises(concurrent.futures.CancelledError):
-            with TestClient(app).websocket_connect("/ws") as ws:
-                ws.send_bytes(pack_frame({"t": FT_HELLO, "token": "x", "protocol_version": N6K_PROTOCOL_VERSION}))
-                assert _recv(ws)["t"] == FT_HELLO_ACK
+        ws = _HelloSocket()
 
-    threading.Thread(target=serve, daemon=True).start()
-    assert closed.wait(15)
+        async def serve() -> None:
+            socket_like: Any = ws
+            await serve_ws(socket_like, connect, lambda ws, con, token: _attach_db(con, token), {})
+
+        earlier = set(threading.enumerate())
+        async with anyio.create_task_group() as group:
+            group.start_soon(serve)
+            with anyio.fail_after(10):
+                await ws.acked.wait()
+            calls = [t for t in threading.enumerate() if t.name == "n6k-serve" and t not in earlier]
+            assert len(calls) == 1
+            group.cancel_scope.cancel()
+        return calls[0], cons[0]
+
+    call, con = asyncio.run(serve_then_cancel())
+
+    call.join(15)
+    assert not call.is_alive()
+    with pytest.raises(duckdb.ConnectionException):
+        con.execute("SELECT 1")
+    con.close()
 
 
 class _SharedHost(_Host):

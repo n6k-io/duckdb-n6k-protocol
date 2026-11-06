@@ -1328,20 +1328,24 @@ void ServeReactor::ExpireIdle() {
 	if (options_.idle_txn_timeout_ms > 0) {
 		const auto cutoff = SteadyNowMs() - options_.idle_txn_timeout_ms;
 		// Taken out of `txns_` with `mu` held, so a request that found it first sees it closed.
-		std::vector<std::shared_ptr<PinnedTxn>> expired;
+		std::vector<std::pair<std::shared_ptr<PinnedTxn>, std::unique_lock<std::mutex>>> expired;
 		{
 			std::lock_guard<std::mutex> lk(txn_mu_);
 			for (auto it = txns_.begin(); it != txns_.end();) {
-				if (it->second->last_used_ms.load() < cutoff && it->second->mu.try_lock()) {
-					expired.push_back(std::move(it->second));
-					it = txns_.erase(it);
-				} else {
-					++it;
+				if (it->second->last_used_ms.load() < cutoff) {
+					std::unique_lock<std::mutex> held(it->second->mu, std::try_to_lock);
+					if (held.owns_lock()) {
+						expired.emplace_back(std::move(it->second), std::move(held));
+						it = txns_.erase(it);
+						continue;
+					}
 				}
+				++it;
 			}
 		}
-		for (auto &pinned : expired) {
-			std::unique_lock<std::mutex> guard(pinned->mu, std::adopt_lock);
+		for (auto &entry : expired) {
+			auto &pinned = entry.first;
+			auto guard = std::move(entry.second);
 			if (!pinned->conn) {
 				continue;
 			}
@@ -2097,6 +2101,10 @@ int64_t ServeReactor::Run() {
 					{
 						std::lock_guard<std::mutex> lk(slot->mu);
 						slot->cancel.store(true);
+						slot->client_cancelled = true;
+						if (slot->context) {
+							slot->context->Interrupt();
+						}
 					}
 					QueueParked(slot, RequestTask::Kind::CANCEL);
 				}
@@ -2282,8 +2290,17 @@ void ServeReactor::RunRequest(RequestTask &task) {
 		}
 	} catch (const std::exception &e) {
 		ErrorData err(e);
-		EndRequest(slot, PackErr(FrameTarget {task.sess.ns, task.req_id}, n6k::WireExceptionName(err.Type()),
-		                         err.RawMessage(), n6k::IsRetriableExceptionType(err.Type())));
+		bool client_cancelled;
+		{
+			std::lock_guard<std::mutex> lk(slot.mu);
+			client_cancelled = slot.client_cancelled;
+		}
+		if (client_cancelled && err.Type() == ExceptionType::INTERRUPT) {
+			EndRequest(slot, PackRespEndCancelled(FrameTarget {task.sess.ns, task.req_id}));
+		} else {
+			EndRequest(slot, PackErr(FrameTarget {task.sess.ns, task.req_id}, n6k::WireExceptionName(err.Type()),
+			                         err.RawMessage(), n6k::IsRetriableExceptionType(err.Type())));
+		}
 	}
 	// Before the request retires: an RPC stream's close runs the host generator's `finally`.
 	task.stream.reset();

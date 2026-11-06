@@ -43,4 +43,6 @@ if(NOT WIN32 AND NOT EMSCRIPTEN AND NOT WASM_LOADABLE_EXTENSIONS)
         EXTENSION_VERSION "v${N6K_VERSION}"
         LOAD_TESTS
     )
+    # Not linked into the shell otherwise; integration tests spawn it expecting these built in.
+    duckdb_extension_statically_link(n6k_client n6k_server n6k_testing)
 endif()

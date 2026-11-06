@@ -7,6 +7,7 @@
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -18,13 +19,20 @@ namespace n6k {
 
 namespace {
 
+enum class StreamFailureKind { NONE, SERVER_ERROR, SERVER_CANCELLED, ENDED_WITHOUT_RESULT, INTERRUPTED };
+
+struct StreamFailure {
+	StreamFailureKind kind = StreamFailureKind::NONE;
+	std::string err_payload;
+};
+
 struct WsStreamPrivate {
 	std::shared_ptr<RequestState> req;
+	std::shared_ptr<StreamFailure> failure;
 	std::string cur;
 	size_t cur_off = 0;
 	bool saw_chunk = false;
 	bool done = false;
-	std::string err_msg;
 	// Polled between wait slices so an idle stream tears down promptly; empty → wait for terminal.
 	std::function<bool()> should_cancel;
 };
@@ -46,7 +54,44 @@ bool WaitNextFrameUntilTerminalOrCancel(WsStreamPrivate *priv, Frame &f) {
 	}
 }
 
+[[noreturn]] void ThrowStreamFailure(const std::string &catalog, uint8_t op, const StreamFailure &failure) {
+	switch (failure.kind) {
+	case StreamFailureKind::SERVER_ERROR:
+		ThrowN6kError(catalog, op, failure.err_payload);
+	case StreamFailureKind::SERVER_CANCELLED:
+		throw IOException("n6k[%s] %s: server cancelled the request", catalog, OpName(op));
+	case StreamFailureKind::ENDED_WITHOUT_RESULT:
+		throw IOException("n6k[%s] %s: the request ended without a result", catalog, OpName(op));
+	case StreamFailureKind::INTERRUPTED:
+		throw InterruptException();
+	case StreamFailureKind::NONE:
+		break;
+	}
+	throw InternalException("n6k[%s] %s: no stream failure to throw", catalog, OpName(op));
+}
+
+// Called when no frame will come. Interrupted leaves `done` false so release still sends CANCEL.
+void RecordStreamStopped(WsStreamPrivate *priv) {
+	if (priv->req->Exhausted()) {
+		priv->done = true;
+		priv->failure->kind = StreamFailureKind::ENDED_WITHOUT_RESULT;
+	} else {
+		priv->failure->kind = StreamFailureKind::INTERRUPTED;
+	}
+}
+
+void RecordRespEnd(WsStreamPrivate *priv, const Frame &end) {
+	priv->done = true;
+	JsonDoc doc(end.payload);
+	if (doc.Parsed() && JsonGetBool(doc.Root(), "cancelled")) {
+		priv->failure->kind = StreamFailureKind::SERVER_CANCELLED;
+	}
+}
+
 bool ReplenishCreditAndAdvanceToPayload(WsStreamPrivate *priv) {
+	if (priv->done) {
+		return false;
+	}
 	if (priv->saw_chunk) {
 		priv->req->Credit(1);
 		priv->saw_chunk = false;
@@ -55,13 +100,7 @@ bool ReplenishCreditAndAdvanceToPayload(WsStreamPrivate *priv) {
 	while (true) {
 		Frame f;
 		if (!WaitNextFrameUntilTerminalOrCancel(priv, f)) {
-			// Terminal → mark done (no spurious CANCEL); client cancel leaves done=false so release sends CANCEL.
-			if (priv->req->Exhausted()) {
-				priv->done = true;
-				if (!priv->req->ErrorMessage().empty()) {
-					priv->err_msg = priv->req->ErrorMessage();
-				}
-			}
+			RecordStreamStopped(priv);
 			return false;
 		}
 		switch (f.type) {
@@ -72,11 +111,12 @@ bool ReplenishCreditAndAdvanceToPayload(WsStreamPrivate *priv) {
 			priv->saw_chunk = (f.type == FrameType::RESP_CHUNK);
 			return true;
 		case FrameType::RESP_END:
-			priv->done = true;
+			RecordRespEnd(priv, f);
 			return false;
 		case FrameType::ERR:
 			priv->done = true;
-			priv->err_msg = ParseErrFrame(f.payload).message;
+			priv->failure->kind = StreamFailureKind::SERVER_ERROR;
+			priv->failure->err_payload = std::move(f.payload);
 			return false;
 		default:
 			break;
@@ -84,12 +124,13 @@ bool ReplenishCreditAndAdvanceToPayload(WsStreamPrivate *priv) {
 	}
 }
 
+// Runs under nanoarrow's C frames, so it must not throw: it records the failure and returns an error,
+// because 0 bytes with NANOARROW_OK at a message boundary is nanoarrow's clean end of stream.
 ArrowErrorCode WsStreamRead(struct ArrowIpcInputStream *stream, uint8_t *buf, int64_t buf_size_bytes,
                             int64_t *size_read_out, struct ArrowError *error) {
-	(void)error;
 	auto *priv = static_cast<WsStreamPrivate *>(stream->private_data);
 	int64_t written = 0;
-	while (written < buf_size_bytes) {
+	while (written < buf_size_bytes && priv->failure->kind == StreamFailureKind::NONE) {
 		if (priv->cur_off >= priv->cur.size()) {
 			if (!ReplenishCreditAndAdvanceToPayload(priv)) {
 				break;
@@ -103,8 +144,9 @@ ArrowErrorCode WsStreamRead(struct ArrowIpcInputStream *stream, uint8_t *buf, in
 		written += static_cast<int64_t>(n);
 	}
 	*size_read_out = written;
-	if (written == 0 && !priv->err_msg.empty() && error != nullptr) {
-		ArrowErrorSet(error, "n6k ws stream error: %s", priv->err_msg.c_str());
+	if (priv->failure->kind != StreamFailureKind::NONE) {
+		ArrowErrorSet(error, "n6k: stream failed");
+		return EIO;
 	}
 	return NANOARROW_OK;
 }
@@ -132,12 +174,52 @@ void WsStreamReleaseAndCancelIfUnfinished(struct ArrowIpcInputStream *stream) {
 	stream->release = nullptr;
 }
 
+struct WsArrayStream {
+	ArrowArrayStream inner;
+	std::shared_ptr<StreamFailure> failure;
+	std::string catalog;
+	uint8_t op;
+};
+
+// The outer callbacks' callers are all C++, so unlike WsStreamRead they can throw, which keeps the typed exception
+// that DuckDB's arrow_scan would otherwise flatten to InvalidInputException.
+int WsArrayStreamChecked(WsArrayStream &self, int rc) {
+	if (rc != 0 && self.failure->kind != StreamFailureKind::NONE) {
+		ThrowStreamFailure(self.catalog, self.op, *self.failure);
+	}
+	return rc;
+}
+
+int WsArrayStreamGetSchema(struct ArrowArrayStream *stream, struct ArrowSchema *out) {
+	auto &self = *static_cast<WsArrayStream *>(stream->private_data);
+	return WsArrayStreamChecked(self, self.inner.get_schema(&self.inner, out));
+}
+
+int WsArrayStreamGetNext(struct ArrowArrayStream *stream, struct ArrowArray *out) {
+	auto &self = *static_cast<WsArrayStream *>(stream->private_data);
+	return WsArrayStreamChecked(self, self.inner.get_next(&self.inner, out));
+}
+
+const char *WsArrayStreamGetLastError(struct ArrowArrayStream *stream) {
+	auto &self = *static_cast<WsArrayStream *>(stream->private_data);
+	return self.inner.get_last_error(&self.inner);
+}
+
+void WsArrayStreamRelease(struct ArrowArrayStream *stream) {
+	auto *self = static_cast<WsArrayStream *>(stream->private_data);
+	self->inner.release(&self->inner);
+	delete self;
+	stream->private_data = nullptr;
+	stream->release = nullptr;
+}
+
 } // namespace
 
 void StartStreamingArrowFromRequestState(const std::string &catalog, uint8_t op, std::shared_ptr<RequestState> req,
                                          ArrowArrayStream *out, std::function<bool()> should_cancel) {
 	auto priv = std::unique_ptr<WsStreamPrivate>(new WsStreamPrivate());
 	priv->req = std::move(req);
+	priv->failure = std::make_shared<StreamFailure>();
 	priv->should_cancel = std::move(should_cancel);
 
 	// Pre-consume the first frame so an early ERR throws the typed DuckDB exception before nanoarrow flattens it to
@@ -152,27 +234,39 @@ void StartStreamingArrowFromRequestState(const std::string &catalog, uint8_t op,
 			priv->cur_off = 0;
 			priv->saw_chunk = (first.type == FrameType::RESP_CHUNK);
 		} else if (first.type == FrameType::RESP_END) {
-			priv->done = true;
+			RecordRespEnd(priv.get(), first);
 		}
 	} else {
-		priv->done = true;
-		if (!priv->req->ErrorMessage().empty()) {
-			priv->err_msg = priv->req->ErrorMessage();
-		}
+		RecordStreamStopped(priv.get());
+		priv->req->Cancel();
 	}
+	if (priv->failure->kind != StreamFailureKind::NONE) {
+		ThrowStreamFailure(catalog, op, *priv->failure);
+	}
+
+	auto array_stream = std::unique_ptr<WsArrayStream>(new WsArrayStream());
+	array_stream->failure = priv->failure;
+	array_stream->catalog = catalog;
+	array_stream->op = op;
 
 	ArrowIpcInputStream input_stream;
 	input_stream.read = WsStreamRead;
 	input_stream.release = WsStreamReleaseAndCancelIfUnfinished;
 	input_stream.private_data = priv.release();
 
-	auto rc = ArrowIpcArrayStreamReaderInit(out, &input_stream, nullptr);
+	auto rc = ArrowIpcArrayStreamReaderInit(&array_stream->inner, &input_stream, nullptr);
 	if (rc != NANOARROW_OK) {
 		if (input_stream.release) {
 			input_stream.release(&input_stream);
 		}
 		throw IOException("n6k[%s] %s: ArrowIpcArrayStreamReaderInit failed", catalog, OpName(op));
 	}
+
+	out->get_schema = WsArrayStreamGetSchema;
+	out->get_next = WsArrayStreamGetNext;
+	out->get_last_error = WsArrayStreamGetLastError;
+	out->release = WsArrayStreamRelease;
+	out->private_data = array_stream.release();
 }
 
 } // namespace n6k

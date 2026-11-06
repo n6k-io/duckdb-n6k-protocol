@@ -69,8 +69,14 @@ void RawSocketTransport::Stop() {
 	}
 }
 
+void ShutdownSocket(int fd) {
+	// One SHUT_RDWR fails on macOS once the peer has shut its write side, leaving ours open: the peer never sees EOF.
+	::shutdown(fd, SHUT_WR);
+	::shutdown(fd, SHUT_RD);
+}
+
 void RawSocketTransport::Shutdown() {
-	::shutdown(fd_, SHUT_RDWR);
+	ShutdownSocket(fd_);
 }
 
 // Wait until `fd` is ready for `events`; false once Stop fires or poll fails.
@@ -144,7 +150,7 @@ void RawSocketTransport::ReaderLoop(const MessageFn &on_message, const CloseFn &
 		return;
 	}
 	// Nothing reads this socket again: without this, a host pump on the other end never sees EOF.
-	::shutdown(fd_, SHUT_RDWR);
+	ShutdownSocket(fd_);
 	if (on_close) {
 		on_close(reason);
 	}

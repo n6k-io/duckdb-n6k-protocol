@@ -23,6 +23,8 @@ struct WsTableRow {
 	string name;
 	vector<string> verbs;
 	vector<string> primary_keys;
+	vector<string> not_null;
+	std::vector<std::vector<std::string>> unique_keys;
 };
 
 struct WsSchemaRow {
@@ -59,6 +61,7 @@ public:
 	// `txn` >= 0 lists and describes inside that server transaction.
 	virtual n6k::WsTableList ListTables(int64_t txn) = 0;
 	virtual void FetchTableSchema(const string &schema, const string &table, int64_t txn, ArrowArrayStream *out) = 0;
+	virtual bool HasFunction(const string &name, const vector<string> &args) = 0;
 	// Start any op with a pre-serialized JSON body and hand back the raw RequestState so a source can
 	// drive it frame-by-frame (TryNext / SetOnFrame / Credit). The request is already in flight on
 	// return.
@@ -78,8 +81,6 @@ public:
 		}
 		return false;
 	}
-	virtual int64_t Insert(const string &schema, const string &table, const uint8_t *data, size_t len,
-	                       const StreamCancelCheck &should_cancel) = 0;
 	virtual int64_t TxnBegin() = 0;
 	virtual void TxnEnd(int64_t txn, bool commit) = 0;
 	virtual int64_t Exec(const string &sql, const StreamCancelCheck &should_cancel) = 0;
@@ -88,10 +89,6 @@ public:
 	                       StreamCancelCheck should_cancel) = 0;
 	virtual void RpcTable(const string &function, const string &args_json, const uint8_t *data, size_t len,
 	                      ArrowArrayStream *out, StreamCancelCheck should_cancel) = 0;
-	virtual void CreateTable(const string &schema, const string &name, const string &columns_json,
-	                         const StreamCancelCheck &should_cancel) = 0;
-	virtual void AlterTable(const string &schema, const string &table, const string &kind, const string &details_json,
-	                        const StreamCancelCheck &should_cancel) = 0;
 	// An op answered by a bare RESP_END {ok}.
 	virtual void RunOp(uint8_t op, const string &body_json, const StreamCancelCheck &should_cancel) = 0;
 

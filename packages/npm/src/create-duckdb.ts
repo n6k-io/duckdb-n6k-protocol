@@ -23,23 +23,19 @@ export type CreateDuckDBOptions = {
   onInvalidated?: (catalog: string, schemas: string[]) => void;
 };
 
-// duckdb-wasm's getJsDelivrBundles() ships only mvp + eh, so its selectBundle()
-// can never return the threaded coi bundle even on a cross-origin-isolated page.
-// n6k is coi-only: the extension is built solely for shared memory (wasm_threads),
-// so eh/mvp bundles cannot load it. We re-add the coi entry so selectBundle picks
-// it when the browser supports wasm threads/SIMD + isolation; createDuckDB then
-// hard-requires it (see below). The dist base is derived from the eh URL to stay
-// version-agnostic.
-function jsDelivrBundlesWithCoi(): duckdb.DuckDBBundles {
+// duckdb-wasm's getJsDelivrBundles() ships only base, so its selectBundle() can
+// never return the threaded bundle, the only one that can load the extension
+// (npm_db_wasm in the Makefile). The dist base is derived from the base URL to
+// stay version-agnostic.
+function jsDelivrBundlesWithThreads(): duckdb.DuckDBBundles {
   const bundles = duckdb.getJsDelivrBundles();
-  const ehBase = bundles.eh?.mainModule?.replace(/duckdb-eh\.wasm$/, "");
-  if (!ehBase) return bundles;
+  const distBase = bundles.base.mainModule.replace(/duckdb-base\.wasm$/, "");
   return {
     ...bundles,
-    coi: {
-      mainModule: `${ehBase}duckdb-coi.wasm`,
-      mainWorker: `${ehBase}duckdb-browser-coi.worker.js`,
-      pthreadWorker: `${ehBase}duckdb-browser-coi.pthread.worker.js`,
+    threads: {
+      mainModule: `${distBase}duckdb-threads.wasm`,
+      mainWorker: `${distBase}duckdb-browser-threads.worker.js`,
+      pthreadWorker: `${distBase}duckdb-browser-threads.pthread.worker.js`,
     },
   };
 }
@@ -78,18 +74,16 @@ export async function createDuckDB(
   );
 
   const bundle =
-    opts.bundle ?? (await duckdb.selectBundle(jsDelivrBundlesWithCoi()));
+    opts.bundle ?? (await duckdb.selectBundle(jsDelivrBundlesWithThreads()));
   log.debug(`#${id} bundle selected (${sinceBoot()}):`, {
     mainModule: bundle.mainModule,
     mainWorker: bundle.mainWorker,
     pthreadWorker: bundle.pthreadWorker,
   });
 
-  // n6k is coi-only: the extension is built for shared memory (wasm_threads) and
-  // cannot load into a non-threaded engine. When auto-selecting, a null
-  // pthreadWorker means selectBundle fell back to eh/mvp (no wasm threads / not
-  // cross-origin isolated) — fail fast instead of loading an engine the extension
-  // can't attach to. An explicit opts.bundle is the caller's responsibility.
+  // A null pthreadWorker means selectBundle fell back to base (no wasm threads or
+  // SIMD / not cross-origin isolated), which the extension can't load into. An
+  // explicit opts.bundle is the caller's responsibility.
   if (!opts.bundle && bundle.pthreadWorker == null) {
     throw new TypeError(
       "n6k requires the threaded (coi) duckdb-wasm bundle, but selectBundle " +

@@ -18,8 +18,6 @@ SELECT * FROM n6k_catalog_query('nope', 'SELECT 1');
 nope
 
 # --- TYPE n6k secret -------------------------------------------------------
-# Credentials may be supplied via CREATE SECRET instead of an inline ATTACH
-# token. The token is redacted in duckdb_secrets().
 
 statement ok
 CREATE SECRET n6k_test (TYPE n6k, TOKEN 'supersecret', SCOPE 'n6k://localhost:8099');

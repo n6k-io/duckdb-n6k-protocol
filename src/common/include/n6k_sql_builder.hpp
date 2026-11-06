@@ -16,9 +16,7 @@ namespace n6k {
 //
 // One implementation, deliberately: a second is a place for the two to disagree, and disagreement
 // here is a security bug. The reactor (src/n6k_server/request_handlers.cpp) is the ONLY caller on
-// the serving path; the n6k_testing_build_*_sql scalars expose these to SQL so tests can assert on
-// the exact statement, and live in the unpublished n6k_testing extension so that keyhole is not
-// part of a shipped binary.
+// the serving path.
 
 // QuoteIdent lives in n6k_sql_escape.hpp, included above.
 
@@ -32,10 +30,14 @@ std::string JsonValueToSqlLiteral(duckdb_yyjson::yyjson_val *v);
 // OP_TABLE_SCHEMA: a zero-row select, executed only for its result types.
 std::string BuildTableSchemaSql(const std::string &catalog, const std::string &schema, const std::string &table);
 
-// OP_CREATE_TABLE. `columns` is an array of {"name": ..., "type": ...}; the type is a type
-// EXPRESSION, not a value, and is interpolated verbatim -- only the name is quoted.
+// OP_CREATE_TABLE. `columns` is an array of {"name": ..., "type": ..., "not_null"?: bool}; the type is a
+// type EXPRESSION, not a value, and is interpolated verbatim -- only the name is quoted.
 std::string BuildCreateTableSql(const std::string &catalog, const std::string &schema, const std::string &name,
-                                duckdb_yyjson::yyjson_val *columns);
+                                duckdb_yyjson::yyjson_val *columns, const std::vector<std::string> &primary_key = {},
+                                const std::vector<std::vector<std::string>> &unique_keys = {});
+
+// OP_CREATE_SCHEMA. `on_conflict` is whitelisted: error, ignore.
+std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &schema, const std::string &on_conflict);
 
 // OP_ALTER_TABLE. `kind` is whitelisted: add_column, drop_column, rename_column.
 std::string BuildAlterSql(const std::string &catalog, const std::string &schema, const std::string &table,

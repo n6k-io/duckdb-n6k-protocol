@@ -14,6 +14,8 @@
 namespace duckdb {
 namespace n6k {
 
+void ShutdownSocket(int fd);
+
 // An already-connected stream socket carrying n6k stream framing: [u32 BE length][u8 type][payload]
 // (Stream framing in packages/python/src/n6k_protocol/protocol.py).
 class RawSocketTransport : public Transport {

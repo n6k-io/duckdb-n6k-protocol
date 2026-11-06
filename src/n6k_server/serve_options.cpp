@@ -54,16 +54,18 @@ static int BindWorkers(const TableFunctionBindInput &input, const char *fn_name,
 }
 
 void AddServeOptionParameters(TableFunction &fn) {
-	fn.named_parameters["authenticate"] = LogicalType::VARCHAR;
-	fn.named_parameters["on_text"] = LogicalType::VARCHAR;
-	fn.named_parameters["resolve"] = LogicalType::VARCHAR;
-	fn.named_parameters["hello_pending_message"] = LogicalType::VARCHAR;
-	fn.named_parameters["hello_pending_first_ms"] = LogicalType::BIGINT;
-	fn.named_parameters["ping_interval_ms"] = LogicalType::BIGINT;
-	fn.named_parameters["open_pending_interval_ms"] = LogicalType::BIGINT;
-	fn.named_parameters["workers"] = LogicalType::BIGINT;
-	fn.named_parameters["idle_stream_timeout_ms"] = LogicalType::BIGINT;
-	fn.named_parameters["idle_txn_timeout_ms"] = LogicalType::BIGINT;
+	fn.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("authenticate", LogicalType::VARCHAR);
+		options.Add("on_text", LogicalType::VARCHAR);
+		options.Add("resolve", LogicalType::VARCHAR);
+		options.Add("hello_pending_message", LogicalType::VARCHAR);
+		options.Add("hello_pending_first_ms", LogicalType::BIGINT);
+		options.Add("ping_interval_ms", LogicalType::BIGINT);
+		options.Add("open_pending_interval_ms", LogicalType::BIGINT);
+		options.Add("workers", LogicalType::BIGINT);
+		options.Add("idle_stream_timeout_ms", LogicalType::BIGINT);
+		options.Add("idle_txn_timeout_ms", LogicalType::BIGINT);
+	});
 }
 
 ServeOptions BindServeOptions(const TableFunctionBindInput &input, const char *fn_name) {

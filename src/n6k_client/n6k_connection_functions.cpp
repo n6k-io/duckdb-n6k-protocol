@@ -69,7 +69,7 @@ static std::shared_ptr<n6k::ConnectionHub> FindOrThrow(ClientContext &context, c
 #endif
 
 unique_ptr<FunctionData> DisconnectBind(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"disconnected"};
 	return_types = {LogicalType::BOOLEAN};
 	n6k::ThrowIfServed(context, DISCONNECT_FN_NAME);
@@ -82,7 +82,7 @@ unique_ptr<FunctionData> DisconnectBind(ClientContext &context, TableFunctionBin
 void DisconnectScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<OnceState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -96,12 +96,12 @@ void DisconnectScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 #else
 	(void)context;
 #endif
-	output.SetValue(0, 0, Value::BOOLEAN(true));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
+	output.SetChildCardinality(1);
 }
 
 unique_ptr<FunctionData> ReconnectBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"capabilities"};
 	return_types = {LogicalType::LIST(LogicalType::VARCHAR)};
 	n6k::ThrowIfServed(context, RECONNECT_FN_NAME);
@@ -114,7 +114,7 @@ unique_ptr<FunctionData> ReconnectBind(ClientContext &context, TableFunctionBind
 void ReconnectScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<OnceState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -128,12 +128,12 @@ void ReconnectScan(ClientContext &context, TableFunctionInput &data_p, DataChunk
 #else
 	(void)context;
 #endif
-	output.SetValue(0, 0, Value::LIST(LogicalType::VARCHAR, std::move(capabilities)));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::LIST(LogicalType::VARCHAR, std::move(capabilities)));
+	output.SetChildCardinality(1);
 }
 
 unique_ptr<FunctionData> SendTextBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"sent"};
 	return_types = {LogicalType::BOOLEAN};
 	n6k::ThrowIfServed(context, SEND_TEXT_FN_NAME);
@@ -150,7 +150,7 @@ unique_ptr<FunctionData> SendTextBind(ClientContext &context, TableFunctionBindI
 void SendTextScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<OnceState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -163,8 +163,8 @@ void SendTextScan(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 #else
 	(void)context;
 #endif
-	output.SetValue(0, 0, Value::BOOLEAN(true));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
+	output.SetChildCardinality(1);
 }
 
 struct ConnectionsState : public GlobalTableFunctionState {
@@ -173,7 +173,7 @@ struct ConnectionsState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ConnectionsBind(ClientContext &context, TableFunctionBindInput &,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"connection_id", "alive", "capabilities", "catalogs", "leases"};
 	return_types = {LogicalType::UUID, LogicalType::BOOLEAN, LogicalType::LIST(LogicalType::VARCHAR),
 	                LogicalType::BIGINT, LogicalType::BIGINT};
@@ -208,12 +208,12 @@ void ConnectionsScan(ClientContext &, TableFunctionInput &data_p, DataChunk &out
 	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = state.rows[state.offset];
 		for (idx_t col = 0; col < row.size(); col++) {
-			output.SetValue(col, count, row[col]);
+			output.data[col].SetValue(count, row[col]);
 		}
 		state.offset++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

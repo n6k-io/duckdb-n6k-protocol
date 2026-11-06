@@ -14,6 +14,7 @@ namespace n6k {
 class ArrowIpcStreamEncoder {
 public:
 	ArrowIpcStreamEncoder(ClientContext &context, const vector<LogicalType> &types, const vector<string> &names);
+	ArrowIpcStreamEncoder(ClientContext &context, const vector<LogicalType> &types, const vector<Identifier> &names);
 	~ArrowIpcStreamEncoder();
 
 	ArrowIpcStreamEncoder(const ArrowIpcStreamEncoder &) = delete;
@@ -34,6 +35,7 @@ private:
 	vector<LogicalType> wire_types_;
 	bool needs_cast_ = false;
 	ArrowSchema schema_;
+	vector<unsafe_unique_array<char>> field_metadata_;
 	ArrowBuffer buf_;
 	ArrowIpcOutputStream out_stream_;
 	ArrowIpcWriter writer_;

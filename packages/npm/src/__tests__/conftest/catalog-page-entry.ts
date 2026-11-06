@@ -23,9 +23,9 @@ globalThis.__n6kAttachCatalog = async (catalog) => {
   await duckdb?.dispose();
   duckdb = new N6kDuckDB({
     bundle: {
-      mainModule: "/duckdb/duckdb-coi.wasm",
-      mainWorker: "/duckdb/duckdb-browser-coi.worker.js",
-      pthreadWorker: "/duckdb/duckdb-browser-coi.pthread.worker.js",
+      mainModule: "/duckdb/duckdb-threads.wasm",
+      mainWorker: "/duckdb/duckdb-browser-threads.worker.js",
+      pthreadWorker: "/duckdb/duckdb-browser-threads.pthread.worker.js",
     },
     extensionRepository: globalThis.location.origin,
     databases: {

@@ -45,7 +45,7 @@ def test_read_through_bridge():
     target = _target()
     _bridge(source, target, _select("main.t"))
 
-    assert target.sql(f"SELECT count(*) FROM {T}").fetchone() == (100,)
+    assert target.execute(f"SELECT count(*) FROM {T}").fetchone() == (100,)
 
 
 def test_non_permitted_table_blocked():
@@ -84,7 +84,7 @@ def test_readwrite_update():
     _bridge(source, target, _all_verbs("main.t"))
 
     target.sql(f"UPDATE {T} SET name = 'updated' WHERE id = 1")
-    assert source.sql("SELECT name FROM t WHERE id = 1").fetchone() == ("updated",)
+    assert source.execute("SELECT name FROM t WHERE id = 1").fetchone() == ("updated",)
 
 
 def test_readwrite_delete():
@@ -132,9 +132,9 @@ def test_live_data_visibility():
     target = _target()
     _bridge(source, target, _select("main.t"))
 
-    assert target.sql(f"SELECT count(*) FROM {T}").fetchone() == (0,)
+    assert target.execute(f"SELECT count(*) FROM {T}").fetchone() == (0,)
     source.sql("INSERT INTO t VALUES (1), (2), (3)")
-    assert target.sql(f"SELECT count(*) FROM {T}").fetchone() == (3,)
+    assert target.execute(f"SELECT count(*) FROM {T}").fetchone() == (3,)
 
 
 def test_empty_policies_raises():
@@ -147,7 +147,7 @@ def test_source_schema_lands_in_same_target_schema():
     target = _target()
     _bridge(source, target, _select("mysrc.t"))
 
-    assert target.sql('SELECT * FROM "workspace"."mysrc".t').fetchone() == (42,)
+    assert target.execute('SELECT * FROM "workspace"."mysrc".t').fetchone() == (42,)
 
 
 def test_two_source_schemas_in_one_bridge():
@@ -161,8 +161,8 @@ def test_two_source_schemas_in_one_bridge():
     target = _target()
     _bridge(source, target, _select("main.t") + _select("other.t"))
 
-    assert target.sql(f"SELECT x FROM {T}").fetchone() == (1,)
-    assert target.sql('SELECT x FROM "workspace"."other".t').fetchone() == (2,)
+    assert target.execute(f"SELECT x FROM {T}").fetchone() == (1,)
+    assert target.execute('SELECT x FROM "workspace"."other".t').fetchone() == (2,)
 
 
 def test_insert_select_roundtrip():
@@ -180,7 +180,7 @@ def test_readwrite_update_expression():
     _bridge(source, target, _all_verbs("main.t"))
 
     target.sql(f"UPDATE {T} SET counter = counter + 5 WHERE id = 1")
-    assert source.sql("SELECT counter FROM t WHERE id = 1").fetchone() == (15,)
+    assert source.execute("SELECT counter FROM t WHERE id = 1").fetchone() == (15,)
 
 
 def test_table_name_with_comma():
@@ -190,7 +190,7 @@ def test_table_name_with_comma():
     target = _target()
     _bridge(source, target, _select("main.my,table"))
 
-    assert target.sql('SELECT * FROM "workspace"."main"."my,table"').fetchone() == (1,)
+    assert target.execute('SELECT * FROM "workspace"."main"."my,table"').fetchone() == (1,)
     with pytest.raises(duckdb.CatalogException):
         target.sql('SELECT * FROM "workspace"."main".secret')
 
@@ -200,7 +200,7 @@ def test_table_name_with_colon():
     target = _target()
     _bridge(source, target, _select("main.a:b"))
 
-    assert target.sql('SELECT * FROM "workspace"."main"."a:b"').fetchone() == (42,)
+    assert target.execute('SELECT * FROM "workspace"."main"."a:b"').fetchone() == (42,)
 
 
 def test_nonexistent_source_table_rejected():
@@ -222,11 +222,11 @@ def test_unbridge_detaches_catalog():
     target.sql(f"SELECT * FROM {T}")
 
     unbridge(target, "workspace")
-    with pytest.raises(duckdb.BinderException, match='Catalog "workspace" does not exist'):
+    with pytest.raises(duckdb.CatalogException, match='schema "workspace.main" does not exist'):
         target.sql(f"SELECT * FROM {T}")
 
     _bridge(source, target, _select("main.t"))
-    assert target.sql(f"SELECT count(*) FROM {T}").fetchone() == (0,)
+    assert target.execute(f"SELECT count(*) FROM {T}").fetchone() == (0,)
 
 
 def test_create_view_over_bridge_table_works():
@@ -244,7 +244,7 @@ def test_readwrite_no_pk_refuses_keyed_writes():
     _bridge(source, target, _all_verbs("main.nopk"))
 
     target.sql('INSERT INTO "workspace"."main".nopk VALUES (2, 20)')
-    assert source.sql("SELECT count(*) FROM nopk").fetchone() == (2,)
+    assert source.execute("SELECT count(*) FROM nopk").fetchone() == (2,)
     with pytest.raises(duckdb.BinderException, match="has no key"):
         target.sql('UPDATE "workspace"."main".nopk SET y = 99 WHERE x = 1')
     with pytest.raises(duckdb.BinderException, match="has no key"):
@@ -257,7 +257,7 @@ def test_readwrite_update_manual_pk_override():
     _bridge(source, target, [Policy("main.nopk", "primary_key", ["x"]), *_all_verbs("main.nopk")])
 
     target.sql('UPDATE "workspace"."main".nopk SET y = 99 WHERE x = 1')
-    assert source.sql("SELECT y FROM nopk WHERE x = 1").fetchone() == (99,)
+    assert source.execute("SELECT y FROM nopk WHERE x = 1").fetchone() == (99,)
 
 
 def test_composite_pk_update():
@@ -269,7 +269,7 @@ def test_composite_pk_update():
     _bridge(source, target, _all_verbs("main.cpk"))
 
     target.sql('UPDATE "workspace"."main".cpk SET val = \'changed\' WHERE a = 1 AND b = 1')
-    assert source.sql("SELECT val FROM cpk WHERE a = 1 AND b = 1").fetchone() == ("changed",)
+    assert source.execute("SELECT val FROM cpk WHERE a = 1 AND b = 1").fetchone() == ("changed",)
 
 
 def test_composite_pk_delete():
@@ -292,7 +292,7 @@ def test_varchar_pk_update():
     _bridge(source, target, _all_verbs("main.vt"))
 
     target.sql('UPDATE "workspace"."main".vt SET val = 99 WHERE code = \'abc\'')
-    assert source.sql("SELECT val FROM vt WHERE code = 'abc'").fetchone() == (99,)
+    assert source.execute("SELECT val FROM vt WHERE code = 'abc'").fetchone() == (99,)
 
 
 def test_varchar_pk_delete():
@@ -326,7 +326,7 @@ def test_table_name_with_single_quote_pk_discovery():
     _bridge(source, target, _all_verbs("main.tab'le"))
 
     target.sql("""UPDATE "workspace"."main"."tab'le" SET val = 'updated' WHERE id = 1""")
-    assert source.sql("""SELECT val FROM "tab'le" WHERE id = 1""").fetchone() == ("updated",)
+    assert source.execute("""SELECT val FROM "tab'le" WHERE id = 1""").fetchone() == ("updated",)
 
 
 def test_filter_value_containing_from():
@@ -338,7 +338,7 @@ def test_filter_value_containing_from():
     _bridge(source, target, _all_verbs("main.ft"))
 
     target.sql("""UPDATE "workspace"."main".ft SET val = 99 WHERE code = 'SELECT x FROM y'""")
-    assert source.sql("SELECT val FROM ft WHERE code = 'SELECT x FROM y'").fetchone() == (99,)
+    assert source.execute("SELECT val FROM ft WHERE code = 'SELECT x FROM y'").fetchone() == (99,)
 
 
 def test_read_only_table_without_pk_is_fine():
@@ -346,7 +346,7 @@ def test_read_only_table_without_pk_is_fine():
     target = _target()
     _bridge(source, target, _select("main.nopk"))
 
-    assert target.sql('SELECT x FROM "workspace"."main".nopk').fetchone() == (1,)
+    assert target.execute('SELECT x FROM "workspace"."main".nopk').fetchone() == (1,)
 
 
 def test_readwrite_sequential_scans():
@@ -386,7 +386,7 @@ def test_drop_bridge_table_rejected():
 
     with pytest.raises(duckdb.Error):
         target.execute(f"DROP TABLE {T}")
-    assert target.sql(f"SELECT count(*) FROM {T}").fetchone() == (0,)
+    assert target.execute(f"SELECT count(*) FROM {T}").fetchone() == (0,)
 
 
 def test_alter_bridge_table_rejected():
@@ -454,14 +454,14 @@ def _bridged_struct_source():
 
 def test_struct_field_filter_still_correct():
     _source_conn, target = _bridged_struct_source()
-    assert target.sql(f"SELECT count(*) FROM {T} WHERE s.x = 3").fetchone() == (1,)
+    assert target.execute(f"SELECT count(*) FROM {T} WHERE s.x = 3").fetchone() == (1,)
 
 
 def test_pushed_filter_applies():
     _source_conn, target = _bridged_struct_source()
-    assert target.sql(f"SELECT count(*) FROM {T} WHERE i = 3").fetchone() == (1,)
-    assert target.sql(f"SELECT count(*) FROM {T} WHERE i >= 7").fetchone() == (3,)
-    assert target.sql(f"SELECT count(*) FROM {T}").fetchone() == (10,)
+    assert target.execute(f"SELECT count(*) FROM {T} WHERE i = 3").fetchone() == (1,)
+    assert target.execute(f"SELECT count(*) FROM {T} WHERE i >= 7").fetchone() == (3,)
+    assert target.execute(f"SELECT count(*) FROM {T}").fetchone() == (10,)
 
 
 # ---------------------------------------------------------------------------
@@ -565,14 +565,15 @@ def test_txn_constraint_error_aborts_transaction():
     _both(body)
 
 
-def test_txn_binder_error_does_not_abort_transaction():
+def test_txn_binder_error_aborts_transaction():
     def body(a, _b, table):
         a.execute("BEGIN")
         with pytest.raises(duckdb.BinderException):
             a.execute(f"SELECT no_such_column FROM {table}")
-        a.execute(f"INSERT INTO {table} VALUES (3, 'c')")
-        a.execute("COMMIT")
-        assert _rows(a, table) == [(1, "a"), (2, "b"), (3, "c")]
+        with pytest.raises(duckdb.TransactionException, match="aborted"):
+            a.execute(f"INSERT INTO {table} VALUES (3, 'c')")
+        a.execute("ROLLBACK")
+        assert _rows(a, table) == [(1, "a"), (2, "b")]
 
     _both(body)
 
@@ -617,8 +618,8 @@ def test_single_writer_two_sources_rejected():
         target.execute('UPDATE "src_b"."main"."t" SET v = \'x\' WHERE id = 1')
     target.execute("ROLLBACK")
 
-    assert source_a.sql("SELECT v FROM t WHERE id = 1").fetchone() == ("a",)
-    assert source_b.sql("SELECT v FROM t WHERE id = 1").fetchone() == ("a",)
+    assert source_a.execute("SELECT v FROM t WHERE id = 1").fetchone() == ("a",)
+    assert source_b.execute("SELECT v FROM t WHERE id = 1").fetchone() == ("a",)
 
 
 def test_single_writer_target_then_source_rejected():
@@ -629,20 +630,20 @@ def test_single_writer_target_then_source_rejected():
         target.execute('UPDATE "src_a"."main"."t" SET v = \'x\' WHERE id = 1')
     target.execute("ROLLBACK")
 
-    assert source_a.sql("SELECT v FROM t WHERE id = 1").fetchone() == ("a",)
-    assert target.sql("SELECT count(*) FROM memory.main.nat_t").fetchone() == (0,)
+    assert source_a.execute("SELECT v FROM t WHERE id = 1").fetchone() == ("a",)
+    assert target.execute("SELECT count(*) FROM memory.main.nat_t").fetchone() == (0,)
 
 
 def test_single_writer_readers_are_unrestricted():
     (source_a, _source_b), target = _two_source_target()
     target.execute("BEGIN")
-    assert target.sql('SELECT count(*) FROM "src_a"."main"."t"').fetchone() == (1,)
-    assert target.sql('SELECT count(*) FROM "src_b"."main"."t"').fetchone() == (1,)
-    assert target.sql("SELECT count(*) FROM memory.main.nat_t").fetchone() == (0,)
+    assert target.execute('SELECT count(*) FROM "src_a"."main"."t"').fetchone() == (1,)
+    assert target.execute('SELECT count(*) FROM "src_b"."main"."t"').fetchone() == (1,)
+    assert target.execute("SELECT count(*) FROM memory.main.nat_t").fetchone() == (0,)
     target.execute('UPDATE "src_a"."main"."t" SET v = \'x\' WHERE id = 1')
     target.execute("COMMIT")
 
-    assert source_a.sql("SELECT v FROM t WHERE id = 1").fetchone() == ("x",)
+    assert source_a.execute("SELECT v FROM t WHERE id = 1").fetchone() == ("x",)
 
 
 # ---------------------------------------------------------------------------
@@ -667,9 +668,9 @@ def _same_instance_fixture():
 
 def test_same_instance_read_and_write():
     conn = _same_instance_fixture()
-    assert conn.sql(f"SELECT count(*) FROM {SAME_INST_BRIDGED}").fetchone() == (2,)
+    assert conn.execute(f"SELECT count(*) FROM {SAME_INST_BRIDGED}").fetchone() == (2,)
     conn.execute(f"UPDATE {SAME_INST_BRIDGED} SET v = 'z' WHERE id = 1")
-    assert conn.sql("SELECT v FROM memory.main.src_t WHERE id = 1").fetchone() == ("z",)
+    assert conn.execute("SELECT v FROM memory.main.src_t WHERE id = 1").fetchone() == ("z",)
 
 
 @pytest.mark.xfail(strict=True, reason=SEPARATE_TXN)
@@ -677,8 +678,8 @@ def test_txn_source_write_visible_through_bridge():
     conn = _same_instance_fixture()
     conn.execute("BEGIN")
     conn.execute("INSERT INTO memory.main.src_t VALUES (3, 'c')")
-    assert conn.sql("SELECT count(*) FROM memory.main.src_t").fetchone() == (3,)
-    assert conn.sql(f"SELECT count(*) FROM {SAME_INST_BRIDGED}").fetchone() == (3,)
+    assert conn.execute("SELECT count(*) FROM memory.main.src_t").fetchone() == (3,)
+    assert conn.execute(f"SELECT count(*) FROM {SAME_INST_BRIDGED}").fetchone() == (3,)
     conn.execute("ROLLBACK")
 
 
@@ -687,7 +688,7 @@ def test_txn_bridge_write_visible_to_source_read():
     conn = _same_instance_fixture()
     conn.execute("BEGIN")
     conn.execute(f"INSERT INTO {SAME_INST_BRIDGED} VALUES (3, 'c')")
-    assert conn.sql("SELECT count(*) FROM memory.main.src_t").fetchone() == (3,)
+    assert conn.execute("SELECT count(*) FROM memory.main.src_t").fetchone() == (3,)
     conn.execute("ROLLBACK")
 
 
@@ -813,7 +814,7 @@ def test_context_finalized_after_bridge():
     bridge_id = _bridge(source, target, [Policy("main.t", "select", "tenant_id = $tenant")], context={"tenant": 42})
 
     with pytest.raises(duckdb.Error, match="is finalized"):
-        source.sql("SELECT vcatbridge_set_context($1, 'tenant', 7)", params=[bridge_id]).fetchone()
+        source.execute("SELECT vcatbridge_set_context($1, 'tenant', 7)", [bridge_id]).fetchone()
 
 
 def test_context_none_value_rejected():

@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "n6k-duckdb[duckdb,test-server,mcp]",
     # Must match the built C++ extension's DuckDB version.
-    "duckdb==1.5.6",
+    "duckdb==2.0.0",
 ]
 
 [tool.uv.sources]

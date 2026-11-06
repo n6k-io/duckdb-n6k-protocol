@@ -77,7 +77,7 @@ static string RpcValueToJSON(const Value &val) {
 }
 
 static std::shared_ptr<CatalogSession> GetCatalogSession(ClientContext &context, const string &db_name) {
-	auto &catalog = Catalog::GetCatalog(context, db_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(db_name));
 	return catalog.Cast<N6kCatalog>().session;
 }
 
@@ -93,17 +93,18 @@ static string RpcArgsJson(const vector<Value> &inputs, idx_t first) {
 	return args_json;
 }
 
-static unique_ptr<FunctionData> ScanDataOverStream(ClientContext &context, unique_ptr<N6kStreamData> stream_data,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
-	auto result = make_uniq<N6kScanFunctionData>(reinterpret_cast<stream_factory_produce_t>(N6kProduceStream),
-	                                             std::move(stream_data));
+static unique_ptr<FunctionData> ScanDataOverStream(ClientContext &context, shared_ptr<N6kStreamData> stream_data,
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto result = make_uniq<N6kScanFunctionData>(std::move(stream_data));
 	auto *schema_ptr = result->owned_stream_data.get();
 	if (schema_ptr->stream.get_schema(&schema_ptr->stream, &result->schema_root.arrow_schema) != 0) {
 		const char *err = schema_ptr->stream.get_last_error(&schema_ptr->stream);
 		throw IOException("n6k: failed to read result schema: %s", err ? err : "unknown error");
 	}
 	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, result->schema_root.arrow_schema);
-	names = result->arrow_table.GetNames();
+	for (auto &column_name : result->arrow_table.GetNames()) {
+		names.emplace_back(column_name);
+	}
 	return_types = result->arrow_table.GetTypes();
 	result->all_types = return_types;
 	return std::move(result);
@@ -111,21 +112,21 @@ static unique_ptr<FunctionData> ScanDataOverStream(ClientContext &context, uniqu
 
 static unique_ptr<FunctionData> BindRpcScalar(ClientContext &context, CatalogSession &session,
                                               const string &function_name, const string &args_json,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
-	auto stream_data = make_uniq<N6kStreamData>();
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto stream_data = make_shared_ptr<N6kStreamData>();
 	session.RpcScalar(function_name, args_json, &stream_data->stream, [&context]() { return context.IsInterrupted(); });
 	return ScanDataOverStream(context, std::move(stream_data), return_types, names);
 }
 
 static unique_ptr<FunctionData> BindQuery(ClientContext &context, CatalogSession &session, const string &sql,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
-	auto stream_data = make_uniq<N6kStreamData>();
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto stream_data = make_shared_ptr<N6kStreamData>();
 	session.Query(sql, &stream_data->stream, [&context]() { return context.IsInterrupted(); });
 	return ScanDataOverStream(context, std::move(stream_data), return_types, names);
 }
 
 static unique_ptr<FunctionData> N6kRpcBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto function_name = input.inputs[1].GetValue<string>();
 	auto session = GetCatalogSession(context, db_name);
@@ -159,6 +160,12 @@ struct N6kRpcArrowLocalState : public LocalTableFunctionState {
 	vector<unique_ptr<DataChunk>> buffered_chunks;
 	bool sent = false;
 	ArrowArrayStream response_stream;
+
+	~N6kRpcArrowLocalState() override {
+		if (response_stream.release) {
+			response_stream.release(&response_stream);
+		}
+	}
 };
 
 struct N6kRpcArrowGlobalState : public GlobalTableFunctionState {
@@ -168,7 +175,7 @@ struct N6kRpcArrowGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> N6kRpcArrowBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto fn_name = input.inputs[1].GetValue<string>();
 	auto session = GetCatalogSession(context, db_name);
@@ -177,7 +184,9 @@ static unique_ptr<FunctionData> N6kRpcArrowBind(ClientContext &context, TableFun
 	bind_data->function_name = fn_name;
 	bind_data->session = session;
 	bind_data->input_types = input.input_table_types;
-	bind_data->input_names = input.input_table_names;
+	for (auto &input_name : input.input_table_names) {
+		bind_data->input_names.push_back(input_name.GetIdentifierName());
+	}
 
 	for (idx_t i = 3; i < input.inputs.size(); i++) {
 		bind_data->scalar_parts.push_back(RpcValueToJSON(input.inputs[i]));
@@ -195,7 +204,7 @@ static unique_ptr<FunctionData> N6kRpcArrowBind(ClientContext &context, TableFun
 	vector<unique_ptr<DataChunk>> no_chunks;
 	SerializeChunksToArrowIPC(context, bind_data->input_types, bind_data->input_names, no_chunks, &probe_buf);
 
-	auto stream_data = make_uniq<N6kStreamData>();
+	auto stream_data = make_shared_ptr<N6kStreamData>();
 	session->RpcTable(fn_name, probe_args, static_cast<const uint8_t *>(probe_buf.data),
 	                  static_cast<size_t>(probe_buf.size_bytes), &stream_data->stream,
 	                  [&context]() { return context.IsInterrupted(); });
@@ -213,8 +222,7 @@ static unique_ptr<FunctionData> N6kRpcArrowBind(ClientContext &context, TableFun
 		names.push_back(response_schema.children[i]->name);
 	}
 
-	auto scan_data = make_uniq<N6kScanFunctionData>(reinterpret_cast<stream_factory_produce_t>(N6kProduceStream),
-	                                                std::move(stream_data));
+	auto scan_data = make_uniq<N6kScanFunctionData>(std::move(stream_data));
 	ArrowTableFunction::PopulateArrowTableSchema(context, scan_data->arrow_table, response_schema);
 	return_types = scan_data->arrow_table.GetTypes();
 
@@ -281,7 +289,12 @@ static OperatorFinalizeResultType N6kRpcArrowFinal(ExecutionContext &context, Ta
 
 	ArrowArray batch;
 	batch.release = nullptr;
-	if (lstate.response_stream.get_next(&lstate.response_stream, &batch) != 0 || batch.release == nullptr) {
+	if (lstate.response_stream.get_next(&lstate.response_stream, &batch) != 0) {
+		const char *err = lstate.response_stream.get_last_error(&lstate.response_stream);
+		throw IOException("n6k_catalog_rpc_table: failed to read response for %s: %s", bind_data.function_name,
+		                  err ? err : "unknown error");
+	}
+	if (batch.release == nullptr) {
 		if (lstate.response_stream.release) {
 			lstate.response_stream.release(&lstate.response_stream);
 			lstate.response_stream.release = nullptr;
@@ -300,14 +313,14 @@ static OperatorFinalizeResultType N6kRpcArrowFinal(ExecutionContext &context, Ta
 	ArrowArrayViewSetArray(&array_view, &batch, nullptr);
 
 	auto row_count = MinValue<idx_t>((idx_t)batch.length, STANDARD_VECTOR_SIZE);
-	output.SetCardinality(row_count);
+	output.SetChildCardinality(row_count);
 
 	for (idx_t col = 0; col < output.ColumnCount() && col < (idx_t)response_schema.n_children; col++) {
 		auto &out_vec = output.data[col];
 		auto *child_view = array_view.children[col];
 
 		if (out_vec.GetType().InternalType() == PhysicalType::VARCHAR) {
-			auto result_data = FlatVector::GetData<string_t>(out_vec);
+			auto result_data = FlatVector::GetDataMutable<string_t>(out_vec);
 			for (idx_t row = 0; row < row_count; row++) {
 				if (ArrowArrayViewIsNull(child_view, static_cast<int64_t>(row))) {
 					FlatVector::SetNull(out_vec, row, true);
@@ -320,7 +333,7 @@ static OperatorFinalizeResultType N6kRpcArrowFinal(ExecutionContext &context, Ta
 			auto type_size = GetTypeIdSize(out_vec.GetType().InternalType());
 			auto *src = static_cast<const uint8_t *>(child_view->buffer_views[1].data.data);
 			if (src) {
-				memcpy(FlatVector::GetData(out_vec), src, row_count * type_size);
+				memcpy(FlatVector::GetDataMutable(out_vec), src, row_count * type_size);
 			}
 			for (idx_t row = 0; row < row_count; row++) {
 				if (ArrowArrayViewIsNull(child_view, static_cast<int64_t>(row))) {
@@ -352,7 +365,7 @@ struct CatalogRpcInfo : public TableFunctionInfo {
 };
 
 static unique_ptr<FunctionData> CatalogRpcBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<CatalogRpcInfo>();
 	// `session` is never null here: this bind only runs for a name looked up inside an ATTACHed
 	// catalog, GetCatalogSession throws rather than returning null, and N6kCatalog is built from a
@@ -361,7 +374,7 @@ static unique_ptr<FunctionData> CatalogRpcBind(ClientContext &context, TableFunc
 }
 
 static unique_ptr<FunctionData> CatalogNamedRpcBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<CatalogRpcInfo>();
 	if (input.inputs.empty()) {
 		throw BinderException("rpc() requires at least a function name argument");
@@ -390,7 +403,7 @@ struct N6kExecGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> N6kExecBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto sql = input.inputs[1].GetValue<string>();
 	auto session = GetCatalogSession(context, db_name);
@@ -414,17 +427,17 @@ static void N6kExecScan(ClientContext &context, TableFunctionInput &data_p, Data
 	}
 	gstate.done = true;
 	auto &bind_data = data_p.bind_data->Cast<N6kExecBindData>();
-	output.SetCardinality(1);
-	output.SetValue(0, 0, Value::BIGINT(bind_data.affected_count));
+	output.SetChildCardinality(1);
+	output.data[0].SetValue(0, Value::BIGINT(bind_data.affected_count));
 }
 
 // drop cached schema metadata; work at bind time, reuses N6kExecBindData/N6kExecScan for the count
 static unique_ptr<FunctionData> N6kInvalidateCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto schemas_csv = input.inputs[1].GetValue<string>();
 
-	auto &catalog = Catalog::GetCatalog(context, db_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(db_name));
 	auto &n6k_catalog = catalog.Cast<N6kCatalog>();
 
 	vector<string> schemas;
@@ -444,7 +457,7 @@ static unique_ptr<FunctionData> N6kInvalidateCacheBind(ClientContext &context, T
 }
 
 static unique_ptr<FunctionData> N6kQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto sql = input.inputs[1].GetValue<string>();
 	auto session = GetCatalogSession(context, db_name);
@@ -458,7 +471,7 @@ struct CatalogSessionInfo : public TableFunctionInfo {
 };
 
 static unique_ptr<FunctionData> CatalogExecBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<CatalogSessionInfo>();
 	if (input.inputs.empty()) {
 		throw BinderException("exec() requires a SQL statement argument");
@@ -474,7 +487,7 @@ static unique_ptr<FunctionData> CatalogExecBind(ClientContext &context, TableFun
 }
 
 static unique_ptr<FunctionData> CatalogQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<CatalogSessionInfo>();
 	if (input.inputs.empty()) {
 		throw BinderException("query() requires a SQL statement argument");
@@ -486,7 +499,7 @@ static unique_ptr<FunctionData> CatalogQueryBind(ClientContext &context, TableFu
 TableFunction MakeN6kCatalogExecFunction(std::shared_ptr<CatalogSession> session) {
 	auto info = make_shared_ptr<CatalogSessionInfo>(std::move(session));
 	TableFunction tf("exec", {}, N6kExecScan, CatalogExecBind, N6kExecInitGlobal);
-	tf.varargs = LogicalType::ANY;
+	tf.GetSignature().AddArgs("args", LogicalType::ANY);
 	tf.function_info = std::move(info);
 	return tf;
 }
@@ -495,7 +508,7 @@ TableFunction MakeN6kCatalogQueryFunction(std::shared_ptr<CatalogSession> sessio
 	auto info = make_shared_ptr<CatalogSessionInfo>(std::move(session));
 	TableFunction tf("query", {}, ArrowTableFunction::ArrowScanFunction, CatalogQueryBind,
 	                 ArrowTableFunction::ArrowScanInitGlobal, ArrowTableFunction::ArrowScanInitLocal);
-	tf.varargs = LogicalType::ANY;
+	tf.GetSignature().AddArgs("args", LogicalType::ANY);
 	// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 	tf.function_info = std::move(info);
 	return tf;
@@ -511,9 +524,9 @@ TableFunction MakeN6kCatalogRpcFunction(const string &function_name, std::shared
 		bind_func = CatalogRpcBind;
 	}
 
-	TableFunction tf(function_name, {}, ArrowTableFunction::ArrowScanFunction, bind_func,
+	TableFunction tf(Identifier(function_name), {}, ArrowTableFunction::ArrowScanFunction, bind_func,
 	                 ArrowTableFunction::ArrowScanInitGlobal, ArrowTableFunction::ArrowScanInitLocal);
-	tf.varargs = LogicalType::ANY;
+	tf.GetSignature().AddArgs("args", LogicalType::ANY);
 	// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 	tf.function_info = std::move(rpc_info);
 	return tf;
@@ -523,14 +536,14 @@ void RegisterN6kRpc(ExtensionLoader &loader) {
 	TableFunction rpc_func("n6k_catalog_rpc", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       ArrowTableFunction::ArrowScanFunction, N6kRpcBind, ArrowTableFunction::ArrowScanInitGlobal,
 	                       ArrowTableFunction::ArrowScanInitLocal);
-	rpc_func.varargs = LogicalType::ANY;
+	rpc_func.GetSignature().AddArgs("args", LogicalType::ANY);
 	// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 	loader.RegisterFunction(rpc_func);
 
 	TableFunction rpc_table_func("n6k_catalog_rpc_table",
 	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TABLE}, nullptr,
 	                             N6kRpcArrowBind, N6kRpcArrowInitGlobal, N6kRpcArrowInitLocal);
-	rpc_table_func.varargs = LogicalType::ANY;
+	rpc_table_func.GetSignature().AddArgs("args", LogicalType::ANY);
 	rpc_table_func.in_out_function = N6kRpcArrowInOut;
 	rpc_table_func.in_out_function_final = N6kRpcArrowFinal;
 	loader.RegisterFunction(rpc_table_func);

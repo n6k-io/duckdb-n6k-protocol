@@ -33,7 +33,6 @@ export async function wsCloseAll(): Promise<void> {
   await fetch(`${SERVER}/debug/ws/close_all`, { method: "POST" });
 }
 
-// Run DDL server-side; the remote CREATE TABLE path drops constraints like PRIMARY KEY.
 export async function serverExec(sql: string, catalog = "db"): Promise<void> {
   const url = `${SERVER}/debug/server_exec?catalog=${catalog}&sql=${encodeURIComponent(sql)}`;
   const r = await fetch(url, { method: "POST" });
