@@ -395,7 +395,7 @@ static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::
 	const auto batch_rows = RequestedBatchRows(root);
 	auto scope = ConnectionFor(reactor, *own, sess, root, slot);
 	auto &conn = *scope.conn;
-	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, {}, PlanCatalogCheck(reactor, slot));
+	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, PlanCatalogCheck(reactor, slot));
 	auto statement = make_uniq<RelationStatement>(rel);
 	auto result = scope.pinned ? conn.Query(std::move(statement)) : conn.Submit(std::move(statement));
 	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(own), target, batch_rows));
@@ -836,7 +836,7 @@ static void HandleWritePlan(ServeReactor &reactor, Connection &own, const Sessio
 		seam = conn.TableFunction(N6K_INSERT_SCAN_FN, {Value::POINTER(reinterpret_cast<uintptr_t>(&bytes))})
 		           ->GetTableRef();
 	} else if (!plan.empty()) {
-		seam = DecodeSubstraitJson(conn, catalog, plan, {}, PlanCatalogCheck(reactor, slot))->GetTableRef();
+		seam = DecodeSubstraitJson(conn, catalog, plan, PlanCatalogCheck(reactor, slot))->GetTableRef();
 	} else {
 		throw InvalidInputException("n6k_server: OP_WRITE_PLAN carries neither rows nor a plan");
 	}

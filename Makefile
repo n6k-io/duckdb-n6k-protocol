@@ -61,7 +61,7 @@ cpp-test:
 	@test -f build/release/CMakeCache.txt || { echo "ERROR: build/release is not configured; run 'make release' once"; exit 1; }
 	@mkdir -p $(CPP_TEST_LOGS)
 	@echo "cpp-test: building (log: $(CPP_TEST_BUILD_LOG))"
-	@{ cmake --build build/release -j$(CPP_TEST_JOBS) --target n6k_client_extension n6k_server_extension duckdb_static core_functions_extension \
+	@{ cmake --build build/release -j$(CPP_TEST_JOBS) --target n6k_client_extension n6k_server_extension n6k_testing_extension duckdb_static core_functions_extension \
 		&& cmake -S test/cpp -B build/cpp-test -DCMAKE_BUILD_TYPE=Release -DDUCKDB_SOURCE_DIR=$(PROJ_DIR)duckdb -DDUCKDB_BUILD_DIR=$(PROJ_DIR)build/release \
 		&& cmake --build build/cpp-test -j$(CPP_TEST_JOBS); } > $(CPP_TEST_BUILD_LOG) 2>&1 \
 		|| { grep -E 'error:|Undefined symbols|duplicate symbol|CMake Error' $(CPP_TEST_BUILD_LOG) | head -40; echo "cpp-test: build failed, full log: $(CPP_TEST_BUILD_LOG)"; exit 1; }

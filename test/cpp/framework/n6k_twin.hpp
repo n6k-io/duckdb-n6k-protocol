@@ -6,6 +6,7 @@
 #include "n6k_server_extension.hpp"
 #include "n6k_stream_framing.hpp"
 #include "n6k_table_function.hpp"
+#include "n6k_testing_extension.hpp"
 #include "ws_json.hpp"
 #include "ws_transport_raw.hpp"
 
@@ -207,6 +208,13 @@ public:
 
 	void NearIgnoringError(const std::string &sql) {
 		con->Query(sql);
+	}
+
+	std::string NearError(const std::string &sql) {
+		INFO(sql);
+		auto result = con->Query(sql);
+		REQUIRE(result->HasError());
+		return result->GetError();
 	}
 
 	void NearInterrupted(const std::string &sql, const std::function<bool()> &started,
@@ -471,6 +479,8 @@ public:
 	    : far(nullptr), far_con(far), catalogs(std::move(catalogs_p)) {
 		ExtensionLoader far_loader(*far.instance, "n6k_server");
 		N6kServerLoadInternal(far_loader);
+		ExtensionLoader testing_loader(*far.instance, "n6k_testing");
+		N6kTestingLoadInternal(testing_loader);
 		for (auto &catalog : catalogs) {
 			TwinRun(far_con, "ATTACH ':memory:' AS " + catalog);
 		}
@@ -522,6 +532,9 @@ public:
 	}
 	void NearIgnoringError(const std::string &sql) {
 		First().NearIgnoringError(sql);
+	}
+	std::string NearError(const std::string &sql) {
+		return First().NearError(sql);
 	}
 	void NearInterrupted(const std::string &sql) {
 		First().NearInterrupted(

@@ -312,7 +312,24 @@ def test_a_drop_mid_authenticate_closes_con_only_after_authenticate_returns():
         host.cons[0].execute("SELECT 1")
 
 
-def test_an_authenticate_outliving_the_join_timeout_still_closes_con(monkeypatch: pytest.MonkeyPatch):
+@pytest.fixture
+def close_finished(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    finished = threading.Event()
+    close_con = pump._close_con
+
+    def traced(con: duckdb.DuckDBPyConnection, on_close: Any) -> None:
+        try:
+            close_con(con, on_close)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(pump, "_close_con", traced)
+    return finished
+
+
+def test_an_authenticate_outliving_the_join_timeout_still_closes_con(
+    monkeypatch: pytest.MonkeyPatch, close_finished: threading.Event
+):
     monkeypatch.setattr(pump, "SERVE_JOIN_TIMEOUT_S", 0.05)
 
     async def slow(con: duckdb.DuckDBPyConnection, token: str) -> list[str]:
@@ -329,16 +346,51 @@ def test_an_authenticate_outliving_the_join_timeout_still_closes_con(monkeypatch
             host.wait_for("teardown")
         assert "authenticate-done" not in host.events
         host.wait_for("authenticate-done")
-        deadline = time.monotonic() + 10
-        while True:
-            try:
+        assert close_finished.wait(10)
+        with pytest.raises(duckdb.ConnectionException):
+            host.cons[0].execute("SELECT 1")
+
+
+@pytest.mark.xfail(strict=True, reason="a refused con.close() is never retried, and the error is lost")
+def test_a_late_close_refused_by_a_running_query_still_closes_con(
+    monkeypatch: pytest.MonkeyPatch, close_finished: threading.Event
+):
+    monkeypatch.setattr(pump, "SERVE_JOIN_TIMEOUT_S", 0.05)
+    entered = threading.Event()
+    release = threading.Event()
+    queries: list[threading.Thread] = []
+
+    def block() -> int:
+        entered.set()
+        release.wait()
+        return 1
+
+    def start_query(con: duckdb.DuckDBPyConnection) -> None:
+        con.create_function("block", block, [], "BIGINT", side_effects=True)
+        query = threading.Thread(target=lambda: con.execute("SELECT block()"), daemon=True)
+        queries.append(query)
+        query.start()
+        assert entered.wait(10)
+
+    async def slow(con: duckdb.DuckDBPyConnection, token: str) -> list[str]:
+        await asyncio.sleep(0.5)
+        return _attach_db(con, token)
+
+    host = _Host(slow, on_close=start_query)
+    try:
+        with TestClient(host.app()) as client:
+            with client.websocket_connect("/ws") as ws:
+                ws.send_bytes(pack_frame({"t": FT_HELLO, "token": "x", "protocol_version": N6K_PROTOCOL_VERSION}))
+                host.wait_for("authenticate:x")
+                ws.close()
+                host.wait_for("teardown")
+            assert close_finished.wait(10)
+            release.set()
+            queries[0].join(10)
+            with pytest.raises(duckdb.ConnectionException):
                 host.cons[0].execute("SELECT 1")
-            except duckdb.ConnectionException:
-                break
-            except duckdb.ResourceInUseException:
-                pass
-            assert time.monotonic() < deadline
-            time.sleep(0.02)
+    finally:
+        release.set()
 
 
 def test_a_serve_cancelled_mid_call_still_ends_the_call():

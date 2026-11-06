@@ -27,6 +27,7 @@ crossing_substrait_includes(CROSSING_INCLUDES)
 set(N6K_ARCHIVES
     ${DUCKDB_BUILD_DIR}/extension/n6k_client/libn6k_client_extension.a
     ${DUCKDB_BUILD_DIR}/extension/n6k_server/libn6k_server_extension.a
+    ${DUCKDB_BUILD_DIR}/extension/n6k_testing/libn6k_testing_extension.a
     ${DUCKDB_BUILD_DIR}/extension/core_functions/libcore_functions_extension.a
     ${DUCKDB_BUILD_DIR}/src/main/http/libduckdb_httplib.a
     ${DUCKDB_BUILD_DIR}/third_party/utf8proc/libduckdb_utf8proc.a
@@ -71,6 +72,7 @@ target_include_directories(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
           ${N6K_ROOT}/src/n6k_client/include
           ${N6K_ROOT}/src/n6k_server/include
+          ${N6K_ROOT}/src/n6k_testing/include
           ${N6K_ROOT}/third_party/ixwebsockets
           ${CROSSING_INCLUDES}
           ${DUCKDB_SOURCE_DIR}/src/include
