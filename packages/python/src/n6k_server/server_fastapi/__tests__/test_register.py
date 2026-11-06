@@ -335,6 +335,8 @@ def test_an_authenticate_outliving_the_join_timeout_still_closes_con(monkeypatch
                 host.cons[0].execute("SELECT 1")
             except duckdb.ConnectionException:
                 break
+            except duckdb.ResourceInUseException:
+                pass
             assert time.monotonic() < deadline
             time.sleep(0.02)
 

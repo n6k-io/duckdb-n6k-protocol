@@ -112,6 +112,33 @@ jobs:
       extension_name: n6k_client
       format_checks: 'format;tidy'
 
+  cpp-test:
+    name: C++ tests
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache libssl-dev
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: cpp-test-ccache-${{ github.sha }}
+          restore-keys: cpp-test-ccache-
+      - name: Build
+        run: GEN=ninja make release
+      - name: Test
+        run: make cpp-test
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-test-logs
+          path: build/test-logs/
+
   duckdb-stable-deploy:
     name: Deploy n6k extensions (${{ matrix.duckdb_arch }})
     needs: duckdb-stable-build

@@ -65,6 +65,7 @@ DRAIN_TIMEOUT_S = 5.0
 # `LiveServe.paused`: how long cancelled requests get to unwind, and how often the drain is polled.
 PAUSE_CANCEL_TIMEOUT_S = 5.0
 PAUSE_POLL_S = 0.02
+CLOSE_RETRY_S = 0.05
 
 _T = TypeVar("_T")
 
@@ -914,6 +915,31 @@ class _ServedText:
         await self._handle._call(lambda cur, session_id, _name: _close(cur, session_id, code, reason[:123]), "")
 
 
+class _UdfRelay:
+    """What the catalog holds instead of `_Callbacks`. `gc` cannot collect a cycle through a registered UDF,
+    so one reaching `con` keeps its database in memory until exit; `_Callbacks.close` cuts this link."""
+
+    def __init__(self, callbacks: "_Callbacks") -> None:
+        self.callbacks: Optional[_Callbacks] = callbacks
+
+    def authenticate(self, session_id: uuid.UUID, token: str, capabilities: list[str], request: Optional[str]) -> str:
+        callbacks = self.callbacks
+        if callbacks is None:
+            return json.dumps({"reject": "the connection closed", "code": 1000})
+        return callbacks._authenticate_udf(session_id, token, capabilities, request)
+
+    def on_text(self, session_id: uuid.UUID, text: str) -> None:
+        callbacks = self.callbacks
+        if callbacks is not None:
+            callbacks._on_text_udf(session_id, text)
+
+    def resolve(self, session_id: uuid.UUID, name: str) -> Optional[str]:
+        callbacks = self.callbacks
+        if callbacks is None:
+            return "the connection closed"
+        return callbacks._resolve_udf(session_id, name)
+
+
 class _Callbacks:
     """The UDFs `n6k_serve_fd` calls back, each run on this loop. They run on the extension's threads, so
     each blocks only that thread: `authenticate` on a thread of its own, `on_text` on the reactor's text
@@ -941,6 +967,7 @@ class _Callbacks:
         self._on_serve = on_serve
         self._resolve = resolve
         self._closing = False
+        self._relay = _UdfRelay(self)
         self._resolving: set[Future[Optional[str]]] = set()
         self.settlers: list[asyncio.Task[None]] = []
         self.cursors: list[duckdb.DuckDBPyConnection] = []
@@ -954,7 +981,7 @@ class _Callbacks:
         special = FunctionNullHandling.SPECIAL
         self._con.create_function(
             self.authenticate_udf,
-            self._authenticate_udf,
+            self._relay.authenticate,
             [_UUID, _VARCHAR, _VARCHAR_LIST, _VARCHAR],
             _VARCHAR,
             null_handling=special,
@@ -963,7 +990,7 @@ class _Callbacks:
         if self.on_text_udf is not None:
             self._con.create_function(
                 self.on_text_udf,
-                self._on_text_udf,
+                self._relay.on_text,
                 [_UUID, _VARCHAR],
                 _VARCHAR,
                 null_handling=special,
@@ -972,7 +999,7 @@ class _Callbacks:
         if self.resolve_udf is not None:
             self._con.create_function(
                 self.resolve_udf,
-                self._resolve_udf,
+                self._relay.resolve,
                 [_UUID, _VARCHAR],
                 _VARCHAR,
                 null_handling=special,
@@ -981,6 +1008,7 @@ class _Callbacks:
 
     def close(self) -> list["asyncio.Task[None]"]:
         self._closing = True
+        self._relay.callbacks = None
         for future in list(self._resolving):
             future.cancel()
         return self.settlers
@@ -1136,7 +1164,20 @@ def _close_con(con: duckdb.DuckDBPyConnection, on_close: Optional[OnClose]) -> N
             on_close(con)
         except Exception:  # noqa: BLE001 - the connection is closed regardless
             logger.exception("on_close failed")
-    con.close()
+    try:
+        con.close()
+    except duckdb.ResourceInUseException:
+        threading.Thread(target=_close_when_free, args=(con,), name="n6k-close", daemon=True).start()
+
+
+def _close_when_free(con: duckdb.DuckDBPyConnection) -> None:
+    while True:
+        time.sleep(CLOSE_RETRY_S)
+        try:
+            con.close()
+            return
+        except duckdb.ResourceInUseException:
+            pass
 
 
 def _close_cursors(cursors: Sequence[duckdb.DuckDBPyConnection]) -> None:

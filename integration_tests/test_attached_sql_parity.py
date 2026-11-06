@@ -61,12 +61,15 @@ class Server:
             total = total * 60 + float(part)
         return total
 
-    def wait_idle(self, timeout: float) -> bool:
+    def cpu_rate(self) -> float:
+        before = self.cpu_seconds()
+        time.sleep(1)
+        return self.cpu_seconds() - before
+
+    def wait_idle(self, baseline: float, timeout: float) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            before = self.cpu_seconds()
-            time.sleep(1)
-            if self.cpu_seconds() - before < 0.2:
+            if self.cpu_rate() < baseline + 0.2:
                 return True
         return False
 
@@ -356,10 +359,11 @@ def test_stale_client_gets_an_error_after_another_client_changes_columns(serve, 
 )
 def test_cancel_stops_the_query_on_the_server(serve, seed: str, statement: str) -> None:
     server = serve(seed)
+    baseline = server.cpu_rate()
 
     interrupted(server.client(), statement)
 
-    assert server.wait_idle(timeout=15)
+    assert server.wait_idle(baseline, timeout=15)
 
 
 @pytest.mark.parametrize(
@@ -371,10 +375,11 @@ def test_cancel_stops_the_query_on_the_server(serve, seed: str, statement: str) 
 )
 def test_cancelled_write_does_not_commit(serve, seed: str, statement: str) -> None:
     server = serve(f"CREATE TABLE out(c BIGINT); {seed}")
+    baseline = server.cpu_rate()
 
     interrupted(server.client(), statement)
 
-    assert server.wait_idle(timeout=120)
+    assert server.wait_idle(baseline, timeout=120)
     assert server.client().execute("SELECT * FROM db.main.out").fetchall() == []
 
 
