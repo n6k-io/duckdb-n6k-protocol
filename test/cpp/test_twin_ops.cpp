@@ -1,5 +1,7 @@
 #include "framework/n6k_twin.hpp"
 
+#include "duckdb/common/string_util.hpp"
+
 #include <string>
 #include <vector>
 
@@ -24,6 +26,56 @@ void SeedMacros(N6kTwin &twin) {
 }
 
 } // namespace
+
+TEST_CASE("a query that fails after its schema raises the server's error", "[twin][ops]") {
+	const std::string big = "SELECT i, CASE WHEN i < 5000000 THEN i %s END AS x FROM range(10000000) t(i)";
+	const auto query = [](const std::string &sql) {
+		return "SELECT * FROM n6k_catalog_query('db', '" + StringUtil::Replace(sql, "'", "''") + "')";
+	};
+	const auto count = [](const std::string &sql) {
+		return "SELECT count(*) FROM n6k_catalog_query('db', '" + StringUtil::Replace(sql, "'", "''") + "')";
+	};
+
+	SECTION("before any row") {
+		N6kTwin twin;
+		twin.Attach();
+		twin.NearFails(query("SELECT error('boom') FROM range(1)"), ExceptionType::INVALID_INPUT, "n6k[db] QUERY:");
+		twin.NearFails(query("SELECT error('boom') FROM range(1)"), ExceptionType::INVALID_INPUT, "boom");
+		REQUIRE(twin.Rows(query("SELECT 1")) == RowList {"1"});
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("after some rows") {
+		N6kTwin twin;
+		twin.Attach();
+		twin.NearFails(count(StringUtil::Replace(big, "%s", "ELSE error('boom')")), ExceptionType::INVALID_INPUT,
+		               "boom");
+		REQUIRE(twin.Rows(query("SELECT 1")) == RowList {"1"});
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("a local file system the server has disabled") {
+		N6kTwin twin;
+		twin.Far("SET extension_directory = '/nonexistent/n6k_test_extensions'");
+		twin.Far("SET disabled_filesystems = 'LocalFileSystem'");
+		twin.Attach();
+		twin.NearFails(query("SELECT count(*) FROM duckdb_extensions()"), ExceptionType::PERMISSION, "LocalFileSystem");
+		REQUIRE(twin.Rows(query("SELECT 1")) == RowList {"1"});
+		for (const std::string sql : {"LOAD inet", "INSTALL inet"}) {
+			twin.NearFails(query(sql), ExceptionType::PERMISSION, "n6k[db] QUERY:");
+			REQUIRE(twin.Rows(query("SELECT 1")) == RowList {"1"});
+		}
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("a query that does not fail keeps every row") {
+		N6kTwin twin;
+		twin.Attach();
+		REQUIRE(twin.Rows(count(StringUtil::Replace(big, "%s", "ELSE 0"))) == RowList {"10000000"});
+		REQUIRE(twin.Rows(query("SET VARIABLE n6k_twin_ops = 1")).empty());
+		REQUIRE(twin.ServeError().empty());
+	}
+}
 
 TEST_CASE("server errors arrive typed with the catalog and op", "[twin][ops]") {
 	SECTION("exec, query and local binding") {

@@ -11,6 +11,19 @@ using RowList = std::vector<std::string>;
 
 } // namespace
 
+TEST_CASE("a created schema reaches the server and accepts tables", "[twin][ddl]") {
+	N6kTwin twin;
+	twin.Attach();
+
+	twin.Near("CREATE SCHEMA db.s1");
+	REQUIRE(twin.FarRows("SELECT schema_name FROM duckdb_schemas() WHERE schema_name = 's1'") == RowList {"s1"});
+
+	twin.Near("CREATE TABLE db.s1.x (i INT)");
+	REQUIRE(twin.FarRows("SELECT table_name FROM duckdb_tables() WHERE schema_name = 's1'") == RowList {"x"});
+
+	REQUIRE(twin.ServeError().empty());
+}
+
 TEST_CASE("table and view DDL work under an alias", "[twin][ddl]") {
 	SECTION("alter renders each kind and refuses the rest") {
 		N6kTwin twin;

@@ -58,6 +58,17 @@ backendDescribe()(`error typing [${backendName}]`, () => {
     expect(msg).toContain("bogus_col_xyz");
   });
 
+  test("streaming QUERY error after the schema surfaces typed", async () => {
+    const msg = await queryError(
+      handle,
+      `SELECT * FROM n6k_catalog_query('db', 'SELECT error(''boom'') FROM range(1)')`,
+    );
+    expect(msg).toContain("Invalid Input Error");
+    expect(msg).toContain("n6k[db]");
+    expect(msg).toContain("QUERY");
+    expect(msg).toContain("boom");
+  });
+
   test("streaming QUERY against a missing table → Catalog Error", async () => {
     const msg = await queryError(
       handle,

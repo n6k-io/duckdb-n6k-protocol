@@ -573,6 +573,15 @@ public:
 		Rows("ATTACH \'\' AS " + alias + " (TYPE n6k, CONNECTION \'" + connection_id + "\')");
 	}
 
+	void Fails(const std::string &sql, ExceptionType type, const std::string &message) {
+		INFO(sql);
+		auto result = con.Query(sql);
+		REQUIRE(result->HasError());
+		INFO(result->GetError());
+		REQUIRE(result->GetErrorType() == type);
+		REQUIRE(result->GetError().find(message) != std::string::npos);
+	}
+
 private:
 	DuckDB db {nullptr};
 	Connection con {db};

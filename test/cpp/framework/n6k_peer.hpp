@@ -104,6 +104,12 @@ inline std::string PackPush(int64_t ns, const SchemaWriter &schemas) {
 	return std::string(sbuf.data(), sbuf.size());
 }
 
+struct PeerRequest {
+	int64_t ns;
+	uint32_t id;
+	uint8_t op;
+};
+
 class ScriptedPeer {
 public:
 	ScriptedPeer() {
@@ -149,6 +155,16 @@ public:
 		if (::write(peer_fd, bytes.data(), bytes.size()) != static_cast<ssize_t>(bytes.size())) {
 			throw std::runtime_error("short write");
 		}
+	}
+
+	// Runs on the reader thread. Requests are otherwise ignored.
+	void OnRequest(std::function<void(const PeerRequest &)> handler) {
+		std::lock_guard<std::mutex> lk(lock);
+		on_request = std::move(handler);
+	}
+
+	void Hangup() {
+		::shutdown(peer_fd, SHUT_RDWR);
 	}
 
 	bool RoundTrip() {
@@ -207,6 +223,17 @@ private:
 				Send(PackOpenAck(ns));
 			} else if (type == static_cast<int64_t>(n6k::FrameType::PONG)) {
 				last_pong.store(n6k::GetInt(message, "id", -1));
+			} else if (type == static_cast<int64_t>(n6k::FrameType::REQ)) {
+				std::function<void(const PeerRequest &)> handler;
+				{
+					std::lock_guard<std::mutex> lk(lock);
+					handler = on_request;
+				}
+				if (handler) {
+					handler(PeerRequest {n6k::GetInt(message, "ns", 0),
+					                     static_cast<uint32_t>(n6k::GetInt(message, "id", 0)),
+					                     static_cast<uint8_t>(n6k::GetInt(message, "op", 0))});
+				}
 			}
 		}
 		eof.store(true);
@@ -218,6 +245,7 @@ private:
 	std::mutex lock;
 	std::mutex write_lock;
 	std::string token;
+	std::function<void(const PeerRequest &)> on_request;
 	std::atomic<int64_t> open_ns {0};
 	std::atomic<int64_t> last_pong {-1};
 	std::atomic<int64_t> next_ping {1000};

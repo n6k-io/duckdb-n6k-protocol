@@ -221,6 +221,8 @@ private:
 class ConnectionRegistry : public ObjectCacheEntry {
 public:
 	static shared_ptr<ConnectionRegistry> Get(DatabaseInstance &db);
+	// The hubs log through the database's LogManager, which dies right after this: their threads must be done first.
+	~ConnectionRegistry() override;
 
 	static string ObjectType() {
 		return "n6k_connections";

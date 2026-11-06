@@ -26,13 +26,49 @@ namespace n6k {
 
 static constexpr std::chrono::milliseconds ABORT_POLL {250};
 
+// Per thread, not per hub: every vsock hub shares one I/O thread.
+static thread_local bool on_hub_owned_thread = false;
+
+namespace {
+
+class HubOwnedThreadScope {
+public:
+	HubOwnedThreadScope() : previous_(on_hub_owned_thread) {
+		on_hub_owned_thread = true;
+	}
+	~HubOwnedThreadScope() {
+		on_hub_owned_thread = previous_;
+	}
+	HubOwnedThreadScope(const HubOwnedThreadScope &) = delete;
+	HubOwnedThreadScope &operator=(const HubOwnedThreadScope &) = delete;
+
+private:
+	bool previous_;
+};
+
+// ~ConnectionHub waits for the transport's callback thread and the writer, so it cannot run on either.
+void DeleteHub(ConnectionHub *hub) {
+	if (!on_hub_owned_thread) {
+		delete hub;
+		return;
+	}
+	try {
+		std::thread([hub]() { delete hub; }).detach();
+	} catch (const std::exception &e) {
+		// Leaked: deleting it here is the self-wait this function exists to avoid.
+		hub->LogError(e);
+	}
+}
+
+} // namespace
+
 std::shared_ptr<ConnectionHub> ConnectionHub::Create(const shared_ptr<DatabaseInstance> &db, Options opts) {
 	return Create(db, std::move(opts), UUID::GenerateRandomUUID());
 }
 
 std::shared_ptr<ConnectionHub> ConnectionHub::Create(const shared_ptr<DatabaseInstance> &db, Options opts,
                                                      const hugeint_t &id) {
-	std::shared_ptr<ConnectionHub> hub(new ConnectionHub(db, std::move(opts), id));
+	std::shared_ptr<ConnectionHub> hub(new ConnectionHub(db, std::move(opts), id), DeleteHub);
 	hub->self_ = hub;
 	return hub;
 }
@@ -77,6 +113,7 @@ void ConnectionHub::Enqueue(uint64_t generation, bool binary, std::string bytes)
 }
 
 void ConnectionHub::WriterLoop() {
+	HubOwnedThreadScope scope;
 	for (;;) {
 		Outbound out;
 		{
@@ -222,6 +259,7 @@ void ConnectionHub::EnsureConnected(const AbortCheck &should_abort) {
 		auto *raw_transport = transport.get();
 		transport->Start(
 		    [this, gen, raw_transport](const std::string &bytes, bool binary) {
+			    HubOwnedThreadScope scope;
 			    // On the native transports, a throw escaping this callback aborts the host process.
 			    try {
 				    OnMessage(gen, bytes, binary);
@@ -231,7 +269,14 @@ void ConnectionHub::EnsureConnected(const AbortCheck &should_abort) {
 				    OnBadFrame(gen, *raw_transport, "unknown error");
 			    }
 		    },
-		    [this, gen](const std::string &reason) { OnTransportClose(gen, reason); }, [this, gen]() { OnOpen(gen); });
+		    [this, gen](const std::string &reason) {
+			    HubOwnedThreadScope scope;
+			    OnTransportClose(gen, reason);
+		    },
+		    [this, gen]() {
+			    HubOwnedThreadScope scope;
+			    OnOpen(gen);
+		    });
 		// Published only once started, so Disconnect never stops a transport before its Start.
 		{
 			std::lock_guard<std::mutex> lk(mu_);
@@ -733,6 +778,20 @@ void ConnectionHub::HostWorkerLoop(std::shared_ptr<HostQueue> queue, const std::
 			DUCKDB_LOG_WARNING(*database, "%s", ErrorData(e).Message());
 		} catch (...) {
 			DUCKDB_LOG_WARNING(*database, "n6k: host callback failed with an unknown error");
+		}
+	}
+}
+
+ConnectionRegistry::~ConnectionRegistry() {
+	// Disconnect stops the transport, which cannot run on the transport's own callback thread.
+	if (on_hub_owned_thread) {
+		return;
+	}
+	for (auto &entry : hubs_) {
+		try {
+			entry.second.hub->Disconnect("database closed");
+		} catch (const std::exception &e) {
+			entry.second.hub->LogError(e);
 		}
 	}
 }

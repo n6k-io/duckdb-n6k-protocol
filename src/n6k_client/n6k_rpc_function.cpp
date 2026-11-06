@@ -160,6 +160,12 @@ struct N6kRpcArrowLocalState : public LocalTableFunctionState {
 	vector<unique_ptr<DataChunk>> buffered_chunks;
 	bool sent = false;
 	ArrowArrayStream response_stream;
+
+	~N6kRpcArrowLocalState() override {
+		if (response_stream.release) {
+			response_stream.release(&response_stream);
+		}
+	}
 };
 
 struct N6kRpcArrowGlobalState : public GlobalTableFunctionState {
@@ -283,7 +289,12 @@ static OperatorFinalizeResultType N6kRpcArrowFinal(ExecutionContext &context, Ta
 
 	ArrowArray batch;
 	batch.release = nullptr;
-	if (lstate.response_stream.get_next(&lstate.response_stream, &batch) != 0 || batch.release == nullptr) {
+	if (lstate.response_stream.get_next(&lstate.response_stream, &batch) != 0) {
+		const char *err = lstate.response_stream.get_last_error(&lstate.response_stream);
+		throw IOException("n6k_catalog_rpc_table: failed to read response for %s: %s", bind_data.function_name,
+		                  err ? err : "unknown error");
+	}
+	if (batch.release == nullptr) {
 		if (lstate.response_stream.release) {
 			lstate.response_stream.release(&lstate.response_stream);
 			lstate.response_stream.release = nullptr;

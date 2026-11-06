@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <sys/socket.h>
@@ -269,4 +270,50 @@ TEST_CASE("one hub routes each frame by ns, answers PING and closes sessions in 
 	REQUIRE(r.ping_answered);
 	REQUIRE(r.close_waits);
 	REQUIRE(r.close_sends_cancel);
+}
+
+TEST_CASE("a hub released last by its own reader thread shuts down", "[hub]") {
+	int sv[2] = {-1, -1};
+	REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	const int client_fd = sv[0];
+	const int peer_fd = sv[1];
+
+	std::atomic<bool> destroyed {false};
+	struct OnDestroy {
+		explicit OnDestroy(std::atomic<bool> &flag_p) : flag(flag_p) {
+		}
+		~OnDestroy() {
+			flag.store(true);
+		}
+		std::atomic<bool> &flag;
+	};
+	auto marker = std::make_shared<OnDestroy>(destroyed);
+
+	n6k::ConnectionHub::Options opts;
+	opts.dial = [client_fd, marker]() {
+		return std::unique_ptr<n6k::Transport>(new n6k::RawSocketTransport(client_fd));
+	};
+	opts.endpoint = "test socket";
+	marker.reset();
+	auto hub = n6k::ConnectionHub::Create(nullptr, std::move(opts));
+	WriteFramed(peer_fd, PackHelloAck());
+	hub->EnsureConnected(nullptr);
+
+	Gate gate;
+	const uint32_t req_id = hub->BindRequest([hub, &gate](const std::string &, bool) { gate.EnterAndWait(); }, nullptr);
+	WriteFramed(peer_fd, MakeFrame(0, T_RESP_CHUNK, req_id));
+	REQUIRE(gate.AwaitEntered());
+
+	hub->UnbindRequest(req_id);
+	hub.reset();
+	gate.Release();
+
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!destroyed.load() && std::chrono::steady_clock::now() < deadline) {
+		::usleep(2000);
+	}
+	REQUIRE(destroyed.load());
+
+	::close(peer_fd);
+	::close(client_fd);
 }
