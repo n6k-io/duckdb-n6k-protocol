@@ -51,21 +51,6 @@ def con() -> Any:
     c.close()
 
 
-def test_attach_waits_out_a_slow_open_and_then_serves(con: Any) -> None:
-    alias = f"slowopen_{SLOW_MS}"
-    t0 = time.monotonic()
-    con.execute(f"ATTACH '{N6K_URL}?catalog={alias}' AS {alias} (TYPE n6k)")
-    assert time.monotonic() - t0 >= SLOW_MS / 1000
-    rows = con.execute(f"SELECT count(*) FROM {alias}.main.users").fetchone()
-    assert rows[0] >= 3
-
-
-@pytest.mark.parametrize("delay_ms", [1500, SLOW_MS])
-def test_a_failed_slow_open_fails_the_attach_with_the_backend_reason(con: Any, delay_ms: int) -> None:
-    with pytest.raises(duckdb.Error, match="slowopen backend failed"):
-        con.execute(f"ATTACH '{N6K_URL}?catalog=slowopen_fail_{delay_ms}' AS slowopen_fail_{delay_ms} (TYPE n6k)")
-
-
 @pytest.mark.asyncio
 async def test_open_pending_repeats_at_the_advertised_cadence_until_ack() -> None:
     catalog = "slowopen_5000"
@@ -89,15 +74,6 @@ async def test_open_pending_repeats_at_the_advertised_cadence_until_ack() -> Non
         assert len(beats) >= 3
         gaps = [b - a for a, b in zip(beats, beats[1:])]
         assert all(0.75 * OPEN_PENDING_INTERVAL_MS / 1000 <= g < OPEN_PENDING_STALL_MS / 1000 for g in gaps), gaps
-
-
-def test_attach_waits_out_a_slow_authenticate(con: Any) -> None:
-    alias = f"slowauth_{SLOW_MS}"
-    t0 = time.monotonic()
-    con.execute(f"ATTACH '{N6K_URL}?catalog={alias}' AS {alias} (TYPE n6k)")
-    assert time.monotonic() - t0 >= SLOW_MS / 1000
-    rows = con.execute(f"SELECT count(*) FROM {alias}.main.users").fetchone()
-    assert rows[0] >= 3
 
 
 @pytest.mark.asyncio

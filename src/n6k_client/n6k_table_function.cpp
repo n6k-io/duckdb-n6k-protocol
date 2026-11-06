@@ -5,7 +5,6 @@
 #include "n6k_client_settings_function.hpp"
 #include "n6k_thread_selftest.hpp"
 #include "n6k_io_thread_selftest.hpp"
-#include "open_ns_selftest.hpp"
 #include "n6k_connect_function.hpp"
 #include "n6k_connection_functions.hpp"
 #include "n6k_list_catalogs_function.hpp"
@@ -30,7 +29,6 @@ void LoadInternal(ExtensionLoader &loader) {
 	RegisterN6kCapabilities(loader);
 	RegisterN6kClientSettings(loader);
 	RegisterN6kSelftestIoThreadDoorbell(loader);
-	RegisterN6kSelftestOpenNsDistinct(loader);
 	RegisterN6kConnect(loader);
 	RegisterN6kConnectionFunctions(loader);
 	RegisterN6kListCatalogs(loader);

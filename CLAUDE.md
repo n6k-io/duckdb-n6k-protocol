@@ -29,7 +29,7 @@ cd packages/python && uv run mypy . --strict
 ## Tests (use uv, no sandbox)
 ```
 uv run pytest packages/python
-uv run pytest integration_tests/        # requires the test server running on :8099
+uv run pytest integration_tests/        # most files require the test server running on :8099
 ```
 
 ## Bun tests (packages/npm) — NO SANDBOX
