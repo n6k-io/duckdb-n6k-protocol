@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <fcntl.h>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -144,7 +145,7 @@ public:
 	TwinClient(const TwinClient &) = delete;
 	TwinClient &operator=(const TwinClient &) = delete;
 
-	std::string Connect() {
+	int OpenLink(bool nonblocking = false) {
 		links.push_back(make_uniq<TwinLink>());
 		auto &link = *links.back();
 		if (::socketpair(AF_UNIX, SOCK_STREAM, 0, link.near_pair) != 0 ||
@@ -153,7 +154,13 @@ public:
 		}
 		SetNoSigPipe(link.near_pair[1]);
 		SetNoSigPipe(link.far_pair[0]);
-		link.to_far = std::thread([this, &link] { Pump(link.near_pair[1], link.far_pair[0], true); });
+		if (nonblocking) {
+			::fcntl(link.near_pair[0], F_SETFL, ::fcntl(link.near_pair[0], F_GETFL) | O_NONBLOCK);
+		}
+		link.to_far = std::thread([this, &link] {
+			Pump(link.near_pair[1], link.far_pair[0], true);
+			link.near_gone.store(true);
+		});
 		link.to_near = std::thread([this, &link] { Pump(link.far_pair[0], link.near_pair[1], false); });
 
 		auto session = TwinRun(far_con, "SELECT session_id FROM n6k_serve_create_session(" +
@@ -173,9 +180,53 @@ public:
 			}
 		});
 
-		auto connected = TwinRun(*con, "SELECT connection_id FROM n6k_connect(wsFd => " +
-		                                   std::to_string(link.near_pair[0]) + ", token => '')");
+		return link.near_pair[0];
+	}
+
+	std::string Connect() {
+		return ConnectFd(OpenLink());
+	}
+
+	std::string ConnectFd(int fd) {
+		auto connected =
+		    TwinRun(*con, "SELECT connection_id FROM n6k_connect(wsFd => " + std::to_string(fd) + ", token => '')");
 		return connected->Collection().GetValue(0, 0).ToString();
+	}
+
+	void CloseHostFd() {
+		auto &link = *links.back();
+		::close(link.near_pair[0]);
+		link.near_pair[0] = -1;
+	}
+
+	void DropSocket() {
+		n6k::ShutdownSocket(links.back()->near_pair[1]);
+	}
+
+	bool AwaitHostEof() const {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!links.back()->near_gone.load() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		return links.back()->near_gone.load();
+	}
+
+	void CloseDatabase() {
+		con.reset();
+		near_db.reset();
+	}
+
+	std::vector<int64_t> SentNs(n6k::FrameType type) {
+		std::lock_guard<std::mutex> lk(lock);
+		std::vector<int64_t> values;
+		for (auto &frame : sent) {
+			size_t offset = 0;
+			auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
+			if (n6k::GetInt(handle.get(), "t", -1) == static_cast<int64_t>(type)) {
+				values.push_back(n6k::GetInt(handle.get(), "ns", 0));
+			}
+		}
+		return values;
 	}
 
 	void AttachAs(const std::string &alias, const std::string &catalog, const std::string &connection_id) {
@@ -457,6 +508,7 @@ private:
 		std::thread to_near;
 		std::thread serve;
 		unique_ptr<Connection> serve_con;
+		std::atomic<bool> near_gone {false};
 	};
 
 	DuckDB &far;
@@ -471,6 +523,30 @@ private:
 	std::mutex lock;
 	std::vector<std::string> sent;
 	std::string serve_error;
+};
+
+class TwinNear {
+public:
+	TwinNear() {
+		ExtensionLoader loader(*db.instance, "n6k_client");
+		LoadInternal(loader);
+	}
+
+	std::vector<std::string> Rows(const std::string &sql) {
+		return TwinRows(con, sql);
+	}
+
+	std::string Connect(int fd, const std::string &args = ", token => \'\'") {
+		return Rows("SELECT connection_id FROM n6k_connect(wsFd => " + std::to_string(fd) + args + ")").at(0);
+	}
+
+	void Attach(const std::string &alias, const std::string &connection_id) {
+		Rows("ATTACH \'\' AS " + alias + " (TYPE n6k, CONNECTION \'" + connection_id + "\')");
+	}
+
+private:
+	DuckDB db {nullptr};
+	Connection con {db};
 };
 
 class N6kTwin {
@@ -519,6 +595,11 @@ public:
 
 	void Attach() {
 		Client();
+	}
+
+	TwinClient &BareClient() {
+		clients.push_back(make_uniq<TwinClient>(far, far_con, catalogs));
+		return *clients.back();
 	}
 
 	unique_ptr<QueryResult> Near(const std::string &sql) {
