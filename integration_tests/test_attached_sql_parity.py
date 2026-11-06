@@ -7,6 +7,7 @@ Each test starts its own `n6k_serve_http`, so clients share one catalog.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import subprocess
@@ -170,6 +171,33 @@ def test_create_table_primary_key_allows_keyed_writes(serve, statement: str, exp
     assert con.execute("SELECT * FROM db.main.k ORDER BY id").fetchall() == expected
 
 
+def test_create_table_unique_is_enforced(serve) -> None:
+    con = serve().client()
+    con.execute("CREATE TABLE db.main.k(id INTEGER, u INTEGER UNIQUE)")
+    con.execute("INSERT INTO db.main.k VALUES (1, 10)")
+
+    with pytest.raises(duckdb.ConstraintException):
+        con.execute("INSERT INTO db.main.k VALUES (2, 10)")
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "v INTEGER DEFAULT 7",
+        "v INTEGER CHECK (v > 0)",
+        "v INTEGER GENERATED ALWAYS AS (1)",
+    ],
+)
+def test_create_table_with_what_the_wire_cannot_carry_is_rejected(serve, column: str) -> None:
+    server = serve()
+
+    with pytest.raises(duckdb.BinderException, match="not supported"):
+        server.client().execute(f"CREATE TABLE db.main.k(id INTEGER, {column})")
+
+    with pytest.raises(duckdb.CatalogException):
+        server.client().execute("SELECT * FROM db.main.k")
+
+
 def test_alter_add_column_with_default_is_rejected(serve) -> None:
     server = serve("CREATE TABLE a(id INTEGER); INSERT INTO a VALUES (1);")
     con = server.client()
@@ -199,6 +227,41 @@ def test_rollback_undoes_create_table(serve) -> None:
         con.execute("SELECT * FROM db.main.r")
     with pytest.raises(duckdb.CatalogException):
         server.client().execute("SELECT * FROM db.main.r")
+
+
+def test_rollback_undoes_alter_table(serve) -> None:
+    server = serve("CREATE TABLE a(id INTEGER); INSERT INTO a VALUES (1);")
+    con = server.client()
+    con.execute("BEGIN")
+    con.execute("ALTER TABLE db.main.a ADD COLUMN d INTEGER")
+    assert con.execute("SELECT * FROM db.main.a").fetchall() == [(1, None)]
+    assert server.client().execute("SELECT * FROM db.main.a").fetchall() == [(1,)]
+    con.execute("ROLLBACK")
+
+    assert con.execute("SELECT * FROM db.main.a").fetchall() == [(1,)]
+    assert server.client().execute("SELECT * FROM db.main.a").fetchall() == [(1,)]
+
+
+def test_commit_keeps_create_table_as(serve) -> None:
+    server = serve()
+    con = server.client()
+    con.execute("BEGIN")
+    con.execute("CREATE TABLE db.main.c AS SELECT 1 AS id")
+    assert con.execute("SELECT * FROM db.main.c").fetchall() == [(1,)]
+    con.execute("COMMIT")
+
+    assert server.client().execute("SELECT * FROM db.main.c").fetchall() == [(1,)]
+
+
+def test_rollback_undoes_create_table_as(serve) -> None:
+    server = serve()
+    con = server.client()
+    con.execute("BEGIN")
+    con.execute("CREATE TABLE db.main.c AS SELECT 1 AS id")
+    con.execute("ROLLBACK")
+
+    with pytest.raises(duckdb.CatalogException):
+        server.client().execute("SELECT * FROM db.main.c")
 
 
 def test_create_table_is_hidden_from_other_clients_until_commit(serve) -> None:
@@ -312,4 +375,17 @@ def test_cancelled_write_does_not_commit(serve, seed: str, statement: str) -> No
     interrupted(server.client(), statement)
 
     assert server.wait_idle(timeout=120)
+    assert server.client().execute("SELECT * FROM db.main.out").fetchall() == []
+
+
+@pytest.mark.parametrize("ending", ["ROLLBACK", "COMMIT"])
+def test_cancelled_write_in_a_transaction_leaves_no_row(serve, ending: str) -> None:
+    server = serve(f"CREATE TABLE out(c BIGINT); CREATE VIEW slow AS {SLOW_COUNT};")
+    con = server.client()
+    con.execute("BEGIN")
+
+    interrupted(con, "INSERT INTO db.main.out SELECT c FROM db.main.slow")
+    with contextlib.suppress(duckdb.Error):
+        con.execute(ending)
+
     assert server.client().execute("SELECT * FROM db.main.out").fetchall() == []

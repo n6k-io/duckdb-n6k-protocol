@@ -6,6 +6,17 @@ A client function the server lacks now runs on the client instead of failing or 
 that name. This adds the `HAS_FUNCTION` op and the `has_function` capability; against a server without them, named
 function calls run on the client, with the same results but slower.
 
+`CREATE TABLE` on an attached database now keeps `PRIMARY KEY`, `UNIQUE` and `NOT NULL`, and `DESCRIBE` shows them.
+`CREATE TABLE`, `CREATE TABLE AS` and `ALTER TABLE` now join the open transaction, so `ROLLBACK` undoes them and other
+clients do not see them before `COMMIT`. This adds the `table_ddl` capability; against a server without it, a
+`CREATE TABLE` with constraints or table DDL in a transaction fails with `BinderException`.
+
+`CREATE TABLE` with a default, `CHECK`, foreign key or generated column, and `ALTER TABLE ADD COLUMN` with a default,
+now fail with `BinderException` on an attached database. These were previously accepted and silently dropped.
+
+Interrupting a query or write on an attached database now stops it on the server, and an interrupted write does not
+commit.
+
 ## v0.2.0
 
 Persistent `n6k` and `n6k_refresh` secrets created by earlier builds with a `SCOPE` no longer

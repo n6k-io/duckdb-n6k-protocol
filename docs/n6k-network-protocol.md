@@ -158,6 +158,13 @@ advisory, but honouring it is what makes the flow-control tests meaningful.
 table rename, defaults, constraints) are rejected client-side with
 `BinderException` before the RPC is sent.
 
+`CREATE_TABLE` `columns` entries are `{name, type, not_null?}`. Optional `primary_key` (string[]) and `unique_keys`
+(string[][]) declare table constraints. Other constraints, defaults and generated columns are rejected client-side with
+`BinderException`.
+
+`CREATE_TABLE` and `ALTER_TABLE` take an optional `txn` and run in that transaction. The fields in this section other
+than `columns`' `name` and `type` need the `table_ddl` capability.
+
 ## Capabilities
 
 Additive protocol changes do not bump `protocol_version`; they are negotiated
@@ -178,6 +185,7 @@ missing capability is fatal. Each name is defined at exactly one level.
 | `mcp` | connect | Text frames carry an MCP session (implies `jsonrpc`). |
 | `catalog_plans` | open | A `READ_PLAN`, `WRITE_PLAN` or `CREATE_VIEW` plan may name a table `[catalog, schema, table]`, for any catalog a session on this socket has open. |
 | `has_function` | open | `HAS_FUNCTION {name, args}` is implemented: `RESP_END {exists}` says whether the session's server has a scalar or aggregate function taking exactly those argument types, with no cast. A client without this capability treats every answer as no and keeps named function calls out of its plans. |
+| `table_ddl` | open | `CREATE_TABLE` honours `not_null`, `primary_key`, `unique_keys` and `txn`, and `ALTER_TABLE` honours `txn`. A client without this capability refuses a `CREATE TABLE` with constraints and table DDL in a transaction. |
 
 `catalog_plans` is granted only for a catalog the server serves itself, never one it forwards upstream. A
 plan naming a catalog no session on the socket has open fails with `CatalogException`, and one naming a
@@ -247,6 +255,11 @@ Each entry in the `tables` array:
 | `name` | string | yes | — |
 | `verbs` | string[] | no | `[]` |
 | `primary_keys` | string[] | no | `[]` |
+| `not_null` | string[] | no | `[]` |
+| `unique_keys` | string[][] | no | `[]` |
+
+`not_null` and `unique_keys` list constraints the server enforces: the NOT NULL column names, and the columns of each
+UNIQUE constraint other than the primary key.
 
 `verbs` lists what may be done to the table, in crossing's spelling: any of
 `select`, `insert`, `update`, `delete`, `alter`, `drop`. `primary_keys` lists

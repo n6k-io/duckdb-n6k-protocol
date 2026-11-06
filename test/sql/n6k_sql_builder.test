@@ -19,6 +19,11 @@ SELECT n6k_testing_build_create_table_sql('db', 'main', 't', '[{"name":"a","type
 CREATE TABLE "db"."main"."t" ("a" INTEGER, "b""c" VARCHAR)
 
 query T
+SELECT n6k_testing_build_create_table_sql('db', 'main', 't', '[{"name":"a","type":"INTEGER","not_null":true},{"name":"b","type":"VARCHAR","not_null":false}]');
+----
+CREATE TABLE "db"."main"."t" ("a" INTEGER NOT NULL, "b" VARCHAR)
+
+query T
 SELECT n6k_testing_build_alter_sql('db', 'main', 't', 'add_column', '{"name":"a","type":"INTEGER"}');
 ----
 ALTER TABLE "db"."main"."t" ADD COLUMN "a" INTEGER
