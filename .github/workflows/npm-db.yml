@@ -10,6 +10,7 @@ on:
 
 jobs:
   lint-and-test:
+    if: false
     runs-on: ubuntu-latest
     defaults:
       run:

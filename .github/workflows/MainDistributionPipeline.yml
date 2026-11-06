@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - main
+      - fix/cpp-tests
   pull_request:
   workflow_dispatch:
 
@@ -17,6 +18,7 @@ jobs:
   # Fails the PR before the long builds start if a package changed but kept a released version.
   version-check:
     name: Package version check
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -60,7 +62,7 @@ jobs:
 
   version-bumped:
     name: VERSION bumped
-    if: github.event_name == 'pull_request'
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +92,7 @@ jobs:
   # them from one compile instead of rebuilding the whole tree once per extension.
   duckdb-stable-build:
     name: Build n6k extension binaries
+    if: false
     needs: version-check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
@@ -104,6 +107,7 @@ jobs:
 
   code-quality-check:
     name: Code Quality Check
+    if: false
     needs: version-check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
@@ -114,7 +118,6 @@ jobs:
 
   cpp-test:
     name: C++ tests
-    needs: version-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,7 +125,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache libssl-dev gdb
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
@@ -131,7 +134,21 @@ jobs:
       - name: Build
         run: GEN=ninja make release
       - name: Test
-        run: make cpp-test
+        run: |
+          sudo sysctl -w kernel.core_pattern="$PWD/core.%p"
+          ulimit -c unlimited
+          make cpp-test
+          for i in $(seq 1 20); do
+            echo "repeat $i"
+            build/cpp-test/n6k_unittest > build/test-logs/cpp-test-repeat.log 2>&1 || { tail -n 40 build/test-logs/cpp-test-repeat.log; exit 1; }
+          done
+      - name: Backtrace
+        if: failure()
+        run: |
+          ls -la core.* || exit 0
+          for core in core.*; do
+            gdb -batch -ex "thread apply all bt" build/cpp-test/n6k_unittest "$core"
+          done
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -142,7 +159,7 @@ jobs:
   duckdb-stable-deploy:
     name: Deploy n6k extensions (${{ matrix.duckdb_arch }})
     needs: duckdb-stable-build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: read
