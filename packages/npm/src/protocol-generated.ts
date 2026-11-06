@@ -47,6 +47,7 @@ export const OP = {
   CREATE_VIEW: 21,
   DROP_VIEW: 22,
   HAS_FUNCTION: 23,
+  CREATE_SCHEMA: 24,
 } as const;
 
 export const FLAG_END_OF_STREAM = 0x01;
@@ -65,10 +66,7 @@ export const CAP_MCP = "mcp";
 export const CAP_CATALOG_PLANS = "catalog_plans";
 export const CAP_HAS_FUNCTION = "has_function";
 export const CAP_TABLE_DDL = "table_ddl";
+export const CAP_SCHEMA_DDL = "schema_ddl";
 export const HELLO_CAPS: readonly string[] = ["crossing", "jsonrpc", "mcp"];
 export const APP_HELLO_CAPS: readonly string[] = ["jsonrpc", "mcp"];
-export const OPEN_CAPS: readonly string[] = [
-  "catalog_plans",
-  "has_function",
-  "table_ddl",
-];
+export const OPEN_CAPS: readonly string[] = ["catalog_plans", "has_function", "table_ddl", "schema_ddl"];

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+`CREATE SCHEMA` on an attached database now creates the schema on the server. It previously reported success but only
+changed that client's local catalog, so a following `CREATE TABLE` in it failed with a permission error. This adds the
+`CREATE_SCHEMA` op and the `schema_ddl` capability; against a server without them, `CREATE SCHEMA` fails with
+`BinderException`. `CREATE SCHEMA` in a transaction, nested schemas and `CREATE OR REPLACE SCHEMA` also fail with
+`BinderException`.
+
 A client function the server lacks now runs on the client instead of failing or running the server's function of
 that name. This adds the `HAS_FUNCTION` op and the `has_function` capability; against a server without them, named
 function calls run on the client, with the same results but slower.

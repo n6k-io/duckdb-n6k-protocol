@@ -1,9 +1,12 @@
+#include "n6k_body_builders.hpp"
 #include "n6k_catalog.hpp"
 #include "n6k_protocol_generated.hpp"
 #include "n6k_schema_entry.hpp"
+#include "n6k_source.hpp"
 #include "ws_json.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -110,19 +113,37 @@ void N6kCatalog::LoadSchemasOnce() {
 }
 
 optional_ptr<CatalogEntry> N6kCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	auto &schema_name = info.GetQualifiedName().Schema().GetIdentifierName();
-	lock_guard<mutex> lock(schemas_lock);
-	auto it = schemas.find(schema_name);
-	if (it != schemas.end()) {
-		if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-			return it->second.get();
-		}
-		throw CatalogException("Schema '%s' already exists", schema_name);
+	const string catalog_name = GetName().GetIdentifierName();
+	if (!transaction.HasContext()) {
+		throw BinderException("n6k[%s]: CREATE SCHEMA needs a client context", catalog_name);
 	}
-	auto schema_entry = make_uniq<N6kSchemaEntry>(*this, info, session);
-	auto result = schema_entry.get();
-	schemas[schema_name] = std::move(schema_entry);
-	return result;
+	auto &context = transaction.GetContext();
+	if (info.IsNested()) {
+		throw BinderException("n6k[%s]: nested schemas are not supported", catalog_name);
+	}
+	string on_conflict;
+	switch (info.on_conflict) {
+	case OnCreateConflict::ERROR_ON_CONFLICT:
+		on_conflict = "error";
+		break;
+	case OnCreateConflict::IGNORE_ON_CONFLICT:
+		on_conflict = "ignore";
+		break;
+	default:
+		throw BinderException("n6k[%s]: CREATE OR REPLACE SCHEMA is not supported", catalog_name);
+	}
+	if (!context.transaction.IsAutoCommit()) {
+		throw BinderException("n6k[%s]: CREATE SCHEMA is not supported in a transaction", catalog_name);
+	}
+	if (!session->HasCapability(n6k::CAP_SCHEMA_DDL)) {
+		throw BinderException("n6k[%s]: the server does not support CREATE SCHEMA", catalog_name);
+	}
+	const string schema_name = info.SchemaName().GetIdentifierName();
+	session->RunOp(n6k::OP_CREATE_SCHEMA, n6k_body::CreateSchema(schema_name, on_conflict),
+	               [&context]() { return context.IsInterrupted(); });
+	attach.Refresh();
+	Source().ForgetListing();
+	return &GetOrCreateSchema(transaction, schema_name);
 }
 
 optional_ptr<SchemaCatalogEntry> N6kCatalog::LookupSchema(CatalogTransaction transaction,

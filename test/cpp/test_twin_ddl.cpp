@@ -11,7 +11,7 @@ using RowList = std::vector<std::string>;
 
 } // namespace
 
-TEST_CASE("a created schema reaches the server and accepts tables", "[twin][ddl][!shouldfail]") {
+TEST_CASE("a created schema reaches the server and accepts tables", "[twin][ddl]") {
 	N6kTwin twin;
 	twin.Attach();
 
@@ -22,6 +22,93 @@ TEST_CASE("a created schema reaches the server and accepts tables", "[twin][ddl]
 	REQUIRE(twin.FarRows("SELECT table_name FROM duckdb_tables() WHERE schema_name = 's1'") == RowList {"x"});
 
 	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("create schema conflicts follow the server", "[twin][ddl]") {
+	N6kTwin twin;
+	twin.Attach();
+	const std::string schemas = "SELECT schema_name FROM duckdb_schemas() WHERE schema_name = 's1'";
+
+	SECTION("a second create of the client's own schema fails") {
+		twin.Near("CREATE SCHEMA db.s1");
+		twin.NearFails("CREATE SCHEMA db.s1", ExceptionType::CATALOG, "already exists");
+		twin.Near("CREATE SCHEMA IF NOT EXISTS db.s1");
+		REQUIRE(twin.FarRows(schemas) == RowList {"s1"});
+	}
+
+	SECTION("a schema only the server knows conflicts") {
+		twin.Far("CREATE SCHEMA db.s1");
+		twin.NearFails("CREATE SCHEMA db.s1", ExceptionType::CATALOG, "already exists");
+	}
+
+	SECTION("if not exists adopts a schema only the server knows") {
+		twin.Far("CREATE SCHEMA db.s1");
+		twin.Near("CREATE SCHEMA IF NOT EXISTS db.s1");
+		twin.Near("CREATE TABLE db.s1.x (i INT)");
+		REQUIRE(twin.FarRows("SELECT table_name FROM duckdb_tables() WHERE schema_name = 's1'") == RowList {"x"});
+	}
+
+	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("create schema refusals leave the server alone", "[twin][ddl]") {
+	N6kTwin twin;
+	twin.Attach();
+	const std::string schemas = "SELECT schema_name FROM duckdb_schemas() WHERE schema_name = 's1'";
+
+	SECTION("inside a transaction") {
+		twin.Near("BEGIN");
+		twin.NearFails("CREATE SCHEMA db.s1", ExceptionType::BINDER, "not supported in a transaction");
+		twin.Near("ROLLBACK");
+		twin.Near("BEGIN");
+		twin.NearFails("CREATE SCHEMA IF NOT EXISTS db.s1", ExceptionType::BINDER, "not supported in a transaction");
+		twin.Near("ROLLBACK");
+		REQUIRE(twin.FarRows(schemas).empty());
+		REQUIRE(twin.Rows(schemas).empty());
+	}
+
+	SECTION("a nested schema") {
+		twin.NearErrors("CREATE SCHEMA db.s1.s2");
+		REQUIRE(twin.FarRows(schemas).empty());
+	}
+
+	SECTION("or replace") {
+		twin.NearErrors("CREATE OR REPLACE SCHEMA db.s1");
+		REQUIRE(twin.FarRows(schemas).empty());
+	}
+
+	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("a created schema is usable however it is reached", "[twin][ddl]") {
+	SECTION("in one multi-statement query") {
+		N6kTwin twin;
+		twin.Attach();
+		twin.Near("CREATE SCHEMA db.s1; CREATE TABLE db.s1.x (i INT)");
+		REQUIRE(twin.FarRows("SELECT table_name FROM duckdb_tables() WHERE schema_name = 's1'") == RowList {"x"});
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("from a client that attaches afterwards") {
+		N6kTwin twin;
+		twin.Attach();
+		twin.Near("CREATE SCHEMA db.s1");
+		auto &fresh = twin.Client();
+		fresh.Near("CREATE TABLE db.s1.x (i INT)");
+		REQUIRE(twin.FarRows("SELECT table_name FROM duckdb_tables() WHERE schema_name = 's1'") == RowList {"x"});
+		REQUIRE(twin.ServeError().empty());
+	}
+
+	SECTION("under an alias") {
+		N6kTwin twin;
+		twin.Attach();
+		twin.AttachAs("other", "db", twin.ConnectionId());
+		twin.Near("CREATE SCHEMA other.s1");
+		twin.Near("CREATE TABLE other.s1.x (i INT)");
+		REQUIRE(twin.FarRows("SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'db'") ==
+		        RowList {"s1|x"});
+		REQUIRE(twin.ServeError().empty());
+	}
 }
 
 TEST_CASE("table and view DDL work under an alias", "[twin][ddl]") {

@@ -89,6 +89,18 @@ std::string BuildCreateTableSql(const std::string &catalog, const std::string &s
 	return "CREATE TABLE " + QuoteQualifiedTable(catalog, schema, name) + " (" + col_defs + ")";
 }
 
+std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &schema,
+                                 const std::string &on_conflict) {
+	const auto qualified = QuoteIdent(catalog) + "." + QuoteIdent(schema);
+	if (on_conflict == "error") {
+		return "CREATE SCHEMA " + qualified;
+	}
+	if (on_conflict == "ignore") {
+		return "CREATE SCHEMA IF NOT EXISTS " + qualified;
+	}
+	throw InvalidInputException("n6k: create_schema \"on_conflict\" must be error or ignore");
+}
+
 std::string BuildAlterSql(const std::string &catalog, const std::string &schema, const std::string &table,
                           const std::string &kind, duckdb_yyjson::yyjson_val *details) {
 	std::string qualified = QuoteQualifiedTable(catalog, schema, table);

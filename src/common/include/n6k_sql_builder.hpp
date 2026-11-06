@@ -36,6 +36,9 @@ std::string BuildCreateTableSql(const std::string &catalog, const std::string &s
                                 duckdb_yyjson::yyjson_val *columns, const std::vector<std::string> &primary_key = {},
                                 const std::vector<std::vector<std::string>> &unique_keys = {});
 
+// OP_CREATE_SCHEMA. `on_conflict` is whitelisted: error, ignore.
+std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &schema, const std::string &on_conflict);
+
 // OP_ALTER_TABLE. `kind` is whitelisted: add_column, drop_column, rename_column.
 std::string BuildAlterSql(const std::string &catalog, const std::string &schema, const std::string &table,
                           const std::string &kind, duckdb_yyjson::yyjson_val *details);

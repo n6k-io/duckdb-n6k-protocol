@@ -128,6 +128,8 @@ inline const char *OpName(uint8_t op) {
 		return "RPC_TABLE";
 	case OP_CREATE_TABLE:
 		return "CREATE_TABLE";
+	case OP_CREATE_SCHEMA:
+		return "CREATE_SCHEMA";
 	case OP_CREATE_VIEW:
 		return "CREATE_VIEW";
 	case OP_DROP_VIEW:

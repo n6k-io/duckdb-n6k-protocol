@@ -287,11 +287,15 @@ void CollectCatalogPermissions(ClientContext &context, Catalog &catalog, optiona
 	CollectCatalogPermissionsHonoringReadOnlyAttach(context, catalog, schema_filter, table_filter, out);
 }
 
-void CollectSchemaPermissions(ClientContext &context, Catalog &catalog, optional_ptr<const string> schema_filter,
-                              vector<SchemaPermissionRow> &out) {
+bool CatalogGrantsCreate(ClientContext &context, Catalog &catalog) {
 	const bool plain = !LookupPermissionCollector(context, catalog.GetCatalogType()) &&
 	                   !VirtualCatalogPermissionsFunction(catalog.GetCatalogType());
-	const bool creates = plain && !catalog.GetAttached().IsReadOnly();
+	return plain && !catalog.GetAttached().IsReadOnly();
+}
+
+void CollectSchemaPermissions(ClientContext &context, Catalog &catalog, optional_ptr<const string> schema_filter,
+                              vector<SchemaPermissionRow> &out) {
+	const bool creates = CatalogGrantsCreate(context, catalog);
 	vector<string> names;
 	ListCatalogSchemas(context, catalog, names);
 	for (auto &name : names) {

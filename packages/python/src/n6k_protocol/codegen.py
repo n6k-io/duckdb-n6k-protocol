@@ -64,6 +64,7 @@ def render_ts() -> str:
     lines.append(f'export const CAP_CATALOG_PLANS = "{P.CAP_CATALOG_PLANS}";')
     lines.append(f'export const CAP_HAS_FUNCTION = "{P.CAP_HAS_FUNCTION}";')
     lines.append(f'export const CAP_TABLE_DDL = "{P.CAP_TABLE_DDL}";')
+    lines.append(f'export const CAP_SCHEMA_DDL = "{P.CAP_SCHEMA_DDL}";')
     lines.append(f"export const HELLO_CAPS: readonly string[] = {json.dumps(list(P.HELLO_CAPS))};")
     lines.append(f"export const APP_HELLO_CAPS: readonly string[] = {json.dumps(list(P.APP_HELLO_CAPS))};")
     lines.append(f"export const OPEN_CAPS: readonly string[] = {json.dumps(list(P.OPEN_CAPS))};")
@@ -121,6 +122,7 @@ def render_hpp() -> str:
     lines.append(f'constexpr const char *CAP_CATALOG_PLANS = "{P.CAP_CATALOG_PLANS}";')
     lines.append(f'constexpr const char *CAP_HAS_FUNCTION = "{P.CAP_HAS_FUNCTION}";')
     lines.append(f'constexpr const char *CAP_TABLE_DDL = "{P.CAP_TABLE_DDL}";')
+    lines.append(f'constexpr const char *CAP_SCHEMA_DDL = "{P.CAP_SCHEMA_DDL}";')
     for name, caps in (("HELLO_CAPS", P.HELLO_CAPS), ("APP_HELLO_CAPS", P.APP_HELLO_CAPS), ("OPEN_CAPS", P.OPEN_CAPS)):
         items = ", ".join(json.dumps(c) for c in caps)
         lines.append(f"constexpr std::array<const char *, {len(caps)}> {name} = {{{{{items}}}}};")

@@ -419,6 +419,7 @@ The extension answers the REQ ops dispatched in `HandleRequest`
 | `EXEC` | ✅ → `{"rowcount":N}` |
 | `INSERT` | ✅ Arrow IPC body → `INSERT`, → `{"rowcount":N}` |
 | `CREATE_TABLE` / `ALTER_TABLE` | ✅ → `{"ok":true}`, in `txn` if given (CREATE: `NOT NULL`, primary key, unique keys; ALTER: add/drop/rename column) |
+| `CREATE_SCHEMA` | ✅ → `{"ok":true}`; `PermissionException` on a read-only, bridge, provider or chained catalog |
 | `CREATE_VIEW` / `DROP_VIEW` | ✅ → `{"ok":true}`; the body is a Substrait plan decoded over the served catalog |
 | `RPC_SCALAR` / `RPC_TABLE` | ✅ calls a host registration, or a table function or macro resolved in the served DuckDB |
 | `HAS_FUNCTION` | ✅ → `{"exists":bool}`; an exact signature match against the system catalog's scalar and aggregate functions |

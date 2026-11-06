@@ -44,6 +44,7 @@ backendDescribe()(`aggregate pushdown [${backendName}]`, () => {
       { capability: "catalog_plans", level: "open" },
       { capability: "crossing", level: "connect" },
       { capability: "has_function", level: "open" },
+      { capability: "schema_ddl", level: "open" },
       { capability: "table_ddl", level: "open" },
     ]);
   });

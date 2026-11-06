@@ -412,6 +412,11 @@ const void *N6kSource::Group() {
 	return group;
 }
 
+void N6kSource::ForgetListing() {
+	lock_guard<mutex> guard(lock);
+	listed = false;
+}
+
 void N6kSource::ListIfNeeded() {
 	if (listed) {
 		return;

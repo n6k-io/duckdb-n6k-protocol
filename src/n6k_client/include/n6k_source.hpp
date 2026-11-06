@@ -50,6 +50,7 @@ public:
 	vector<string> SetCrossingOperators(const string &action, const vector<string> &names);
 
 	void ForgetServerFunctions();
+	void ForgetListing();
 
 private:
 	void ListIfNeeded();

@@ -1080,6 +1080,37 @@
           "const": 1
         },
         "op": {
+          "const": 24
+        },
+        "id": {
+          "type": "integer"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "on_conflict": {
+          "type": "string"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "op",
+        "id",
+        "schema",
+        "on_conflict"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 1
+        },
+        "op": {
           "const": 23
         },
         "id": {

@@ -194,6 +194,15 @@ inline std::string DropView(const std::string &schema, const std::string &name, 
 	return n6k::SerializeJsonDocAndFree(doc);
 }
 
+inline std::string CreateSchema(const std::string &schema, const std::string &on_conflict) {
+	auto *doc = yyjson_mut_doc_new(nullptr);
+	auto *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_strncpy(doc, root, "schema", schema.c_str(), schema.size());
+	yyjson_mut_obj_add_strncpy(doc, root, "on_conflict", on_conflict.c_str(), on_conflict.size());
+	return n6k::SerializeJsonDocAndFree(doc);
+}
+
 inline std::string HasFunction(const std::string &name, const std::vector<std::string> &args) {
 	auto *doc = yyjson_mut_doc_new(nullptr);
 	auto *root = yyjson_mut_obj(doc);

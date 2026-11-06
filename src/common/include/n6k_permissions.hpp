@@ -51,7 +51,9 @@ using PermissionCollectorFn = void (*)(ClientContext &context, Catalog &catalog,
 void CollectCatalogPermissions(ClientContext &context, Catalog &catalog, optional_ptr<const string> schema_filter,
                                optional_ptr<const string> table_filter, vector<TablePermissionRow> &out);
 
-// A plain catalog's schemas allow create unless the attach is READ_ONLY; any other catalog type grants none.
+// A plain catalog allows create unless the attach is READ_ONLY; any other catalog type grants none.
+bool CatalogGrantsCreate(ClientContext &context, Catalog &catalog);
+
 void CollectSchemaPermissions(ClientContext &context, Catalog &catalog, optional_ptr<const string> schema_filter,
                               vector<SchemaPermissionRow> &out);
 

@@ -516,6 +516,35 @@ static void HandleCreateTable(ServeReactor &reactor, Connection &own, const Sess
 	reactor.EndRequest(slot, PackRespEndOk(target));
 }
 
+static void HandleCreateSchema(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
+                               size_t body_len, RequestSlot &slot) {
+	const FrameTarget target {slot.ns, slot.req_id};
+	JsonDoc doc(body, body_len);
+	if (!doc.Parsed()) {
+		throw InvalidInputException("n6k_server: OP_CREATE_SCHEMA body is not valid JSON");
+	}
+	auto *root = doc.Root();
+	auto schema = JsonGetStr(root, "schema");
+	if (schema.empty()) {
+		throw InvalidInputException("n6k_server: OP_CREATE_SCHEMA requires \"schema\"");
+	}
+	auto sql = BuildCreateSchemaSql(sess.catalog, schema, JsonGetStr(root, "on_conflict"));
+	auto scope = ConnectionFor(reactor, own, sess, root, slot);
+	auto &context = *scope.conn->context;
+	bool grants_create = false;
+	context.RunFunctionInTransaction([&]() {
+		grants_create = CatalogGrantsCreate(context, Catalog::GetCatalog(context, Identifier(sess.catalog)));
+	});
+	if (!grants_create) {
+		throw PermissionException("n6k_server: catalog '%s' does not allow CREATE SCHEMA", sess.catalog);
+	}
+	auto result = scope.conn->Query(sql);
+	if (result->HasError()) {
+		result->ThrowError();
+	}
+	reactor.EndRequest(slot, PackRespEndOk(target));
+}
+
 static void HandleAlterTable(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
                              size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
@@ -1259,6 +1288,9 @@ std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_p
 		break;
 	case OP_CREATE_TABLE:
 		HandleCreateTable(reactor, conn, sess, body, body_len, slot);
+		break;
+	case OP_CREATE_SCHEMA:
+		HandleCreateSchema(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_ALTER_TABLE:
 		HandleAlterTable(reactor, conn, sess, body, body_len, slot);
