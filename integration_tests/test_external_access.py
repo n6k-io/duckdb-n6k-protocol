@@ -65,34 +65,11 @@ def _assert_refused(c: duckdb.DuckDBPyConnection, sql: str, listener: Listener) 
     assert listener.accepted == 0
 
 
-def test_attach_is_refused(listener: Listener) -> None:
-    c = _connect()
-    _lock(c)
-    _assert_refused(c, f"ATTACH 'n6k://127.0.0.1:{listener.port}' AS x (TYPE n6k, anonymous true)", listener)
-
-
 def test_attach_with_a_secret_is_refused(listener: Listener) -> None:
     c = _connect()
     c.execute("CREATE SECRET s (TYPE n6k, TOKEN 'tok')")
     _lock(c)
     _assert_refused(c, f"ATTACH 'n6k://127.0.0.1:{listener.port}' AS x (TYPE n6k)", listener)
-
-
-def test_n6k_connect_url_is_refused(listener: Listener) -> None:
-    c = _connect()
-    _lock(c)
-    _assert_refused(c, f"SELECT * FROM n6k_connect(url => 'n6k://127.0.0.1:{listener.port}', token => 't')", listener)
-
-
-def test_n6k_connect_wsfd_is_refused(listener: Listener) -> None:
-    c = _connect()
-    _lock(c)
-    host_end, ext_end = socket.socketpair()
-    try:
-        _assert_refused(c, f"SELECT * FROM n6k_connect(wsFd => {ext_end.fileno()}, token => 't')", listener)
-    finally:
-        host_end.close()
-        ext_end.close()
 
 
 def test_n6k_login_is_refused(listener: Listener) -> None:

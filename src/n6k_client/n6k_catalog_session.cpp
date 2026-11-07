@@ -174,8 +174,8 @@ public:
 
 	n6k::WsTableList ListTables() override {
 		std::string arrow, json_chunk, end_body;
-		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_TABLES_LIST, "{}", arrow,
-		                              json_chunk, end_body, StreamCancelCheck());
+		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_TABLES_LIST, "{}", arrow, json_chunk, end_body,
+		                              StreamCancelCheck());
 		n6k::WsTableList out;
 		n6k::JsonDoc doc(json_chunk);
 		auto *arr = doc.Parsed() ? duckdb_yyjson::yyjson_obj_get(doc.Root(), "tables") : nullptr;
@@ -218,8 +218,8 @@ public:
 	}
 
 	void FetchTableSchema(const string &schema, const string &table, ArrowArrayStream *out) override {
-		SendRequestAndReadArrow(*client_, catalog_name_, n6k::OP_TABLE_SCHEMA,
-		                        n6k_body::SchemaTable(schema, table), out, StreamCancelCheck());
+		SendRequestAndReadArrow(*client_, catalog_name_, n6k::OP_TABLE_SCHEMA, n6k_body::SchemaTable(schema, table),
+		                        out, StreamCancelCheck());
 	}
 
 	bool HasFunction(const string &name, const vector<string> &args) override {

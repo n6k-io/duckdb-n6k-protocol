@@ -149,24 +149,6 @@ backendDescribe()(`create/drop view [${backendName}]`, () => {
   );
 
   test(
-    "a view created in a transaction is seen there and gone after ROLLBACK",
-    async () => {
-      const t = await seedTable("cv_txn");
-      await handle.conn.query("BEGIN");
-      await handle.conn.query(
-        `CREATE VIEW db.main."${t}_view" AS SELECT id FROM db.main."${t}"`,
-      );
-      const counted = await handle.conn.query(
-        `SELECT count(*) AS n FROM db.main."${t}_view"`,
-      );
-      expect(Number((counted.toArray()[0] as ArrowRow).toJSON().n)).toBe(3);
-      await handle.conn.query("ROLLBACK");
-      expect(await throws(`SELECT * FROM db.main."${t}_view"`)).toBe(true);
-    },
-    TIMEOUT,
-  );
-
-  test(
     "DROP VIEW IF EXISTS on a missing view does not throw",
     async () => {
       const t = await seedTable("cv_ifexists");

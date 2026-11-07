@@ -24,7 +24,7 @@ namespace n6k {
 // 1 MiB per frame.
 constexpr size_t N6K_STREAM_FRAGMENT_BYTES = 512 * 1024;
 // What a peer may have queued on one link, whole or in pieces. Past it the peer is breaking the protocol.
-constexpr size_t N6K_LINK_MAX_INBOUND_BYTES = size_t(1) << 32;
+constexpr size_t N6K_LINK_MAX_INBOUND_BYTES = size_t(1) << 30;
 constexpr size_t N6K_LINK_MAX_STREAMS = size_t(1) << 20;
 
 bool IsLinkFrame(FrameType type);

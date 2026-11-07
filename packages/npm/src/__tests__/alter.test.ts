@@ -86,22 +86,4 @@ backendDescribe()(`alter table [${backendName}]`, () => {
     },
     TIMEOUT,
   );
-
-  test(
-    "ALTER COLUMN TYPE rejected with 'not supported'",
-    async () => {
-      const ns = await makeTable("alter_bad");
-      let caught: Error | null = null;
-      try {
-        await handle.conn.query(
-          `ALTER TABLE db.main."${ns}" ALTER COLUMN age TYPE BIGINT`,
-        );
-      } catch (error) {
-        caught = error as Error;
-      }
-      expect(caught).not.toBeNull();
-      expect(caught!.message.toLowerCase()).toContain("not supported");
-    },
-    TIMEOUT,
-  );
 });

@@ -272,7 +272,8 @@ public:
 	// Throws if it is not paused. Safe to call from any thread.
 	InflightState Inflight(const std::string &catalog);
 
-	// Cancel and interrupt every request running against `catalog`, including statements on open links. Returns how many requests were running. Safe to call from any thread.
+	// Cancel and interrupt every request running against `catalog`, including statements on open links. Returns how
+	// many requests were running. Safe to call from any thread.
 	int64_t CancelInflight(const std::string &catalog);
 
 	void SendFrame(std::string frame);
@@ -407,9 +408,9 @@ private:
 	// Joins every worker. Idempotent, so Run() and ~ServeReactor may both call it.
 	void StopWorkers();
 	std::shared_ptr<RequestSlot> FindSlot(int64_t ns, uint32_t req_id);
-	// Interrupt every in-flight request's own Connection. A request that has not yet published its context has nothing to interrupt;
-	// only a streamed response sees `stopping_` later, so a non-streamed op already past RunRequest's check runs
-	// to completion.
+	// Interrupt every in-flight request's own Connection. A request that has not yet published its context has nothing
+	// to interrupt; only a streamed response sees `stopping_` later, so a non-streamed op already past RunRequest's
+	// check runs to completion.
 	void InterruptWorkers();
 	// Reader thread only.
 	void TrackSession(int64_t ns, const std::string &catalog);

@@ -254,3 +254,82 @@ TEST_CASE("client UDFs run on the client and overloads resolve", "[twin][pushdow
 
 	REQUIRE(twin.ServeError().empty());
 }
+
+TEST_CASE("or, in and null filters match the server", "[twin][pushdown]") {
+	N6kTwin twin;
+	SeedUsersAndProducts(twin);
+	twin.Attach();
+
+	for (const char *sql : {
+	         "SELECT id FROM db.main.users WHERE age > 30 OR age < 26 ORDER BY id",
+	         "SELECT id FROM db.main.users WHERE (age > 26 AND age < 34) OR age = 35 ORDER BY id",
+	         "SELECT id FROM db.main.users WHERE age >= 30 AND name != 'Alice' ORDER BY id",
+	         "SELECT id FROM db.main.users WHERE name IN ('Alice', 'Charlie') ORDER BY id",
+	         "SELECT id FROM db.main.users WHERE age NOT IN (25, 30) ORDER BY id",
+	         "SELECT id FROM db.main.users WHERE name IS NOT NULL ORDER BY id",
+	         "SELECT id FROM db.main.users WHERE name IS NULL",
+	         "SELECT id, name, age FROM db.main.users WHERE age > 30 OR age < 26 ORDER BY id",
+	     }) {
+		twin.Same(sql);
+	}
+	REQUIRE(twin.Rows("SELECT id FROM db.main.users WHERE (age > 26 AND age < 34) OR age = 35 ORDER BY id") ==
+	        std::vector<std::string> {"1", "3"});
+
+	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("aggregates match the server", "[twin][pushdown]") {
+	N6kTwin twin;
+	SeedUsersAndProducts(twin);
+	twin.Attach();
+
+	for (const char *sql : {
+	         "SELECT age, count(*) AS c, sum(id) AS s FROM db.main.users GROUP BY age ORDER BY age",
+	         "SELECT sum(id) AS s, typeof(sum(id)) AS t FROM db.main.users",
+	         "SELECT count(*) AS c0, count(name) AS c1, sum(id) AS s, min(name) AS mn, max(age) AS mx, "
+	         "avg(age) AS av FROM db.main.users",
+	         "SELECT age, sum(id) AS s FROM db.main.users WHERE age > 26 GROUP BY age ORDER BY age",
+	         "SELECT count(*) AS c, min(name) AS mn FROM db.main.users WHERE id < 0",
+	         "SELECT age, count(*) AS c FROM db.main.users WHERE id < 0 GROUP BY age",
+	         "SELECT lower(name) AS g, count(*) AS c FROM db.main.users GROUP BY lower(name) ORDER BY 1",
+	         "SELECT count(DISTINCT age) AS c FROM db.main.users",
+	         "SELECT median(age) AS m FROM db.main.users",
+	         "SELECT string_agg(name, ',') AS s FROM (SELECT name FROM db.main.users ORDER BY name)",
+	         "SELECT sum(id + age) AS s FROM db.main.users",
+	         "SELECT count(*) FILTER (WHERE age > 26) AS c FROM db.main.users",
+	         "SELECT count(*) AS c FROM db.main.users WHERE age > 30 OR age < 26",
+	         "SELECT age, count(*) AS c FROM db.main.users GROUP BY age HAVING count(*) > 0 ORDER BY age",
+	     }) {
+		twin.Same(sql);
+	}
+	REQUIRE(twin.Rows("SELECT typeof(sum(id)) FROM db.main.users") == std::vector<std::string> {"HUGEINT"});
+	REQUIRE(twin.Rows("SELECT count(*), min(name) FROM db.main.users WHERE id < 0") ==
+	        std::vector<std::string> {"0|NULL"});
+
+	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("has_function answers are cached until invalidated", "[twin][pushdown]") {
+	const auto plus = [](int64_t offset) {
+		return ScalarFunction("shared_name", {LogicalType::BIGINT}, LogicalType::BIGINT,
+		                      [offset](DataChunk &args, ExpressionState &, Vector &result) {
+			                      UnaryExecutor::Execute<int64_t, int64_t>(
+			                          args.data[0], result, [&](int64_t value) { return value + offset; });
+		                      });
+	};
+	const std::string sql = "SELECT shared_name(i) FROM db.main.t";
+
+	N6kTwin twin;
+	twin.Far("CREATE TABLE db.main.t AS SELECT 1::BIGINT AS i");
+	twin.Attach();
+	twin.NearFunction(plus(1));
+	REQUIRE(twin.Rows(sql) == std::vector<std::string> {"2"});
+
+	twin.FarFunction(plus(1000));
+	REQUIRE(twin.Rows(sql) == std::vector<std::string> {"2"});
+
+	twin.Near("CALL n6k_invalidate_cache('db', 'main')");
+	REQUIRE(twin.Rows(sql) == std::vector<std::string> {"1001"});
+
+	REQUIRE(twin.ServeError().empty());
+}

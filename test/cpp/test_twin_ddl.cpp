@@ -1,6 +1,9 @@
 #include "framework/n6k_twin.hpp"
 
+#include <cstdio>
+#include <filesystem>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace duckdb;
@@ -221,4 +224,47 @@ TEST_CASE("table and view DDL work under an alias", "[twin][ddl]") {
 			REQUIRE(twin.ServeError().empty());
 		}
 	}
+}
+
+TEST_CASE("table permissions report a remote table and view", "[twin][ddl]") {
+	N6kTwin twin;
+	twin.Far("CREATE TABLE db.main.t (id INTEGER PRIMARY KEY, label VARCHAR)");
+	twin.Far("CREATE VIEW db.main.v AS SELECT id FROM db.main.t");
+	twin.Attach();
+
+	REQUIRE(
+	    twin.Rows("SELECT name, kind, verbs, primary_key FROM n6k_table_permissions('db', schema := 'main') "
+	              "WHERE name IN ('t', 'v') ORDER BY name") ==
+	    RowList {"t|n6k_remote|[select, insert, update, delete, alter, drop]|[id]", "v|n6k_remote|[select, drop]|[]"});
+
+	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("one execute creates a schema then a table in it", "[twin][ddl]") {
+	N6kTwin twin;
+	twin.Attach();
+
+	twin.Near("CREATE SCHEMA db.s1; CREATE TABLE db.s1.x (i INT);");
+	REQUIRE(twin.Rows("SELECT table_name FROM duckdb_tables() WHERE schema_name = 's1'") == RowList {"x"});
+
+	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("a read-only catalog refuses create schema", "[twin][ddl]") {
+	const auto path =
+	    (std::filesystem::temp_directory_path() / ("n6k_twin_ro_" + std::to_string(::getpid()) + ".duckdb")).string();
+	std::remove(path.c_str());
+	{
+		N6kTwin twin({"ro"});
+		twin.Far("ATTACH '" + path + "' AS ro_seed");
+		twin.Far("DETACH ro_seed");
+		twin.Far("DETACH ro");
+		twin.Far("ATTACH '" + path + "' AS ro (READ_ONLY)");
+		twin.Attach();
+
+		twin.NearFails("CREATE SCHEMA ro.refused", ExceptionType::PERMISSION, "does not allow CREATE SCHEMA");
+
+		REQUIRE(twin.ServeError().empty());
+	}
+	std::remove(path.c_str());
 }

@@ -1,8 +1,10 @@
 #include "framework/n6k_twin.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -222,4 +224,49 @@ TEST_CASE("a parallel scan keeps order and a mid-stream error raises", "[twin][r
 	REQUIRE((twin.Rows(descending) == Sequence(true)));
 
 	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("concurrent column scans of one schema read live entries", "[twin][reads]") {
+	const std::string expansion = "SELECT t.table_oid FROM duckdb_tables() t JOIN duckdb_columns() c USING (table_oid) "
+	                              "UNION ALL "
+	                              "SELECT v.view_oid FROM duckdb_views() v JOIN duckdb_columns() c ON (v.view_oid = "
+	                              "c.table_oid)";
+	const auto lists_db = [](const std::vector<std::string> &rows) {
+		return std::any_of(rows.begin(), rows.end(), [](const std::string &row) { return row.rfind("db|", 0) == 0; });
+	};
+	const auto rounds = [](const std::function<void(N6kTwin &)> &body) {
+		for (int round = 0; round < 5; round++) {
+			N6kTwin twin;
+			twin.Far("CREATE TABLE db.main.users (id INTEGER, name VARCHAR, age INTEGER)");
+			twin.Attach();
+			body(twin);
+			REQUIRE(twin.ServeError().empty());
+		}
+	};
+
+	SECTION("show all tables on a cold catalog") {
+		rounds([&](N6kTwin &twin) { REQUIRE(lists_db(twin.Rows("SHOW ALL TABLES"))); });
+	}
+
+	SECTION("show all tables after a query warmed the catalog") {
+		rounds([&](N6kTwin &twin) {
+			twin.Rows("SELECT count(*) FROM db.main.users");
+			REQUIRE(lists_db(twin.Rows("SHOW ALL TABLES")));
+		});
+	}
+
+	SECTION("two joined column scans in one query") {
+		rounds([&](N6kTwin &twin) { twin.Rows("SELECT count(*) FROM (" + expansion + ")"); });
+	}
+
+	SECTION("each half of the expansion alone") {
+		N6kTwin twin;
+		twin.Far("CREATE TABLE db.main.users (id INTEGER, name VARCHAR, age INTEGER)");
+		twin.Attach();
+		const auto tables =
+		    twin.Rows("SELECT count(*) FROM duckdb_tables() t JOIN duckdb_columns() c USING (table_oid)");
+		REQUIRE(std::stoll(tables.at(0)) > 0);
+		twin.Rows("SELECT count(*) FROM duckdb_views() v JOIN duckdb_columns() c ON (v.view_oid = c.table_oid)");
+		REQUIRE(twin.ServeError().empty());
+	}
 }

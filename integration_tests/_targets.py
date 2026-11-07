@@ -268,9 +268,7 @@ class WireClient:
                     arrow += parse_stream_payload(partial)[1]
                     partial = b""
                     await self.ws.send(
-                        pack_frame(
-                            {"t": FT_STREAM_CREDIT, "ns": ns, "link": link, "stream": header["stream"], "n": 1}
-                        )
+                        pack_frame({"t": FT_STREAM_CREDIT, "ns": ns, "link": link, "stream": header["stream"], "n": 1})
                     )
             elif header["t"] in (FT_STREAM_END, FT_LINK_END):
                 if "exception_type" in header and failure is None:

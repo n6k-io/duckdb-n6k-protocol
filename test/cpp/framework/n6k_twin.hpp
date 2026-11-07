@@ -645,6 +645,12 @@ public:
 		return TwinRows(far_con, sql);
 	}
 
+	void FarFunction(ScalarFunction function) {
+		CreateScalarFunctionInfo info(std::move(function));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		far_con.context->RegisterFunction(info);
+	}
+
 	TwinClient &Client() {
 		clients.push_back(make_uniq<TwinClient>(far, far_con, catalogs));
 		clients.back()->Attach();
