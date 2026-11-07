@@ -32,10 +32,7 @@ from n6k_protocol.protocol import (
     FT_HELLO_ERR,
     FT_OPEN_ACK,
     FT_OPEN_ERR,
-    FT_RESP_END,
     OP_QUERY,
-    OP_READ_PLAN,
-    OP_TXN_BEGIN,
 )
 
 pytestmark = pytest.mark.skipif(not server_is_up(), reason="test server not running on :8099")
@@ -113,22 +110,17 @@ async def test_a_served_client_cannot_reach_the_serve_functions(sql: str) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pinned", [False, True])
-async def test_a_plan_cannot_reach_the_serve_functions(pinned: bool) -> None:
+async def test_a_plan_cannot_reach_the_serve_functions() -> None:
     async with websockets.connect(IDENT.ws_url(catalog=None)) as ws:
         assert (await hello(ws, "tok-a"))["t"] == FT_HELLO_ACK
         assert (await open_session(ws, 1, "a"))["t"] == FT_OPEN_ACK
         sql = f"CREATE OR REPLACE VIEW a.main.send_text_view AS SELECT * FROM n6k_serve_send_text({SESSION_ID}, 'x')"
         assert (await asyncio.to_thread(_debug, "server_exec", {"catalog": "a", "sql": sql}, "POST"))["handlers"] >= 1
         client = WireClient(ws)
-        args: dict[str, Any] = {}
-        if pinned:
-            begin = await client.request(OP_TXN_BEGIN)
-            assert begin[-1][0]["t"] == FT_RESP_END, begin
-            args["txn"] = begin[-1][0]["txn"]
         plan = substrait_plan(substrait_read("main", "send_text_view", [("sent", "bool")]), ["sent"])
-        err = await client.error(OP_READ_PLAN, plan=plan, **args)
-        assert "not callable from a served connection" in err["exception_message"]
+        _, failure = await client.run_plan(plan)
+        assert failure is not None
+        assert "not callable from a served connection" in failure["exception_message"]
 
 
 @pytest.mark.asyncio

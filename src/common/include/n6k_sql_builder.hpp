@@ -9,10 +9,8 @@
 namespace duckdb {
 namespace n6k {
 
-// Structure -> SQL for the n6k request ops. This is the trust boundary: a client sends column
-// names, RPC arguments and alter kinds, and NEVER SQL text, so everything a request can influence
-// passes through here to be whitelisted (alter kinds), quoted (identifiers) or escaped (literals)
-// before reaching a statement.
+// Structure -> SQL for the n6k request ops: everything these requests can influence passes through here to be
+// whitelisted, quoted (identifiers) or escaped (literals) before reaching a statement.
 //
 // One implementation, deliberately: a second is a place for the two to disagree, and disagreement
 // here is a security bug. The reactor (src/n6k_server/request_handlers.cpp) is the ONLY caller on
@@ -30,18 +28,8 @@ std::string JsonValueToSqlLiteral(duckdb_yyjson::yyjson_val *v);
 // OP_TABLE_SCHEMA: a zero-row select, executed only for its result types.
 std::string BuildTableSchemaSql(const std::string &catalog, const std::string &schema, const std::string &table);
 
-// OP_CREATE_TABLE. `columns` is an array of {"name": ..., "type": ..., "not_null"?: bool}; the type is a
-// type EXPRESSION, not a value, and is interpolated verbatim -- only the name is quoted.
-std::string BuildCreateTableSql(const std::string &catalog, const std::string &schema, const std::string &name,
-                                duckdb_yyjson::yyjson_val *columns, const std::vector<std::string> &primary_key = {},
-                                const std::vector<std::vector<std::string>> &unique_keys = {});
-
 // OP_CREATE_SCHEMA. `on_conflict` is whitelisted: error, ignore.
 std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &schema, const std::string &on_conflict);
-
-// OP_ALTER_TABLE. `kind` is whitelisted: add_column, drop_column, rename_column.
-std::string BuildAlterSql(const std::string &catalog, const std::string &schema, const std::string &table,
-                          const std::string &kind, duckdb_yyjson::yyjson_val *details);
 
 // One RPC argument -> a SQL literal. A superset of JsonValueToSqlLiteral: the wire encodes a STRUCT
 // as a JSON object and a LIST as a JSON array, which JsonValueToSqlLiteral rejects on purpose.

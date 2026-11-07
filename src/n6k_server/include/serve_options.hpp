@@ -37,6 +37,8 @@ struct ServeOptions {
 	int open_pending_interval_ms = OPEN_PENDING_INTERVAL_MS;
 	// Requests that run at once on this connection; the rest of the MAX_CONCURRENT_REQS window queues.
 	int workers = 4;
+	// Far transactions open at once on this connection, each on its own thread; the next is refused.
+	int max_links = MAX_CONCURRENT_REQS;
 	// 0: off. A stream parked for credit longer than this is ERRed and ended.
 	int idle_stream_timeout_ms = 0;
 	// 0: off. A pinned transaction no request has used for this long is rolled back.

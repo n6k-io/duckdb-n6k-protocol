@@ -172,9 +172,9 @@ public:
 		return schemas;
 	}
 
-	n6k::WsTableList ListTables(int64_t txn) override {
+	n6k::WsTableList ListTables() override {
 		std::string arrow, json_chunk, end_body;
-		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_TABLES_LIST, n6k_body::TablesList(txn), arrow,
+		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_TABLES_LIST, "{}", arrow,
 		                              json_chunk, end_body, StreamCancelCheck());
 		n6k::WsTableList out;
 		n6k::JsonDoc doc(json_chunk);
@@ -193,6 +193,7 @@ public:
 			row.schema = JsonGetStr(item, "schema");
 			row.name = JsonGetStr(item, "name");
 			row.verbs = n6k::JsonGetStrArray(item, "verbs");
+			row.row_ids = n6k::JsonGetBool(item, "row_ids", true);
 			row.primary_keys = n6k::JsonGetStrArray(item, "primary_keys");
 			row.not_null = n6k::JsonGetStrArray(item, "not_null");
 			row.unique_keys = n6k::JsonGetStrArrays(item, "unique_keys");
@@ -216,9 +217,9 @@ public:
 		return out;
 	}
 
-	void FetchTableSchema(const string &schema, const string &table, int64_t txn, ArrowArrayStream *out) override {
+	void FetchTableSchema(const string &schema, const string &table, ArrowArrayStream *out) override {
 		SendRequestAndReadArrow(*client_, catalog_name_, n6k::OP_TABLE_SCHEMA,
-		                        n6k_body::SchemaTable(schema, table, txn), out, StreamCancelCheck());
+		                        n6k_body::SchemaTable(schema, table), out, StreamCancelCheck());
 	}
 
 	bool HasFunction(const string &name, const vector<string> &args) override {
@@ -239,33 +240,21 @@ public:
 		return client_->AwaitReadySessionAndSendRequest(op, body_json, should_cancel);
 	}
 
+	std::shared_ptr<n6k::N6kLinkState> OpenLink(DatabaseInstance &db, idx_t streams,
+	                                            const StreamCancelCheck &should_abort) override {
+		return client_->OpenLink(db, streams, should_abort);
+	}
+
+	void CloseLink(n6k::N6kLinkState &link) override {
+		client_->CloseLink(link);
+	}
+
 	n6k::NegotiatedCapabilities GetCapabilities() override {
 		return n6k::NegotiatedCapabilities {client_->GetHelloCapabilities(), client_->GetOpenAck().capabilities};
 	}
 
 	int64_t Exec(const string &sql, const StreamCancelCheck &should_cancel) override {
 		return SendRequestAndReadRowcount(*client_, catalog_name_, n6k::OP_EXEC, n6k_body::Sql(sql), should_cancel);
-	}
-
-	int64_t TxnBegin() override {
-		std::string arrow, json_chunk, end_body;
-		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_TXN_BEGIN, "{}", arrow, json_chunk, end_body,
-		                              StreamCancelCheck());
-		n6k::JsonDoc doc(end_body);
-		if (!doc.Parsed()) {
-			throw IOException("n6k[%s] TXN_BEGIN: server returned no transaction id", catalog_name_);
-		}
-		auto *txn = duckdb_yyjson::yyjson_obj_get(doc.Root(), "txn");
-		if (!txn || !duckdb_yyjson::yyjson_is_int(txn)) {
-			throw IOException("n6k[%s] TXN_BEGIN: server returned no transaction id", catalog_name_);
-		}
-		return duckdb_yyjson::yyjson_get_sint(txn);
-	}
-
-	void TxnEnd(int64_t txn, bool commit) override {
-		std::string arrow, json_chunk, end_body;
-		SendRequestAndCollectResponse(*client_, catalog_name_, commit ? n6k::OP_TXN_COMMIT : n6k::OP_TXN_ROLLBACK,
-		                              n6k_body::Txn(txn), arrow, json_chunk, end_body, StreamCancelCheck());
 	}
 
 	void Query(const string &sql, ArrowArrayStream *out, StreamCancelCheck should_cancel) override {

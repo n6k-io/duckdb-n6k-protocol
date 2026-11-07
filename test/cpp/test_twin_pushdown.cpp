@@ -142,8 +142,8 @@ TEST_CASE("the per-attach operator list controls what crosses", "[twin][pushdown
 	const auto local = [&]() {
 		const auto plan = twin.Explain(query);
 		INFO(plan);
-		REQUIRE(plan.find("Crossing Read") != std::string::npos);
-		return plan.substr(0, plan.find("Crossing Read"));
+		REQUIRE(plan.find("Crossing Remote") != std::string::npos);
+		return plan.substr(0, plan.find("Crossing Remote"));
 	};
 	const auto has = [](const std::vector<std::string> &values, const char *value) {
 		return std::find(values.begin(), values.end(), value) != values.end();

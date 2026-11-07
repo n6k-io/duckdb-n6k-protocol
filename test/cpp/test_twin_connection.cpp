@@ -191,8 +191,8 @@ TEST_CASE("catalogs on one socket share it and read across each other", "[twin][
 		const auto reads = [&](const std::string &sql) {
 			const auto plan = client.Explain(sql);
 			size_t count = 0;
-			for (auto at = plan.find("Crossing Read"); at != std::string::npos;
-			     at = plan.find("Crossing Read", at + 1)) {
+			for (auto at = plan.find("Crossing Remote"); at != std::string::npos;
+			     at = plan.find("Crossing Remote", at + 1)) {
 				count++;
 			}
 			return count;
@@ -232,9 +232,9 @@ TEST_CASE("catalogs on one socket share it and read across each other", "[twin][
 		const std::string sql = "SELECT count(*) FROM p1.main.users u JOIN p2.main.users v ON u.id = v.id";
 		const auto plan = client.Explain(sql);
 		INFO(plan);
-		const auto first = plan.find("Crossing Read");
+		const auto first = plan.find("Crossing Remote");
 		REQUIRE(first != std::string::npos);
-		REQUIRE(plan.find("Crossing Read", first + 1) != std::string::npos);
+		REQUIRE(plan.find("Crossing Remote", first + 1) != std::string::npos);
 		REQUIRE(client.Rows(sql) == RowList {"3"});
 	}
 }

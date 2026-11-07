@@ -20,7 +20,7 @@ import pyarrow.ipc as ipc
 import pytest
 import websockets
 
-from _targets import hello, open_session, scan_plan
+from _targets import hello, open_session
 
 from n6k_protocol.engine import pack_frame, unpack_frame
 from n6k_protocol.protocol import (  # noqa: E402
@@ -39,7 +39,6 @@ from n6k_protocol.protocol import (  # noqa: E402
     OP_EXEC,
     OP_INSERT,
     OP_QUERY,
-    OP_READ_PLAN,
     OP_RPC_SCALAR,
     OP_RPC_TABLE,
 )
@@ -144,23 +143,6 @@ async def test_exec_and_query(server):
         table = ipc.open_stream(buf).read_all()
         assert set(table.column_names) == {"id", "name"}
         assert table.num_rows == 3
-    finally:
-        await ws.close()
-
-
-@pytest.mark.asyncio
-async def test_read_plan_streaming(server):
-    ws, client, _ = await _connect(server)
-    try:
-        req = await client.send_req(
-            OP_READ_PLAN,
-            plan=scan_plan("main", "users", ["id", "age"]),
-            _batch_rows=1,
-        )
-        frames = await client.drain_until_end(req)
-        assert sum(1 for h, _ in frames if h["t"] == FT_RESP_SCHEMA) == 1
-        assert sum(1 for h, _ in frames if h["t"] == FT_RESP_CHUNK) >= 2
-        assert sum(1 for h, _ in frames if h["t"] == FT_RESP_END) == 1
     finally:
         await ws.close()
 

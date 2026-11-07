@@ -24,7 +24,14 @@ import pytest
 from duckdb.sqltypes import UUID, VARCHAR
 
 from _paths import REPO_ROOT
-from _targets import substrait_plan, substrait_read
+from _targets import (
+    CONTROL_STREAM,
+    parse_stream_payload,
+    plan_header,
+    stream_payload,
+    substrait_plan,
+    substrait_read,
+)
 
 from n6k_protocol.engine import pack_frame, unpack_frame
 from n6k_protocol.protocol import (
@@ -33,6 +40,8 @@ from n6k_protocol.protocol import (
     FT_ERR,
     FT_HELLO,
     FT_HELLO_ACK,
+    FT_LINK_END,
+    FT_LINK_OPEN,
     FT_OPEN,
     FT_OPEN_ACK,
     FT_OPEN_ERR,
@@ -43,14 +52,14 @@ from n6k_protocol.protocol import (
     FT_REQ,
     FT_RESP_CHUNK,
     FT_RESP_END,
+    FT_STREAM_DATA,
+    FT_STREAM_END,
     N6K_PROTOCOL_VERSION,
     OP_CATALOG_LIST,
     OP_CATALOGS_CHANGED,
     OP_EXEC,
     STREAM_FRAME_N6K,
     OP_QUERY,
-    OP_READ_PLAN,
-    OP_TXN_BEGIN,
 )
 
 SERVER_EXT_PATH = os.path.join(REPO_ROOT, "build", "release", "extension", "n6k_server", "n6k_server.duckdb_extension")
@@ -65,15 +74,18 @@ class _Peer:
         self.sock = sock
         sock.settimeout(5)
 
-    def send(self, header: dict[str, Any]) -> None:
-        frame = pack_frame(header)
+    def send(self, header: dict[str, Any], body: bytes = b"") -> None:
+        frame = pack_frame(header, body)
         self.sock.sendall(struct.pack(">IB", len(frame), STREAM_FRAME_N6K) + frame)
 
     def recv(self) -> dict[str, Any]:
+        return self.recv_frame()[0]
+
+    def recv_frame(self) -> tuple[dict[str, Any], bytes]:
         n, frame_type = struct.unpack(">IB", self._exactly(5))
         assert frame_type == STREAM_FRAME_N6K
-        header, _ = unpack_frame(self._exactly(n))
-        return dict(header)
+        header, body = unpack_frame(self._exactly(n))
+        return dict(header), bytes(body)
 
     def recv_until(self, match: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
         while not match(frame := self.recv()):
@@ -282,11 +294,8 @@ def test_removing_a_catalog_mid_transaction_stream_leaves_the_reactor_serving(
     side = con.cursor()
     with _serving(con, ", 'a', 'c'") as (peer, session_id):
         assert _open(peer, 1, "c")["t"] == FT_OPEN_ACK
-        peer.send({"t": FT_REQ, "id": 1, "ns": 1, "op": OP_TXN_BEGIN})
-        txn = peer.recv_until(lambda f: f["t"] == FT_RESP_END and f.get("ns") == 1)["txn"]
-        plan = substrait_plan(substrait_read("main", "t", [("i", "i64")]), ["i"])
-        peer.send({"t": FT_REQ, "id": 2, "ns": 1, "op": OP_READ_PLAN, "plan": plan, "txn": txn, "_batch_rows": 1})
-        peer.recv_until(lambda f: f["t"] == FT_RESP_CHUNK and f["ns"] == 1)
+        _start_plan(peer, 1, 1, ["main", "t"], ends_transaction=False)
+        peer.recv_until(lambda f: f["t"] == FT_STREAM_DATA and f["ns"] == 1)
 
         _remove(side, session_id, "c")
         assert peer.recv_push() == ["a"]
@@ -491,11 +500,28 @@ def test_invalid_pauses_raise(con: duckdb.DuckDBPyConnection) -> None:
         _resume(side, session_id, "a")
 
 
-def _read_plan(peer: _Peer, ns: int, req_id: int, names: list[str], **extra: Any) -> None:
+def _start_plan(peer: _Peer, ns: int, link: int, names: list[str], ends_transaction: bool = True) -> None:
     rel = substrait_read(names[-2], names[-1], [("i", "i64")])
     rel["read"]["namedTable"]["names"] = names
     plan = substrait_plan(rel, ["i"])
-    peer.send({"t": FT_REQ, "id": req_id, "ns": ns, "op": OP_READ_PLAN, "plan": plan, **extra})
+    peer.send({"t": FT_LINK_OPEN, "ns": ns, "link": link})
+    peer.send(
+        {"t": FT_STREAM_DATA, "ns": ns, "link": link, "stream": CONTROL_STREAM, "fin": True},
+        stream_payload(plan_header(plan, ends_transaction)),
+    )
+
+
+def _link_failure(peer: _Peer, ns: int, link: int) -> dict[str, Any] | None:
+    """Waits for the link to end; returns the first frame carrying an error."""
+    failure = None
+    while True:
+        frame = peer.recv()
+        if frame.get("ns") != ns or frame.get("link") != link:
+            continue
+        if frame["t"] in (FT_STREAM_END, FT_LINK_END) and "exception_type" in frame and failure is None:
+            failure = frame
+        if frame["t"] == FT_LINK_END:
+            return failure
 
 
 def test_a_plan_reads_a_catalog_another_session_has_open(con: duckdb.DuckDBPyConnection) -> None:
@@ -503,22 +529,22 @@ def test_a_plan_reads_a_catalog_another_session_has_open(con: duckdb.DuckDBPyCon
     with _serving(con, ", 'a', 'c'") as (peer, _fd):
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
         assert _open(peer, 2, "c")["t"] == FT_OPEN_ACK
-        _read_plan(peer, 1, 1, ["c", "main", "only_in_c"])
-        assert _end_of(peer, 1, 1)["t"] == FT_RESP_END
+        _start_plan(peer, 1, 1, ["c", "main", "only_in_c"])
+        assert _link_failure(peer, 1, 1) is None
 
 
 def test_a_plan_naming_a_catalog_no_session_has_open_is_refused(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("CREATE TABLE c.main.only_in_c AS SELECT 1::BIGINT AS i")
     with _serving(con, ", 'a', 'c'") as (peer, _fd):
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
-        _read_plan(peer, 1, 1, ["c", "main", "only_in_c"])
-        err = _end_of(peer, 1, 1)
-        assert err["t"] == FT_ERR
-        assert err["exception_type"] == "CatalogException"
-        assert 'catalog "c"' in err["exception_message"]
+        _start_plan(peer, 1, 1, ["c", "main", "only_in_c"])
+        failure = _link_failure(peer, 1, 1)
+        assert failure is not None
+        assert failure["exception_type"] == "Catalog"
+        assert 'catalog "c"' in failure["exception_message"]
 
 
-def test_a_plan_naming_a_paused_catalog_is_refused_as_retriable(con: duckdb.DuckDBPyConnection) -> None:
+def test_a_plan_naming_a_paused_catalog_is_refused(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("CREATE TABLE c.main.only_in_c AS SELECT 1::BIGINT AS i")
     side = con.cursor()
     with _serving(con, ", 'a', 'c'") as (peer, session_id):
@@ -526,11 +552,10 @@ def test_a_plan_naming_a_paused_catalog_is_refused_as_retriable(con: duckdb.Duck
         assert _open(peer, 2, "c")["t"] == FT_OPEN_ACK
         _pause(side, session_id, "c")
         _await_inflight(side, session_id, "c", 0)
-        _read_plan(peer, 1, 1, ["c", "main", "only_in_c"])
-        err = _end_of(peer, 1, 1)
-        assert err["t"] == FT_ERR
-        assert err["exception_type"] == "TransactionException"
-        assert err["retriable"] is True
+        _start_plan(peer, 1, 1, ["c", "main", "only_in_c"])
+        failure = _link_failure(peer, 1, 1)
+        assert failure is not None
+        assert "paused" in failure["exception_message"]
         _resume(side, session_id, "c")
 
 
@@ -540,15 +565,30 @@ def test_a_plan_on_another_session_counts_as_inflight_on_the_catalog_it_reads(co
     with _serving(con, ", 'a', 'c'") as (peer, session_id):
         assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
         assert _open(peer, 2, "c")["t"] == FT_OPEN_ACK
-        _read_plan(peer, 1, 1, ["c", "main", "big"], _batch_rows=1)
-        peer.recv_until(lambda f: f["t"] == FT_RESP_CHUNK and f["ns"] == 1)
+        _start_plan(peer, 1, 1, ["c", "main", "big"])
+        peer.recv_until(lambda f: f["t"] == FT_STREAM_DATA and f["ns"] == 1)
         _pause(side, session_id, "c")
         _await_inflight(side, session_id, "c", 1)
         assert side.execute("SELECT * FROM n6k_serve_cancel_inflight(?, 'c')", [session_id]).fetchone() == (1,)
-        end = _end_of(peer, 1, 1)
-        assert end["t"] == FT_ERR or end.get("cancelled") is True
+        assert _link_failure(peer, 1, 1) is not None
         _await_inflight(side, session_id, "c", 0)
         _resume(side, session_id, "c")
+
+
+def test_a_pause_holds_a_statement_until_resume(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("CREATE TABLE a.main.t AS SELECT 1::BIGINT AS i")
+    side = con.cursor()
+    with _serving(con, ", 'a'") as (peer, session_id):
+        assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
+        _pause(side, session_id, "a")
+        _await_inflight(side, session_id, "a", 0)
+        _start_plan(peer, 1, 1, ["main", "t"])
+        peer.send({"t": FT_PING, "id": 7})
+        before = _collect_until(peer, lambda f: f["t"] == FT_PONG and f.get("id") == 7)
+        time.sleep(0.3)
+        assert not [f for f in before if f.get("link") == 1]
+        _resume(side, session_id, "a")
+        assert _link_failure(peer, 1, 1) is None
 
 
 def test_open_grants_catalog_plans(con: duckdb.DuckDBPyConnection) -> None:

@@ -126,28 +126,10 @@ inline const char *OpName(uint8_t op) {
 		return "RPC_SCALAR";
 	case OP_RPC_TABLE:
 		return "RPC_TABLE";
-	case OP_CREATE_TABLE:
-		return "CREATE_TABLE";
 	case OP_CREATE_SCHEMA:
 		return "CREATE_SCHEMA";
-	case OP_CREATE_VIEW:
-		return "CREATE_VIEW";
-	case OP_DROP_VIEW:
-		return "DROP_VIEW";
 	case OP_HAS_FUNCTION:
 		return "HAS_FUNCTION";
-	case OP_ALTER_TABLE:
-		return "ALTER_TABLE";
-	case OP_READ_PLAN:
-		return "READ_PLAN";
-	case OP_WRITE_PLAN:
-		return "WRITE_PLAN";
-	case OP_TXN_BEGIN:
-		return "TXN_BEGIN";
-	case OP_TXN_COMMIT:
-		return "TXN_COMMIT";
-	case OP_TXN_ROLLBACK:
-		return "TXN_ROLLBACK";
 	default:
 		return "UNKNOWN";
 	}

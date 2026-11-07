@@ -40,7 +40,7 @@ void LoadInternal(ExtensionLoader &loader) {
 
 	auto &db = loader.GetDatabaseInstance();
 	n6k::RegisterWsLogType(db);
-	Crossing<N6kSource>::RegisterPass(db);
+	RegisterCrossingPass(db);
 	StorageExtension::Register(DBConfig::GetConfig(db), "n6k", CreateN6kStorageExtension());
 }
 

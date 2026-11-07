@@ -94,7 +94,6 @@ std::string PackRespChunkArrow(const FrameTarget &target, const std::string &arr
 std::string PackRespEnd(const FrameTarget &target);
 std::string PackRespEndRowcount(const FrameTarget &target, int64_t rowcount);
 std::string PackRespEndRowcountNull(const FrameTarget &target);
-std::string PackRespEndTxn(const FrameTarget &target, int64_t txn);
 std::string PackRespEndCancelled(const FrameTarget &target);
 std::string PackRespEndOk(const FrameTarget &target);
 std::string PackRespEndExists(const FrameTarget &target, bool exists);

@@ -15,6 +15,7 @@ its own mount paths, its own port probe, and its own copy of the request client.
 import io
 import json
 import os
+import struct
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -29,15 +30,20 @@ from n6k_protocol.protocol import (
     FT_ERR,
     FT_HELLO,
     FT_HELLO_ACK,
+    FT_LINK_CLOSE,
+    FT_LINK_END,
+    FT_LINK_OPEN,
     FT_OPEN,
     FT_OPEN_ACK,
     FT_REQ,
     FT_RESP_CHUNK,
     FT_RESP_END,
     FT_RESP_SCHEMA,
+    FT_STREAM_CREDIT,
+    FT_STREAM_DATA,
+    FT_STREAM_END,
     N6K_PROTOCOL_VERSION,
     OP_CATALOG_LIST,
-    OP_READ_PLAN,
 )
 
 SERVER_HOST = os.environ.get("N6K_TEST_HOST", "127.0.0.1")
@@ -89,7 +95,7 @@ TUNED = Target(
 )
 
 
-# Substrait JSON plan builders. A READ_PLAN is the only read op qualified against the
+# Substrait JSON plan builders. A plan on a link is the only read qualified against the
 # session's catalog (QUERY is raw SQL), so it is what the conformance tests scan with.
 
 # The fixture tables the scans below address, as (column, substrait type) pairs.
@@ -129,27 +135,50 @@ def substrait_read(
     return rel
 
 
-def substrait_plan(rel: dict[str, Any], names: list[str], functions: list[str] = ()) -> str:
+def substrait_plan(rel: dict[str, Any], names: list[str], slice_id: int = 0) -> str:
+    """A statement of one slice, as crossing's far side reads it."""
+    wrapped = {"extensionSingle": {"detail": {"id": slice_id, "ordered": False}, "input": rel}}
     return json.dumps(
         {
             "version": {"minorNumber": 98, "producer": "test"},
-            "extensionUris": [{"extensionUriAnchor": 1, "uri": "https://n6k.io/substrait/duckdb.yaml"}],
-            "extensions": [
-                {"extensionFunction": {"extensionUriReference": 1, "functionAnchor": i + 1, "name": name}}
-                for i, name in enumerate(functions)
-            ],
-            "relations": [{"root": {"input": rel, "names": names}}],
+            "relations": [{"root": {"input": wrapped, "names": names}}],
         }
     )
 
 
 def scan_plan(schema: str, table: str, columns: Optional[list[str]] = None) -> str:
-    """A READ_PLAN body scanning `schema.table` (a FIXTURE_TABLES entry), optionally
-    projected to `columns`."""
+    """A plan scanning `schema.table` (a FIXTURE_TABLES entry), optionally projected to `columns`."""
     all_columns = FIXTURE_TABLES[table]
     names = [name for name, _ in all_columns]
     fields = None if columns is None else [names.index(c) for c in columns]
     return substrait_plan(substrait_read(schema, table, all_columns, fields), columns or names)
+
+
+# Crossing's frames on a link, spelled by hand: the header is crossing's own, carried unread by a real transport.
+CONTROL_STREAM = 0
+
+
+def slice_stream(slice_id: int = 0, into_far: bool = False, stream: int = 0) -> int:
+    return 1 + ((((slice_id << 1) | int(into_far)) << 16) | stream)
+
+
+def plan_header(plan: str, ends_transaction: bool = True, slice_id: int = 0) -> str:
+    """`ends_transaction`: far commits when the statement ends and replies nothing on the control stream."""
+    return f"PLAN\n{int(ends_transaction)}\n1\n{slice_id}\n{plan}"
+
+
+def stream_payload(header: str, arrow: bytes = b"") -> bytes:
+    encoded = header.encode()
+    return struct.pack("<I", len(encoded)) + encoded + arrow
+
+
+def parse_stream_payload(payload: bytes) -> tuple[str, bytes]:
+    (length,) = struct.unpack_from("<I", payload)
+    return payload[4 : 4 + length].decode(), payload[4 + length :]
+
+
+def stream_data(ns: int, link: int, stream: int, payload: bytes, fin: bool = True) -> bytes:
+    return pack_frame({"t": FT_STREAM_DATA, "ns": ns, "link": link, "stream": stream, "fin": fin}, payload)
 
 
 def server_is_up(timeout: float = 2.0) -> bool:
@@ -173,6 +202,7 @@ class WireClient:
         self.ws = ws
         self.ns = ns
         self._next_id = 1
+        self._next_link = 1
 
     async def send(self, op: int, body: bytes = b"", **args: Any) -> int:
         """Send one REQ. `body` is the raw payload appended after the header — Arrow IPC
@@ -217,12 +247,53 @@ class WireClient:
         assert errs, f"expected an ERR frame, got {[h['t'] for h, _ in frames]}"
         return errs[0]
 
-    async def scan(self, schema: str, table: str, columns: Optional[list[str]] = None, **args: Any) -> pa.Table:
-        """Scan a fixture table through the session's catalog via READ_PLAN."""
-        return await self.table(OP_READ_PLAN, plan=scan_plan(schema, table, columns), **args)
+    async def run_plan(self, plan: str, ns: Optional[int] = None) -> tuple[pa.Table, Optional[dict[str, Any]]]:
+        """Run a read-only statement of slice 0 on a link of its own. Returns its rows and the frame carrying its
+        error, if any."""
+        ns = self.ns if ns is None else ns
+        link = self._next_link
+        self._next_link += 1
+        await self.ws.send(pack_frame({"t": FT_LINK_OPEN, "ns": ns, "link": link}))
+        await self.ws.send(stream_data(ns, link, CONTROL_STREAM, stream_payload(plan_header(plan))))
+        arrow = b""
+        partial = b""
+        failure: Optional[dict[str, Any]] = None
+        while True:
+            header, body = unpack_frame(await self.ws.recv())
+            if header.get("link") != link or header.get("ns") != ns:
+                continue
+            if header["t"] == FT_STREAM_DATA:
+                partial += bytes(body)
+                if header["fin"]:
+                    arrow += parse_stream_payload(partial)[1]
+                    partial = b""
+                    await self.ws.send(
+                        pack_frame(
+                            {"t": FT_STREAM_CREDIT, "ns": ns, "link": link, "stream": header["stream"], "n": 1}
+                        )
+                    )
+            elif header["t"] in (FT_STREAM_END, FT_LINK_END):
+                if "exception_type" in header and failure is None:
+                    failure = dict(header)
+                if header["t"] == FT_LINK_END:
+                    break
+        await self.ws.send(pack_frame({"t": FT_LINK_CLOSE, "ns": ns, "link": link}))
+        return (ipc.open_stream(io.BytesIO(arrow)).read_all() if arrow else pa.table({})), failure
 
-    async def scan_error(self, schema: str, table: str, **args: Any) -> dict[str, Any]:
-        return await self.error(OP_READ_PLAN, plan=scan_plan(schema, table), **args)
+    async def scan(
+        self, schema: str, table: str, columns: Optional[list[str]] = None, ns: Optional[int] = None
+    ) -> pa.Table:
+        """Scan a fixture table through the session's catalog. A link's rows are positional, so the names are ours."""
+        rows, failure = await self.run_plan(scan_plan(schema, table, columns), ns)
+        assert failure is None, failure
+        if rows.num_columns == 0:
+            return rows
+        return rows.rename_columns(columns or [name for name, _ in FIXTURE_TABLES[table]])
+
+    async def scan_error(self, schema: str, table: str, ns: Optional[int] = None) -> dict[str, Any]:
+        _, failure = await self.run_plan(scan_plan(schema, table), ns)
+        assert failure is not None, "expected the scan to fail"
+        return failure
 
 
 async def hello(ws: Any, token: str = "") -> dict[str, Any]:

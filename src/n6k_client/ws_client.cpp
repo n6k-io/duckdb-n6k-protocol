@@ -1,5 +1,6 @@
 #include "ws_client.hpp"
 #include "ws_msgpack.hpp"
+#include "n6k_link.hpp"
 #include "n6k_protocol_generated.hpp"
 #include "n6k_ws_log.hpp"
 
@@ -349,6 +350,25 @@ void WsClient::OnMessage(const std::string &bytes, bool binary) {
 		return;
 	}
 
+	if (IsLinkFrame(type)) {
+		std::shared_ptr<N6kLinkState> link;
+		{
+			std::lock_guard<std::mutex> lk(links_mu_);
+			auto it = links_.find(static_cast<uint32_t>(GetInt(h, "link", 0)));
+			if (it != links_.end()) {
+				link = it->second;
+			}
+		}
+		if (link) {
+			try {
+				link->Deliver(type, h, body_ptr, body_len);
+			} catch (const std::exception &e) {
+				FailConnectionAndAllInFlightRequests(std::string("malformed link frame from server: ") + e.what());
+			}
+		}
+		return;
+	}
+
 	// Rebuild the Frame: Arrow bodies stay raw; everything else reconstructs to JSON from the header.
 	const bool is_arrow = (type == FrameType::RESP_SCHEMA) || HasKey(h, "arrow");
 	const bool terminal = (type == FrameType::RESP_END) || (type == FrameType::ERR);
@@ -475,8 +495,7 @@ void WsClient::Reconnect(const AbortCheck &should_abort) {
 	}
 }
 
-std::shared_ptr<RequestState> WsClient::AwaitReadySessionAndSendRequest(uint8_t op, const std::string &body,
-                                                                        const AbortCheck &should_abort) {
+void WsClient::EnsureConnected(const AbortCheck &should_abort) {
 	// Lazily re-establish a dropped (not closed) connection: reopen + re-handshake so a server drop recovers with no
 	// re-ATTACH. A moved generation means the connection beneath was replaced: clear `connected` to force a fresh OPEN.
 	if (IsConnected() && !stopping_.load()) {
@@ -492,6 +511,47 @@ std::shared_ptr<RequestState> WsClient::AwaitReadySessionAndSendRequest(uint8_t 
 	if (!IsConnected() || stopping_.load()) {
 		throw std::runtime_error("ws client not connected");
 	}
+}
+
+std::shared_ptr<N6kLinkState> WsClient::OpenLink(DatabaseInstance &db, idx_t streams, const AbortCheck &should_abort) {
+	EnsureConnected(should_abort);
+	std::weak_ptr<WsClient> weak_self = shared_from_this();
+	const auto id = next_link_id_.fetch_add(1);
+	auto link = std::make_shared<N6kLinkState>(db, static_cast<int64_t>(CurrentNs()), id, streams,
+	                                           [weak_self](std::string frame) {
+		                                           if (auto self = weak_self.lock()) {
+			                                           if (!self->stopping_.load()) {
+				                                           self->SendFrame(frame);
+			                                           }
+		                                           }
+	                                           });
+	{
+		std::lock_guard<std::mutex> lk(links_mu_);
+		links_[id] = link;
+	}
+	// A drop before the insert above failed every link but this one, and nothing would ever fail it.
+	if (!IsConnected() || stopping_.load()) {
+		{
+			std::lock_guard<std::mutex> lk(links_mu_);
+			links_.erase(id);
+		}
+		throw std::runtime_error("ws client not connected");
+	}
+	SendFrame(PackLinkFrame(FrameType::LINK_OPEN, static_cast<int64_t>(CurrentNs()), id));
+	return link;
+}
+
+void WsClient::CloseLink(N6kLinkState &link) {
+	{
+		std::lock_guard<std::mutex> lk(links_mu_);
+		links_.erase(link.Id());
+	}
+	link.SendFrame(PackLinkFrame(FrameType::LINK_CLOSE, static_cast<int64_t>(CurrentNs()), link.Id()));
+}
+
+std::shared_ptr<RequestState> WsClient::AwaitReadySessionAndSendRequest(uint8_t op, const std::string &body,
+                                                                        const AbortCheck &should_abort) {
+	EnsureConnected(should_abort);
 	uint32_t req_id = next_req_id_.fetch_add(1);
 	std::weak_ptr<WsClient> weak_self = shared_from_this();
 	auto st = std::make_shared<RequestState>(req_id, weak_self);
@@ -504,7 +564,7 @@ std::shared_ptr<RequestState> WsClient::AwaitReadySessionAndSendRequest(uint8_t 
 	size_t args_len = body.size();
 	const char *arrow = nullptr;
 	size_t arrow_len = 0;
-	if (op == OP_INSERT || op == OP_RPC_TABLE || op == OP_WRITE_PLAN) {
+	if (op == OP_INSERT || op == OP_RPC_TABLE) {
 		size_t nl = body.find('\n');
 		if (nl != std::string::npos) {
 			args_len = nl;
@@ -555,6 +615,15 @@ void WsClient::FailConnectionAndAllInFlightRequests(const std::string &reason) {
 	// reschedules a parked pipeline and must not run with state_mu_ held.
 	for (auto &kv : reqs) {
 		kv.second->DeliverSyntheticError(reason);
+	}
+	std::unordered_map<uint32_t, std::shared_ptr<N6kLinkState>> links;
+	{
+		std::lock_guard<std::mutex> lk(links_mu_);
+		links.swap(links_);
+	}
+	const ErrorData error(ExceptionType::IO, reason);
+	for (auto &kv : links) {
+		kv.second->Fail(error);
 	}
 }
 

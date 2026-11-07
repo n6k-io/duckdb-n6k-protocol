@@ -112,7 +112,7 @@ TEST_CASE("a created schema is usable however it is reached", "[twin][ddl]") {
 }
 
 TEST_CASE("table and view DDL work under an alias", "[twin][ddl]") {
-	SECTION("alter renders each kind and refuses the rest") {
+	SECTION("alter reaches the server") {
 		N6kTwin twin;
 		twin.Attach();
 		const std::string table = "db.main.t";
@@ -120,9 +120,11 @@ TEST_CASE("table and view DDL work under an alias", "[twin][ddl]") {
 		twin.Near("CREATE TABLE " + table +
 		          " AS SELECT * FROM VALUES (1, 'alice', 30), (2, 'bob', 25) v(id, name, age)");
 
-		twin.NearFails("ALTER TABLE " + table + " ALTER COLUMN age TYPE BIGINT", ExceptionType::BINDER,
-		               "not supported");
-		twin.NearFails("ALTER TABLE " + table + " RENAME TO renamed", ExceptionType::BINDER, "not supported");
+		twin.Near("ALTER TABLE " + table + " ALTER COLUMN age TYPE BIGINT");
+		REQUIRE(twin.FarRows("SELECT typeof(age) FROM " + table + " LIMIT 1") == RowList {"BIGINT"});
+		twin.Near("ALTER TABLE " + table + " RENAME TO renamed");
+		REQUIRE(twin.Rows("SELECT count(*) FROM db.main.renamed") == RowList {"2"});
+		twin.Near("ALTER TABLE db.main.renamed RENAME TO t");
 
 		twin.Near("ALTER TABLE " + table + " ADD COLUMN score DOUBLE");
 		REQUIRE(twin.Rows(columns) == RowList {"id", "name", "age", "score"});
