@@ -175,7 +175,7 @@ public:
 	    : conn(std::move(conn_p)), target_(target), batch_rows_(batch_rows) {
 	}
 
-	void Start(ServeReactor &reactor, RequestSlot &slot, unique_ptr<QueryResult> result) {
+	void Start(ServeReactor &reactor, RequestSlot &slot, unique_ptr<QueryResult> result, bool materialized = false) {
 		if (result->HasError()) {
 			result->ThrowError();
 		}
@@ -941,6 +941,9 @@ std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_p
 		break;
 	case OP_CREATE_SCHEMA:
 		HandleCreateSchema(reactor, conn, sess, body, body_len, slot);
+		break;
+	case OP_HAS_FUNCTION:
+		HandleHasFunction(reactor, conn, body, body_len, slot);
 		break;
 	case OP_HAS_FUNCTION:
 		HandleHasFunction(reactor, conn, body, body_len, slot);

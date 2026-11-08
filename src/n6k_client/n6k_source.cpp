@@ -131,6 +131,11 @@ void N6kSource::ForgetListing() {
 	listed = false;
 }
 
+void N6kSource::ForgetListing() {
+	lock_guard<mutex> guard(lock);
+	listed = false;
+}
+
 void N6kSource::ListIfNeeded() {
 	if (listed) {
 		return;
@@ -296,6 +301,59 @@ CrossingSchema N6kSource::DescribeSchema(const string &schema) {
 		described.verbs = CrossingVerbsNamed(it->second);
 	}
 	return described;
+}
+
+static bool NamedCallOf(const Expression &expr, string &name, vector<string> &args) {
+	auto add_args = [&](const vector<unique_ptr<Expression>> &children) {
+		for (auto &child : children) {
+			args.push_back(child->GetReturnType().ToString());
+		}
+	};
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &call = expr.Cast<BoundFunctionExpression>();
+		name = call.Function().GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	case ExpressionClass::BOUND_AGGREGATE: {
+		auto &call = expr.Cast<BoundAggregateExpression>();
+		name = call.Function().GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	case ExpressionClass::BOUND_WINDOW: {
+		auto &call = expr.Cast<BoundWindowExpression>();
+		if (!call.AggregateFunction()) {
+			return false;
+		}
+		name = call.AggregateFunction()->GetName().GetIdentifierName();
+		add_args(call.GetChildren());
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+bool N6kSource::ServerHasFunction(const string &name, const vector<string> &args) {
+	auto signature = name + "(" + StringUtil::Join(args, ", ") + ")";
+	{
+		lock_guard<mutex> guard(server_functions_lock);
+		auto known = server_functions.find(signature);
+		if (known != server_functions.end()) {
+			return known->second;
+		}
+	}
+	auto exists = session->HasFunction(name, args);
+	lock_guard<mutex> guard(server_functions_lock);
+	server_functions[signature] = exists;
+	return exists;
+}
+
+void N6kSource::ForgetServerFunctions() {
+	lock_guard<mutex> guard(server_functions_lock);
+	server_functions.clear();
 }
 
 static bool NamedCallOf(const Expression &expr, string &name, vector<string> &args) {

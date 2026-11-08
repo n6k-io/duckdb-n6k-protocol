@@ -235,6 +235,19 @@ public:
 		return duckdb_yyjson::yyjson_get_bool(exists);
 	}
 
+	bool HasFunction(const string &name, const vector<string> &args) override {
+		std::string arrow, json_chunk, end_body;
+		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_HAS_FUNCTION, n6k_body::HasFunction(name, args),
+		                              arrow, json_chunk, end_body, StreamCancelCheck());
+		n6k::JsonDoc doc(end_body);
+		auto *exists = doc.Parsed() ? duckdb_yyjson::yyjson_obj_get(doc.Root(), "exists") : nullptr;
+		if (!exists || !duckdb_yyjson::yyjson_is_bool(exists)) {
+			throw IOException("n6k[%s] %s: server response has no \"exists\"", catalog_name_,
+			                  n6k::OpName(n6k::OP_HAS_FUNCTION));
+		}
+		return duckdb_yyjson::yyjson_get_bool(exists);
+	}
+
 	std::shared_ptr<n6k::RequestState> StartOpRequest(uint8_t op, const string &body_json,
 	                                                  const StreamCancelCheck &should_cancel) override {
 		return client_->AwaitReadySessionAndSendRequest(op, body_json, should_cancel);

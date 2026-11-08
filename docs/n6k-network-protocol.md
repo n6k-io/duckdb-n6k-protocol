@@ -197,6 +197,18 @@ server's `max_links` until the client's `LINK_CLOSE`, and frames for an ended li
 A paused catalog holds its links' control frames until it resumes. A dropped connection ends every link on it, and a
 link never moves to a new connection.
 
+`CREATE_TABLE` `columns` entries are `{name, type, not_null?}`. Optional `primary_key` (string[]) and `unique_keys`
+(string[][]) declare table constraints. Other constraints, defaults and generated columns are rejected client-side with
+`BinderException`.
+
+`CREATE_SCHEMA {schema, on_conflict}` creates a schema in the session's catalog; `on_conflict` is `error` or `ignore`,
+and there is no `txn`. It needs the `schema_ddl` capability. A catalog that grants no create refuses it with
+`PermissionException`. The client refuses `CREATE SCHEMA` in a transaction, nested schemas and `CREATE OR REPLACE
+SCHEMA` with `BinderException`.
+
+`CREATE_TABLE` and `ALTER_TABLE` take an optional `txn` and run in that transaction. The fields in this section other
+than `columns`' `name` and `type` need the `table_ddl` capability.
+
 ## Capabilities
 
 Additive protocol changes do not bump `protocol_version`; they are negotiated

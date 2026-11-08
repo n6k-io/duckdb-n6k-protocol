@@ -423,6 +423,11 @@ The extension answers the REQ ops dispatched in `HandleRequest`
 | `INSERT` | ✅ Arrow IPC body → `INSERT`, → `{"rowcount":N}` |
 | `CREATE_SCHEMA` | ✅ → `{"ok":true}`; `PermissionException` on a read-only, bridge, provider or chained catalog |
 | `RPC_SCALAR` / `RPC_TABLE` | ✅ calls a host registration, or a table function or macro resolved in the served DuckDB |
+| `HAS_FUNCTION` | ✅ → `{"exists":bool}`; an exact signature match against the system catalog's scalar and aggregate functions |
+
+A client asks `HAS_FUNCTION` before sending a function call in a plan, and runs the call itself on a no. It
+caches each answer until `n6k_invalidate_cache`, a catalog invalidation or `DETACH`. A client function with the
+same name and argument types as a different server function gets a yes, so the server's function runs.
 
 Reads, writes, transactions and table and view DDL arrive on [links](n6k-network-protocol.md#links), which crossing's
 far side runs over the served catalog (and, under `catalog_plans`, the socket's other open catalogs).
