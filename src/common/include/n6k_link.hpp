@@ -22,7 +22,7 @@ namespace n6k {
 
 // A crossing frame travels in STREAM_DATA frames of at most this much payload: wasm's rings carry at most
 // 1 MiB per frame.
-constexpr size_t N6K_STREAM_FRAGMENT_BYTES = 512 * 1024;
+constexpr size_t N6K_STREAM_FRAGMENT_BYTES = size_t(512) * 1024;
 // What a peer may have queued on one link, whole or in pieces. Past it the peer is breaking the protocol.
 constexpr size_t N6K_LINK_MAX_INBOUND_BYTES = size_t(1) << 30;
 constexpr size_t N6K_LINK_MAX_STREAMS = size_t(1) << 20;
@@ -86,6 +86,7 @@ private:
 
 	CrossingIo StreamSend(N6kLinkSlot &slot, CrossingFrame &frame, const CrossingWaker &waker);
 	void StreamClose(N6kLinkSlot &slot, optional_ptr<const ErrorData> error);
+	void StreamDetach(N6kLinkSlot &slot, idx_t open);
 	std::string EncodeRows(N6kLinkSlot &slot, DataChunk &rows);
 	void DecodeRows(N6kLinkSlot &slot, const std::string &payload, size_t offset, CrossingReceiver &receiver,
 	                DataChunk &rows);

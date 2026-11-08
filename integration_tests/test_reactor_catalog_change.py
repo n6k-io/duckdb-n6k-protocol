@@ -26,7 +26,6 @@ from duckdb.sqltypes import UUID, VARCHAR
 from _paths import REPO_ROOT
 from _targets import (
     CONTROL_STREAM,
-    parse_stream_payload,
     plan_header,
     stream_payload,
     substrait_plan,

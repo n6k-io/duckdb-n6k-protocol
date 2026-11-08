@@ -121,10 +121,13 @@ Every serving `CALL` runs the same `ServeReactor`; only the `ServeTransport` beh
   the keepalive.
 - `workers`: requests that run at once on the connection; the rest of the window waits in
   arrival order.
+- `max_links` (default `MAX_CONCURRENT_REQS`): far transactions open at once on the connection,
+  each on its own thread; one more is answered `LINK_END` with an error.
 - `idle_stream_timeout_ms` (0 is off): a stream parked for credit longer than this is
-  answered `FT_ERR` and ended.
-- `idle_txn_timeout_ms` (0 is off): a pinned transaction no request has used for this long
-  is rolled back, and a later request naming it gets `TransactionException`.
+  answered `FT_ERR` and ended, and a link whose stream has waited for credit with no traffic
+  for this long is cancelled.
+- `idle_txn_timeout_ms` (0 is off): a link waiting this long for its next statement is
+  cancelled, and its transaction rolled back.
 
 The callbacks are the
 names of scalar UDFs the host registered on the database; the extension calls each on
@@ -398,9 +401,12 @@ three roles:
   reader's table and survives its session being closed mid-request. A stream out of
   credit **parks**: it leaves its worker and holds no thread until `FT_CREDIT` (or a
   cancel) queues it again, and one that could keep sending yields between frames while
-  another request waits. A read in a pinned transaction is materialized, so it releases
-  the transaction before it streams. Shutdown drains requests (each closes its
-  `Connection`) and joins the workers before the `CALL` returns.
+  another request waits. Shutdown drains requests (each closes its `Connection`) and
+  joins the workers before the `CALL` returns;
+- one **thread per link**, up to `max_links`, running crossing's `CrossingFar::Serve` on a
+  `Connection` of its own until the link's transaction ends. The reader decodes each link
+  frame and hands it to crossing as it arrives. Shutdown and a session's close cancel its
+  links and join their threads.
 
 ## Op coverage
 
@@ -410,25 +416,23 @@ The extension answers the REQ ops dispatched in `HandleRequest`
 | Op | Status |
 |---|---|
 | `SCHEMA_LIST` | ✅ schemas of the session's catalog (system schemas excluded) |
-| `TABLES_LIST` | ✅ tables/views + verbs + primary keys, schema verbs (optional schema filter) |
+| `TABLES_LIST` | ✅ tables/views + verbs + `row_ids` + primary keys, schema verbs (optional schema filter) |
 | `TABLE_SCHEMA` | ✅ Arrow schema (`SELECT … LIMIT 0`) |
 | `QUERY` | ✅ raw passthrough SQL, streamed |
-| `READ_PLAN` | ✅ Substrait plan decoded over the served catalog (and, under `catalog_plans`, the socket's other open catalogs), streamed |
-| `WRITE_PLAN` | ✅ crossing write → `{"rowcount":N}`, or with `returning_columns` the rows it left, streamed |
-| `TXN_BEGIN` / `TXN_COMMIT` / `TXN_ROLLBACK` | ✅ one pinned `Connection` per `(ns, txn)` |
 | `EXEC` | ✅ → `{"rowcount":N}` |
 | `INSERT` | ✅ Arrow IPC body → `INSERT`, → `{"rowcount":N}` |
-| `CREATE_TABLE` / `ALTER_TABLE` | ✅ → `{"ok":true}`, in `txn` if given (CREATE: `NOT NULL`, primary key, unique keys; ALTER: add/drop/rename column) |
 | `CREATE_SCHEMA` | ✅ → `{"ok":true}`; `PermissionException` on a read-only, bridge, provider or chained catalog |
-| `CREATE_VIEW` / `DROP_VIEW` | ✅ → `{"ok":true}`; the body is a Substrait plan decoded over the served catalog |
 | `RPC_SCALAR` / `RPC_TABLE` | ✅ calls a host registration, or a table function or macro resolved in the served DuckDB |
+
+Reads, writes, transactions and table and view DDL arrive on [links](n6k-network-protocol.md#links), which crossing's
+far side runs over the served catalog (and, under `catalog_plans`, the socket's other open catalogs).
 | `HAS_FUNCTION` | ✅ → `{"exists":bool}`; an exact signature match against the system catalog's scalar and aggregate functions |
 
 A client asks `HAS_FUNCTION` before sending a function call in a plan, and runs the call itself on a no. It
 caches each answer until `n6k_invalidate_cache`, a catalog invalidation or `DETACH`. A client function with the
 same name and argument types as a different server function gets a yes, so the server's function runs.
 
-Streaming ops (`QUERY`, `READ_PLAN`, `RPC_*`) follow the protocol's credit and
+Streaming ops (`QUERY`, `RPC_*`) follow the protocol's credit and
 cancel rules ([Lifecycle](n6k-network-protocol.md#lifecycle)). Errors are typed
 `ERR` frames, with `retriable` set per `IsRetriableExceptionType` — the same [error reporting](n6k-network-protocol.md#error-reporting)
 contract the client expects.

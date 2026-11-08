@@ -518,7 +518,7 @@ std::shared_ptr<N6kLinkState> WsClient::OpenLink(DatabaseInstance &db, idx_t str
 	std::weak_ptr<WsClient> weak_self = shared_from_this();
 	const auto id = next_link_id_.fetch_add(1);
 	auto link = std::make_shared<N6kLinkState>(db, static_cast<int64_t>(CurrentNs()), id, streams,
-	                                           [weak_self](std::string frame) {
+	                                           [weak_self](const std::string &frame) {
 		                                           if (auto self = weak_self.lock()) {
 			                                           if (!self->stopping_.load()) {
 				                                           self->SendFrame(frame);

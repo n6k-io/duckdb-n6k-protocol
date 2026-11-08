@@ -206,6 +206,12 @@ TEST_CASE("constraints, defaults and generated columns reach the server and are 
 		REQUIRE(twin.Rows("SELECT * FROM db.main.k") == RowList {"1|1"});
 	}
 
+	SECTION("a check refuses the first row inserted") {
+		twin.Near("CREATE TABLE db.main.t_c (i INTEGER CHECK (i > 0))");
+		twin.NearFails("INSERT INTO db.main.t_c VALUES (-1)", ExceptionType::CONSTRAINT, "");
+		REQUIRE(twin.Rows("SELECT count(*) FROM db.main.t_c") == RowList {"0"});
+	}
+
 	SECTION("a generated column reads back") {
 		twin.Near("CREATE TABLE db.main.k (id INTEGER, v INTEGER GENERATED ALWAYS AS (id + 1))");
 		twin.Near("INSERT INTO db.main.k (id) VALUES (1)");
@@ -237,6 +243,12 @@ TEST_CASE("constraints, defaults and generated columns reach the server and are 
 	SECTION("describe shows the server's constraints") {
 		REQUIRE(twin.Rows("SELECT column_name, \"null\", key FROM (DESCRIBE db.main.described)") ==
 		        RowList {"id|NO|PRI", "n|NO|NULL", "x|YES|NULL"});
+	}
+
+	SECTION("describe shows crossing's source default on every column") {
+		twin.Near("CREATE TABLE db.main.t_k (i BIGINT PRIMARY KEY, v VARCHAR)");
+		REQUIRE(twin.Rows("SELECT column_name, \"default\" FROM (DESCRIBE db.main.t_k)") ==
+		        RowList {"i|set_by_source()", "v|set_by_source()"});
 	}
 
 	REQUIRE(twin.ServeError().empty());

@@ -157,6 +157,8 @@ struct N6kLinkSlot {
 	// Guarded by N6kLinkState::lock.
 	bool opened = false;
 	optional_ptr<CrossingReceiver> receiver;
+	//! Which Open set `receiver`: only that handle's destruction may drop it.
+	idx_t receiver_open = 0;
 	std::deque<Inbound> inbound;
 	std::string partial;
 	size_t queued_bytes = 0;
@@ -186,8 +188,12 @@ struct N6kLinkSlot {
 
 class N6kLinkStream : public CrossingStream {
 public:
-	N6kLinkStream(std::shared_ptr<N6kLinkState> state_p, std::shared_ptr<N6kLinkSlot> slot_p)
-	    : state(std::move(state_p)), slot(std::move(slot_p)) {
+	N6kLinkStream(std::shared_ptr<N6kLinkState> state_p, std::shared_ptr<N6kLinkSlot> slot_p, idx_t open_p)
+	    : state(std::move(state_p)), slot(std::move(slot_p)), open(open_p) {
+	}
+	// The receiver need only outlive this handle, and crossing may drop a handle it never closed.
+	~N6kLinkStream() override {
+		state->StreamDetach(*slot, open);
 	}
 
 	CrossingIo Send(CrossingFrame &frame, CrossingWaker waker) override {
@@ -200,6 +206,7 @@ public:
 private:
 	std::shared_ptr<N6kLinkState> state;
 	std::shared_ptr<N6kLinkSlot> slot;
+	idx_t open;
 };
 
 N6kLinkState::N6kLinkState(DatabaseInstance &db_p, int64_t ns_p, uint32_t link_p, idx_t streams_p, SendBytes send_p)
@@ -258,14 +265,27 @@ std::shared_ptr<N6kLinkSlot> N6kLinkState::SlotOf(idx_t id) {
 
 unique_ptr<CrossingStream> N6kLinkState::Open(idx_t id, optional_ptr<CrossingReceiver> receiver) {
 	std::shared_ptr<N6kLinkSlot> slot;
+	idx_t open;
 	{
 		std::lock_guard<std::mutex> guard(lock);
 		slot = SlotOf(id);
 		slot->opened = true;
 		slot->receiver = receiver;
+		open = ++slot->receiver_open;
 	}
 	Pump(slot);
-	return make_uniq<N6kLinkStream>(shared_from_this(), slot);
+	return make_uniq<N6kLinkStream>(shared_from_this(), slot, open);
+}
+
+void N6kLinkState::StreamDetach(N6kLinkSlot &slot, idx_t open) {
+	std::unique_lock<std::mutex> guard(lock);
+	if (slot.receiver_open != open || !slot.receiver) {
+		return;
+	}
+	if (slot.delivering_thread != std::this_thread::get_id()) {
+		delivered.wait(guard, [&slot]() { return !slot.delivering; });
+	}
+	slot.receiver = nullptr;
 }
 
 void N6kLinkState::Pump(const std::shared_ptr<N6kLinkSlot> &slot_p) {
@@ -326,6 +346,7 @@ void N6kLinkState::Pump(const std::shared_ptr<N6kLinkSlot> &slot_p) {
 		break;
 	}
 	slot.delivering = false;
+	slot.delivering_thread = std::thread::id();
 	guard.unlock();
 	delivered.notify_all();
 }
@@ -518,8 +539,11 @@ CrossingIo N6kLinkState::StreamSend(N6kLinkSlot &slot, CrossingFrame &frame, con
 	}
 	if (slot.id == CONTROL_STREAM) {
 		std::lock_guard<std::mutex> guard(lock);
-		if (control_unanswered > 0 && --control_unanswered == 0) {
-			control_idle_ms.store(NowMs());
+		if (control_unanswered > 0) {
+			control_unanswered--;
+			if (control_unanswered == 0) {
+				control_idle_ms.store(NowMs());
+			}
 		}
 	}
 	Touch();

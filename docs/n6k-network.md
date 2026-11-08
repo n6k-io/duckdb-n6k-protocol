@@ -10,7 +10,7 @@ provider catalogs (no network, no server) live in the sibling
 
 Attached catalogs with the same URL and token share one WebSocket; every operation —
 schema discovery, scans, inserts, DDL, exec, query, and RPC — is multiplexed on
-that socket, `CREATE TABLE` included (`OP_CREATE_TABLE`). Catalog-scoped table
+that socket, reads, writes and DDL on [links](n6k-network-protocol.md#links). Catalog-scoped table
 functions use the `n6k_catalog_*` prefix (e.g. `n6k_catalog_exec`,
 `n6k_catalog_rpc`). The only HTTP a client speaks is OAuth discovery / token
 exchange, and that is against the authorization server, not an n6k server.
