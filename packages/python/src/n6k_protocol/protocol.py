@@ -24,7 +24,7 @@ from typing import Any, Final, Union
 # The major version: bump only on incompatible changes (frame layout, op semantics, etc.).
 # Additive changes are negotiated as capabilities instead (HELLO_CAPS / OPEN_CAPS). Both ends check
 # it: the server against HELLO (HELLO_ERR on mismatch), the client against HELLO_ACK.
-N6K_PROTOCOL_VERSION = 12
+N6K_PROTOCOL_VERSION = 13
 
 # ── Frame types ──────────────────────────────────────────────────────────────
 FT_REQ: Final = 1
@@ -45,6 +45,13 @@ FT_OPEN_ACK: Final = 16
 FT_OPEN_ERR: Final = 17
 FT_OPEN_PENDING: Final = 18
 FT_HELLO_PENDING: Final = 19
+FT_LINK_OPEN: Final = 20
+FT_LINK_CANCEL: Final = 21
+FT_LINK_CLOSE: Final = 22
+FT_LINK_END: Final = 23
+FT_STREAM_DATA: Final = 24
+FT_STREAM_END: Final = 25
+FT_STREAM_CREDIT: Final = 26
 
 _FRAME_TYPES = [
     ("REQ", FT_REQ),
@@ -65,6 +72,13 @@ _FRAME_TYPES = [
     ("OPEN_ERR", FT_OPEN_ERR),
     ("OPEN_PENDING", FT_OPEN_PENDING),
     ("HELLO_PENDING", FT_HELLO_PENDING),
+    ("LINK_OPEN", FT_LINK_OPEN),
+    ("LINK_CANCEL", FT_LINK_CANCEL),
+    ("LINK_CLOSE", FT_LINK_CLOSE),
+    ("LINK_END", FT_LINK_END),
+    ("STREAM_DATA", FT_STREAM_DATA),
+    ("STREAM_END", FT_STREAM_END),
+    ("STREAM_CREDIT", FT_STREAM_CREDIT),
 ]
 
 # ── Frame flags ─────────────────────────────────────────────────────────────
@@ -89,18 +103,9 @@ OP_EXEC: Final = 6
 OP_QUERY: Final = 7
 OP_RPC_SCALAR: Final = 8
 OP_RPC_TABLE: Final = 9
-OP_CREATE_TABLE: Final = 10
-OP_ALTER_TABLE: Final = 11
 OP_CATALOG_INVALIDATED: Final = 12
-OP_READ_PLAN: Final = 14
-OP_WRITE_PLAN: Final = 15
-OP_TXN_BEGIN: Final = 16
-OP_TXN_COMMIT: Final = 17
-OP_TXN_ROLLBACK: Final = 18
 OP_CATALOG_LIST: Final = 19
 OP_CATALOGS_CHANGED: Final = 20
-OP_CREATE_VIEW: Final = 21
-OP_DROP_VIEW: Final = 22
 OP_HAS_FUNCTION: Final = 23
 OP_CREATE_SCHEMA: Final = 24
 
@@ -113,18 +118,9 @@ _OPS = [
     ("QUERY", OP_QUERY),
     ("RPC_SCALAR", OP_RPC_SCALAR),
     ("RPC_TABLE", OP_RPC_TABLE),
-    ("CREATE_TABLE", OP_CREATE_TABLE),
-    ("ALTER_TABLE", OP_ALTER_TABLE),
     ("CATALOG_INVALIDATED", OP_CATALOG_INVALIDATED),
-    ("READ_PLAN", OP_READ_PLAN),
-    ("WRITE_PLAN", OP_WRITE_PLAN),
-    ("TXN_BEGIN", OP_TXN_BEGIN),
-    ("TXN_COMMIT", OP_TXN_COMMIT),
-    ("TXN_ROLLBACK", OP_TXN_ROLLBACK),
     ("CATALOG_LIST", OP_CATALOG_LIST),
     ("CATALOGS_CHANGED", OP_CATALOGS_CHANGED),
-    ("CREATE_VIEW", OP_CREATE_VIEW),
-    ("DROP_VIEW", OP_DROP_VIEW),
     ("HAS_FUNCTION", OP_HAS_FUNCTION),
     ("CREATE_SCHEMA", OP_CREATE_SCHEMA),
 ]
@@ -242,6 +238,40 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
     },
     {"name": "CANCEL", "t": FT_CANCEL, "fields": [_F_ID]},
     {"name": "CREDIT", "t": FT_CREDIT, "fields": [_F_ID, ("n", "integer", True)]},
+    # ── Links: one far transaction and its streams. See docs/n6k-network-protocol.md ─────
+    {"name": "LINK_OPEN", "t": FT_LINK_OPEN, "fields": [("link", "integer", True)]},
+    {"name": "LINK_CANCEL", "t": FT_LINK_CANCEL, "fields": [("link", "integer", True)]},
+    {"name": "LINK_CLOSE", "t": FT_LINK_CLOSE, "fields": [("link", "integer", True)]},
+    {
+        "name": "LINK_END",
+        "t": FT_LINK_END,
+        "fields": [
+            ("link", "integer", True),
+            ("exception_type", "string", False),
+            ("exception_message", "string", False),
+        ],
+    },
+    {
+        "name": "STREAM_DATA",
+        "t": FT_STREAM_DATA,
+        "fields": [("link", "integer", True), ("stream", "integer", True), ("fin", "boolean", True)],
+        "body": "bytes",
+    },
+    {
+        "name": "STREAM_END",
+        "t": FT_STREAM_END,
+        "fields": [
+            ("link", "integer", True),
+            ("stream", "integer", True),
+            ("exception_type", "string", False),
+            ("exception_message", "string", False),
+        ],
+    },
+    {
+        "name": "STREAM_CREDIT",
+        "t": FT_STREAM_CREDIT,
+        "fields": [("link", "integer", True), ("stream", "integer", True), ("n", "integer", True)],
+    },
     {
         "name": "PUSH_CATALOG_INVALIDATED",
         "t": FT_PUSH,
@@ -284,18 +314,17 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
     # ── Requests (t=REQ, discriminated on op) ────────────────────────────────
     {"name": "REQ_CATALOG_LIST", "t": FT_REQ, "op": OP_CATALOG_LIST, "fields": [_F_ID]},
     {"name": "REQ_SCHEMA_LIST", "t": FT_REQ, "op": OP_SCHEMA_LIST, "fields": [_F_ID]},
-    # `txn` lists and describes inside that transaction, so it sees its own uncommitted DDL.
     {
         "name": "REQ_TABLES_LIST",
         "t": FT_REQ,
         "op": OP_TABLES_LIST,
-        "fields": [_F_ID, ("schema", "string", False), ("txn", "integer", False)],
+        "fields": [_F_ID, ("schema", "string", False)],
     },
     {
         "name": "REQ_TABLE_SCHEMA",
         "t": FT_REQ,
         "op": OP_TABLE_SCHEMA,
-        "fields": [_F_ID, ("schema", "string", True), ("table", "string", True), ("txn", "integer", False)],
+        "fields": [_F_ID, ("schema", "string", True), ("table", "string", True)],
     },
     {
         "name": "REQ_INSERT",
@@ -304,32 +333,6 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         "fields": [_F_ID, ("schema", "string", True), ("table", "string", True)],
         "body": "arrow",
     },
-    {
-        "name": "REQ_READ_PLAN",
-        "t": FT_REQ,
-        "op": OP_READ_PLAN,
-        "fields": [_F_ID, ("plan", "string", True), ("txn", "integer", False), ("_batch_rows", "integer", False)],
-    },
-    {
-        "name": "REQ_WRITE_PLAN",
-        "t": FT_REQ,
-        "op": OP_WRITE_PLAN,
-        "fields": [
-            _F_ID,
-            ("verb", "string", True),
-            ("schema", "string", True),
-            ("table", "string", True),
-            ("key_columns", _ARRAY_OF_STR, True),
-            ("set_columns", _ARRAY_OF_STR, True),
-            ("reads_rows", "boolean", False),
-            ("plan", "string", True),
-            ("txn", "integer", False),
-        ],
-        "body": "arrow",
-    },
-    {"name": "REQ_TXN_BEGIN", "t": FT_REQ, "op": OP_TXN_BEGIN, "fields": [_F_ID]},
-    {"name": "REQ_TXN_COMMIT", "t": FT_REQ, "op": OP_TXN_COMMIT, "fields": [_F_ID, ("txn", "integer", True)]},
-    {"name": "REQ_TXN_ROLLBACK", "t": FT_REQ, "op": OP_TXN_ROLLBACK, "fields": [_F_ID, ("txn", "integer", True)]},
     {"name": "REQ_EXEC", "t": FT_REQ, "op": OP_EXEC, "fields": [_F_ID, ("sql", "string", True)]},
     {
         "name": "REQ_QUERY",
@@ -351,47 +354,6 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         "body": "arrow?",
     },
     {
-        "name": "REQ_CREATE_TABLE",
-        "t": FT_REQ,
-        "op": OP_CREATE_TABLE,
-        "fields": [
-            _F_ID,
-            ("schema", "string", True),
-            ("name", "string", True),
-            ("columns", "array", True),
-            ("primary_key", _ARRAY_OF_STR, False),
-            ("unique_keys", _ARRAY_OF_STR_ARRAYS, False),
-            ("txn", "integer", False),
-        ],
-    },
-    # `plan` is the view's body as Substrait JSON, floors only; its columns are `names`, in order.
-    {
-        "name": "REQ_CREATE_VIEW",
-        "t": FT_REQ,
-        "op": OP_CREATE_VIEW,
-        "fields": [
-            _F_ID,
-            ("schema", "string", True),
-            ("name", "string", True),
-            ("on_conflict", {"type": "string", "enum": ["error", "ignore", "replace"]}, True),
-            ("names", _ARRAY_OF_STR, True),
-            ("plan", "string", True),
-            ("txn", "integer", False),
-        ],
-    },
-    {
-        "name": "REQ_DROP_VIEW",
-        "t": FT_REQ,
-        "op": OP_DROP_VIEW,
-        "fields": [
-            _F_ID,
-            ("schema", "string", True),
-            ("name", "string", True),
-            ("if_exists", "boolean", True),
-            ("txn", "integer", False),
-        ],
-    },
-    {
         "name": "REQ_CREATE_SCHEMA",
         "t": FT_REQ,
         "op": OP_CREATE_SCHEMA,
@@ -403,19 +365,6 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         "t": FT_REQ,
         "op": OP_HAS_FUNCTION,
         "fields": [_F_ID, ("name", "string", True), ("args", _ARRAY_OF_STR, True)],
-    },
-    {
-        "name": "REQ_ALTER_TABLE",
-        "t": FT_REQ,
-        "op": OP_ALTER_TABLE,
-        "fields": [
-            _F_ID,
-            ("schema", "string", True),
-            ("table", "string", True),
-            ("kind", "string", True),
-            ("details", "object", False),
-            ("txn", "integer", False),
-        ],
     },
 ]
 
@@ -544,11 +493,10 @@ CAP_JSONRPC: Final = "jsonrpc"
 CAP_MCP: Final = "mcp"
 CAP_CATALOG_PLANS: Final = "catalog_plans"
 CAP_HAS_FUNCTION: Final = "has_function"
-CAP_TABLE_DDL: Final = "table_ddl"
 CAP_SCHEMA_DDL: Final = "schema_ddl"
 
 # What this implementation supports at each level; client and server both send their set.
 HELLO_CAPS: Final = (CAP_CROSSING, CAP_JSONRPC, CAP_MCP)
 # The subset of HELLO_CAPS the server grants only when the app serving the socket provides it.
 APP_HELLO_CAPS: Final = (CAP_JSONRPC, CAP_MCP)
-OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_TABLE_DDL, CAP_SCHEMA_DDL)
+OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_SCHEMA_DDL)

@@ -10,7 +10,7 @@
 namespace duckdb {
 namespace n6k {
 
-constexpr int N6K_PROTOCOL_VERSION = 12;
+constexpr int N6K_PROTOCOL_VERSION = 13;
 
 enum class FrameType : uint8_t {
 	REQ = 1,
@@ -31,6 +31,13 @@ enum class FrameType : uint8_t {
 	OPEN_ERR = 17,
 	OPEN_PENDING = 18,
 	HELLO_PENDING = 19,
+	LINK_OPEN = 20,
+	LINK_CANCEL = 21,
+	LINK_CLOSE = 22,
+	LINK_END = 23,
+	STREAM_DATA = 24,
+	STREAM_END = 25,
+	STREAM_CREDIT = 26,
 };
 
 // nullptr for a value outside FrameType.
@@ -72,6 +79,20 @@ inline const char *FrameTypeName(int type) {
 		return "OPEN_PENDING";
 	case 19:
 		return "HELLO_PENDING";
+	case 20:
+		return "LINK_OPEN";
+	case 21:
+		return "LINK_CANCEL";
+	case 22:
+		return "LINK_CLOSE";
+	case 23:
+		return "LINK_END";
+	case 24:
+		return "STREAM_DATA";
+	case 25:
+		return "STREAM_END";
+	case 26:
+		return "STREAM_CREDIT";
 	default:
 		return nullptr;
 	}
@@ -88,18 +109,9 @@ constexpr uint8_t OP_EXEC = 6;
 constexpr uint8_t OP_QUERY = 7;
 constexpr uint8_t OP_RPC_SCALAR = 8;
 constexpr uint8_t OP_RPC_TABLE = 9;
-constexpr uint8_t OP_CREATE_TABLE = 10;
-constexpr uint8_t OP_ALTER_TABLE = 11;
 constexpr uint8_t OP_CATALOG_INVALIDATED = 12;
-constexpr uint8_t OP_READ_PLAN = 14;
-constexpr uint8_t OP_WRITE_PLAN = 15;
-constexpr uint8_t OP_TXN_BEGIN = 16;
-constexpr uint8_t OP_TXN_COMMIT = 17;
-constexpr uint8_t OP_TXN_ROLLBACK = 18;
 constexpr uint8_t OP_CATALOG_LIST = 19;
 constexpr uint8_t OP_CATALOGS_CHANGED = 20;
-constexpr uint8_t OP_CREATE_VIEW = 21;
-constexpr uint8_t OP_DROP_VIEW = 22;
 constexpr uint8_t OP_HAS_FUNCTION = 23;
 constexpr uint8_t OP_CREATE_SCHEMA = 24;
 
@@ -118,11 +130,10 @@ constexpr const char *CAP_JSONRPC = "jsonrpc";
 constexpr const char *CAP_MCP = "mcp";
 constexpr const char *CAP_CATALOG_PLANS = "catalog_plans";
 constexpr const char *CAP_HAS_FUNCTION = "has_function";
-constexpr const char *CAP_TABLE_DDL = "table_ddl";
 constexpr const char *CAP_SCHEMA_DDL = "schema_ddl";
 constexpr std::array<const char *, 3> HELLO_CAPS = {{"crossing", "jsonrpc", "mcp"}};
 constexpr std::array<const char *, 2> APP_HELLO_CAPS = {{"jsonrpc", "mcp"}};
-constexpr std::array<const char *, 4> OPEN_CAPS = {{"catalog_plans", "has_function", "table_ddl", "schema_ddl"}};
+constexpr std::array<const char *, 3> OPEN_CAPS = {{"catalog_plans", "has_function", "schema_ddl"}};
 
 } // namespace n6k
 } // namespace duckdb

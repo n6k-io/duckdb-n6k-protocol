@@ -63,6 +63,7 @@ void AddServeOptionParameters(TableFunction &fn) {
 		options.Add("ping_interval_ms", LogicalType::BIGINT);
 		options.Add("open_pending_interval_ms", LogicalType::BIGINT);
 		options.Add("workers", LogicalType::BIGINT);
+		options.Add("max_links", LogicalType::BIGINT);
 		options.Add("idle_stream_timeout_ms", LogicalType::BIGINT);
 		options.Add("idle_txn_timeout_ms", LogicalType::BIGINT);
 	});
@@ -82,6 +83,7 @@ ServeOptions BindServeOptions(const TableFunctionBindInput &input, const char *f
 	options.open_pending_interval_ms =
 	    BindMs(input, "open_pending_interval_ms", fn_name, 1, options.open_pending_interval_ms);
 	options.workers = BindWorkers(input, fn_name, options.workers);
+	options.max_links = BindMs(input, "max_links", fn_name, 1, options.max_links);
 	options.idle_stream_timeout_ms =
 	    BindMs(input, "idle_stream_timeout_ms", fn_name, 0, options.idle_stream_timeout_ms);
 	options.idle_txn_timeout_ms = BindMs(input, "idle_txn_timeout_ms", fn_name, 0, options.idle_txn_timeout_ms);

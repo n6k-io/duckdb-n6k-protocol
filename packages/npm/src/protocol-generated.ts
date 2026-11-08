@@ -2,7 +2,7 @@
 // Source of truth: packages/python/src/n6k_protocol/protocol.py
 // Regenerate via `make protocol-gen`.
 
-export const N6K_PROTOCOL_VERSION = 12;
+export const N6K_PROTOCOL_VERSION = 13;
 
 export const FT = {
   REQ: 1,
@@ -23,6 +23,13 @@ export const FT = {
   OPEN_ERR: 17,
   OPEN_PENDING: 18,
   HELLO_PENDING: 19,
+  LINK_OPEN: 20,
+  LINK_CANCEL: 21,
+  LINK_CLOSE: 22,
+  LINK_END: 23,
+  STREAM_DATA: 24,
+  STREAM_END: 25,
+  STREAM_CREDIT: 26,
 } as const;
 
 export const OP = {
@@ -34,18 +41,9 @@ export const OP = {
   QUERY: 7,
   RPC_SCALAR: 8,
   RPC_TABLE: 9,
-  CREATE_TABLE: 10,
-  ALTER_TABLE: 11,
   CATALOG_INVALIDATED: 12,
-  READ_PLAN: 14,
-  WRITE_PLAN: 15,
-  TXN_BEGIN: 16,
-  TXN_COMMIT: 17,
-  TXN_ROLLBACK: 18,
   CATALOG_LIST: 19,
   CATALOGS_CHANGED: 20,
-  CREATE_VIEW: 21,
-  DROP_VIEW: 22,
   HAS_FUNCTION: 23,
   CREATE_SCHEMA: 24,
 } as const;
@@ -65,8 +63,7 @@ export const CAP_JSONRPC = "jsonrpc";
 export const CAP_MCP = "mcp";
 export const CAP_CATALOG_PLANS = "catalog_plans";
 export const CAP_HAS_FUNCTION = "has_function";
-export const CAP_TABLE_DDL = "table_ddl";
 export const CAP_SCHEMA_DDL = "schema_ddl";
 export const HELLO_CAPS: readonly string[] = ["crossing", "jsonrpc", "mcp"];
 export const APP_HELLO_CAPS: readonly string[] = ["jsonrpc", "mcp"];
-export const OPEN_CAPS: readonly string[] = ["catalog_plans", "has_function", "table_ddl", "schema_ddl"];
+export const OPEN_CAPS: readonly string[] = ["catalog_plans", "has_function", "schema_ddl"];

@@ -15,7 +15,6 @@ from typing import Any
 import duckdb
 import pytest
 
-from _targets import substrait_plan, substrait_read
 from test_reactor_catalog_change import SERVER_EXT_PATH, _collect_until, _of, _open, _Peer, _serving
 
 from n6k_protocol.protocol import (
@@ -29,9 +28,6 @@ from n6k_protocol.protocol import (
     FT_RESP_END,
     MAX_CONCURRENT_REQS,
     OP_QUERY,
-    OP_READ_PLAN,
-    OP_TXN_BEGIN,
-    OP_TXN_COMMIT,
 )
 
 # One row per frame, far more rows than any credit window: the stream starves until credited.
@@ -123,19 +119,6 @@ def test_the_window_still_refuses_past_its_limit_when_every_stream_is_parked(
         assert err["t"] == FT_ERR and "too many concurrent requests" in err["exception_message"]
 
 
-def test_a_starved_transaction_read_does_not_hold_up_its_commit(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute("CREATE TABLE a.main.t AS SELECT range AS i FROM range(100000)")
-    with _serving(con, ", 'a', workers => 1") as (peer, _):
-        assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
-        peer.send({"t": FT_REQ, "id": 1, "ns": 1, "op": OP_TXN_BEGIN})
-        txn = _end(peer, 1)["txn"]
-        plan = substrait_plan(substrait_read("main", "t", [("i", "i64")]), ["i"])
-        peer.send({"t": FT_REQ, "id": 2, "ns": 1, "op": OP_READ_PLAN, "plan": plan, "txn": txn, "_batch_rows": 1})
-        peer.recv_until(lambda f: f["t"] == FT_RESP_CHUNK and f.get("id") == 2)
-        peer.send({"t": FT_REQ, "id": 3, "ns": 1, "op": OP_TXN_COMMIT, "txn": txn})
-        assert _end(peer, 3)["t"] == FT_RESP_END
-
-
 @pytest.mark.parametrize("workers", [1, 4])
 def test_queued_requests_all_answer(con: duckdb.DuckDBPyConnection, workers: int) -> None:
     with _serving(con, f", 'a', workers => {workers}") as (peer, _):
@@ -184,34 +167,3 @@ def test_a_parked_stream_waits_indefinitely_by_default(con: duckdb.DuckDBPyConne
         peer.send({"t": FT_CREDIT, "id": 1, "ns": 1, "n": 100})
         end = _end(peer, 1)
         assert end["t"] == FT_RESP_END and not end.get("cancelled")
-
-
-def _begin(peer: _Peer, req_id: int) -> int:
-    peer.send({"t": FT_REQ, "id": req_id, "ns": 1, "op": OP_TXN_BEGIN})
-    return int(_end(peer, req_id)["txn"])
-
-
-def _read_in(peer: _Peer, req_id: int, txn: int) -> dict[str, Any]:
-    plan = substrait_plan(substrait_read("main", "t", [("i", "i64")]), ["i"])
-    peer.send({"t": FT_REQ, "id": req_id, "ns": 1, "op": OP_READ_PLAN, "plan": plan, "txn": txn})
-    return _end(peer, req_id)
-
-
-def test_an_idle_transaction_is_rolled_back_when_the_timeout_is_set(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute("CREATE TABLE a.main.t AS SELECT range AS i FROM range(10)")
-    with _serving(con, ", 'a', idle_txn_timeout_ms => 300") as (peer, _):
-        assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
-        txn = _begin(peer, 1)
-        time.sleep(1)
-        err = _read_in(peer, 2, txn)
-        assert err["t"] == FT_ERR and "not open on this session" in err["exception_message"]
-
-
-def test_a_transaction_in_use_outlives_the_timeout(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute("CREATE TABLE a.main.t AS SELECT range AS i FROM range(10)")
-    with _serving(con, ", 'a', idle_txn_timeout_ms => 500") as (peer, _):
-        assert _open(peer, 1, "a")["t"] == FT_OPEN_ACK
-        txn = _begin(peer, 1)
-        for req_id in range(2, 8):
-            time.sleep(0.2)
-            assert _read_in(peer, req_id, txn)["t"] == FT_RESP_END

@@ -22,6 +22,7 @@ struct WsTableRow {
 	string schema;
 	string name;
 	vector<string> verbs;
+	bool row_ids = true;
 	vector<string> primary_keys;
 	vector<string> not_null;
 	std::vector<std::vector<std::string>> unique_keys;
@@ -39,6 +40,7 @@ struct WsTableList {
 
 class RequestState;
 class ConnectionHub;
+class N6kLinkState;
 
 // `hello`: negotiated once per socket (HELLO_ACK). `open`: negotiated for this catalog (OPEN_ACK).
 struct NegotiatedCapabilities {
@@ -58,9 +60,8 @@ public:
 	virtual ~CatalogSession() = default;
 
 	virtual vector<string> ListSchemas() = 0;
-	// `txn` >= 0 lists and describes inside that server transaction.
-	virtual n6k::WsTableList ListTables(int64_t txn) = 0;
-	virtual void FetchTableSchema(const string &schema, const string &table, int64_t txn, ArrowArrayStream *out) = 0;
+	virtual n6k::WsTableList ListTables() = 0;
+	virtual void FetchTableSchema(const string &schema, const string &table, ArrowArrayStream *out) = 0;
 	virtual bool HasFunction(const string &name, const vector<string> &args) = 0;
 	// Start any op with a pre-serialized JSON body and hand back the raw RequestState so a source can
 	// drive it frame-by-frame (TryNext / SetOnFrame / Credit). The request is already in flight on
@@ -81,8 +82,10 @@ public:
 		}
 		return false;
 	}
-	virtual int64_t TxnBegin() = 0;
-	virtual void TxnEnd(int64_t txn, bool commit) = 0;
+	// One far transaction, already opening on the server on return. `should_abort` guards a reconnect.
+	virtual std::shared_ptr<n6k::N6kLinkState> OpenLink(DatabaseInstance &db, idx_t streams,
+	                                                    const StreamCancelCheck &should_abort) = 0;
+	virtual void CloseLink(n6k::N6kLinkState &link) = 0;
 	virtual int64_t Exec(const string &sql, const StreamCancelCheck &should_cancel) = 0;
 	virtual void Query(const string &sql, ArrowArrayStream *out, StreamCancelCheck should_cancel) = 0;
 	virtual void RpcScalar(const string &function, const string &args_json, ArrowArrayStream *out,

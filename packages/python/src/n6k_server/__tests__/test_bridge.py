@@ -238,17 +238,15 @@ def test_create_view_over_bridge_table_works():
     assert target.sql('SELECT id FROM "workspace"."main"."active_t"').fetchall() == [(1,)]
 
 
-def test_readwrite_no_pk_refuses_keyed_writes():
+def test_readwrite_no_pk_writes():
     source = _source("CREATE TABLE nopk(x INTEGER, y INTEGER)", "INSERT INTO nopk VALUES (1, 10)")
     target = _target()
     _bridge(source, target, _all_verbs("main.nopk"))
 
     target.sql('INSERT INTO "workspace"."main".nopk VALUES (2, 20)')
-    assert source.execute("SELECT count(*) FROM nopk").fetchone() == (2,)
-    with pytest.raises(duckdb.BinderException, match="has no key"):
-        target.sql('UPDATE "workspace"."main".nopk SET y = 99 WHERE x = 1')
-    with pytest.raises(duckdb.BinderException, match="has no key"):
-        target.sql('DELETE FROM "workspace"."main".nopk WHERE x = 1')
+    target.sql('UPDATE "workspace"."main".nopk SET y = 99 WHERE x = 1')
+    target.sql('DELETE FROM "workspace"."main".nopk WHERE x = 2')
+    assert source.execute("SELECT * FROM nopk").fetchall() == [(1, 99)]
 
 
 def test_readwrite_update_manual_pk_override():
@@ -742,7 +740,7 @@ def test_policies_insert_check_rejects_row():
     assert source.sql("SELECT id FROM t ORDER BY id").fetchall() == [(1,), (2,), (3,)]
 
 
-def test_policies_delete_ignores_select_policy():
+def test_policies_delete_without_where_ignores_select():
     source = _tenant_source()
     target = _target()
     _bridge(

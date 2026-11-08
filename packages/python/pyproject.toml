@@ -1,6 +1,6 @@
 [project]
 name = "n6k-duckdb"
-version = "0.13.0"
+version = "0.13.1"
 description = "n6k protocol definitions and the Python host for the n6k_server DuckDB extension"
 readme = "README.md"
 authors = [

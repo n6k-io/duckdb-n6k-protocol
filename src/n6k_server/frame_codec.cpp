@@ -284,16 +284,6 @@ std::string PackRespEndRowcount(const FrameTarget &target, int64_t rowcount) {
 	return PackedHeader(sb);
 }
 
-std::string PackRespEndTxn(const FrameTarget &target, int64_t txn) {
-	msgpack::sbuffer sb;
-	msgpack::packer<msgpack::sbuffer> pk(&sb);
-	pk.pack_map(3 + NsKeyCount(target));
-	PackTIdInto(pk, FrameType::RESP_END, target);
-	PackString(pk, "txn");
-	pk.pack(txn);
-	return PackedHeader(sb);
-}
-
 std::string PackRespEndRowcountNull(const FrameTarget &target) {
 	msgpack::sbuffer sb;
 	msgpack::packer<msgpack::sbuffer> pk(&sb);

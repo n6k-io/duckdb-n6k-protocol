@@ -42,53 +42,6 @@ std::string BuildTableSchemaSql(const std::string &catalog, const std::string &s
 	return "SELECT * FROM " + QuoteQualifiedTable(catalog, schema, table) + " LIMIT 0";
 }
 
-static std::string QuotedColumnList(const std::vector<std::string> &columns) {
-	if (columns.empty()) {
-		throw InvalidInputException("n6k: a table constraint requires at least one column");
-	}
-	std::string out;
-	for (auto &column : columns) {
-		if (!out.empty()) {
-			out += ", ";
-		}
-		out += QuoteIdent(column);
-	}
-	return out;
-}
-
-std::string BuildCreateTableSql(const std::string &catalog, const std::string &schema, const std::string &name,
-                                duckdb_yyjson::yyjson_val *columns, const std::vector<std::string> &primary_key,
-                                const std::vector<std::vector<std::string>> &unique_keys) {
-	using namespace duckdb_yyjson; // NOLINT
-	if (!columns || !yyjson_is_arr(columns)) {
-		throw InvalidInputException("n6k: create_table requires a \"columns\" array");
-	}
-	std::string col_defs;
-	size_t idx, max;
-	yyjson_val *col;
-	yyjson_arr_foreach(columns, idx, max, col) {
-		auto cname = JsonGetStr(col, "name");
-		auto ctype = JsonGetStr(col, "type");
-		if (cname.empty() || ctype.empty()) {
-			throw InvalidInputException("n6k: each column requires \"name\" and \"type\"");
-		}
-		if (!col_defs.empty()) {
-			col_defs += ", ";
-		}
-		col_defs += QuoteIdent(cname) + " " + ctype;
-		if (JsonGetBool(col, "not_null")) {
-			col_defs += " NOT NULL";
-		}
-	}
-	if (!primary_key.empty()) {
-		col_defs += ", PRIMARY KEY (" + QuotedColumnList(primary_key) + ")";
-	}
-	for (auto &unique_key : unique_keys) {
-		col_defs += ", UNIQUE (" + QuotedColumnList(unique_key) + ")";
-	}
-	return "CREATE TABLE " + QuoteQualifiedTable(catalog, schema, name) + " (" + col_defs + ")";
-}
-
 std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &schema,
                                  const std::string &on_conflict) {
 	const auto qualified = QuoteIdent(catalog) + "." + QuoteIdent(schema);
@@ -99,35 +52,6 @@ std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &
 		return "CREATE SCHEMA IF NOT EXISTS " + qualified;
 	}
 	throw InvalidInputException("n6k: create_schema \"on_conflict\" must be error or ignore");
-}
-
-std::string BuildAlterSql(const std::string &catalog, const std::string &schema, const std::string &table,
-                          const std::string &kind, duckdb_yyjson::yyjson_val *details) {
-	std::string qualified = QuoteQualifiedTable(catalog, schema, table);
-	if (kind == "add_column") {
-		auto cname = JsonGetStr(details, "name");
-		auto ctype = JsonGetStr(details, "type");
-		if (cname.empty() || ctype.empty()) {
-			throw InvalidInputException("n6k: add_column requires \"name\" and \"type\"");
-		}
-		return "ALTER TABLE " + qualified + " ADD COLUMN " + QuoteIdent(cname) + " " + ctype;
-	}
-	if (kind == "drop_column") {
-		auto cname = JsonGetStr(details, "name");
-		if (cname.empty()) {
-			throw InvalidInputException("n6k: drop_column requires \"name\"");
-		}
-		return "ALTER TABLE " + qualified + " DROP COLUMN " + QuoteIdent(cname);
-	}
-	if (kind == "rename_column") {
-		auto old_name = JsonGetStr(details, "old_name");
-		auto new_name = JsonGetStr(details, "new_name");
-		if (old_name.empty() || new_name.empty()) {
-			throw InvalidInputException("n6k: rename_column requires \"old_name\" and \"new_name\"");
-		}
-		return "ALTER TABLE " + qualified + " RENAME COLUMN " + QuoteIdent(old_name) + " TO " + QuoteIdent(new_name);
-	}
-	throw InvalidInputException("n6k: unsupported alter kind '%s' (add_column, drop_column, rename_column)", kind);
 }
 
 std::string RenderRpcArgValue(duckdb_yyjson::yyjson_val *v) {

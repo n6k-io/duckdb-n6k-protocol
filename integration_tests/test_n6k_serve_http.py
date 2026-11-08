@@ -32,11 +32,10 @@ from n6k_protocol.protocol import (
     FT_RESP_END,
     FT_RESP_SCHEMA,
     OP_QUERY,
-    OP_READ_PLAN,
 )
 
 from _paths import REPO_ROOT
-from _targets import hello, open_session, substrait_field, substrait_nullable, substrait_plan, substrait_read
+from _targets import hello, open_session
 
 DUCKDB_BIN = os.path.join(REPO_ROOT, "build", "release", "duckdb")
 
@@ -155,41 +154,6 @@ async def test_query_streams_arrow(http_served) -> None:
     try:
         table = await _query(ws, "SELECT id, name FROM users ORDER BY id")
         assert table.to_pydict() == {"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]}
-    finally:
-        await ws.close()
-
-
-@pytest.mark.asyncio
-async def test_read_plan_with_projection_and_filter(http_served) -> None:
-    rel = {
-        "filter": {
-            "input": substrait_read("main", "users", [("id", "i32"), ("name", "string")], [0, 1]),
-            "condition": {
-                "scalarFunction": {
-                    "functionReference": 1,
-                    "outputType": substrait_nullable("bool"),
-                    "arguments": [{"value": substrait_field(0)}, {"value": {"literal": {"i32": 1}}}],
-                }
-            },
-        }
-    }
-    rel = {"project": {"input": rel, "common": {"emit": {"outputMapping": [1]}}}}
-    ws = await _connect(http_served)
-    try:
-        await ws.send(
-            pack_frame(
-                {
-                    "t": FT_REQ,
-                    "id": 3,
-                    "op": OP_READ_PLAN,
-                    "plan": substrait_plan(rel, ["name"], ["gt"]),
-                    "ns": 1,
-                }
-            )
-        )
-        table = await _drain_arrow(ws, 3)
-        assert table.column_names == ["name"]
-        assert sorted(table.to_pydict()["name"]) == ["Bob", "Charlie"]
     finally:
         await ws.close()
 

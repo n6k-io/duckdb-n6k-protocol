@@ -28,7 +28,7 @@ The storage extension parses the URL and dials `n6k://` as `ws://` and `n6ks://`
 
 ### Schema and Table Discovery
 
-Attached catalogs route everything through the `/ws` WebSocket session — `REQ SCHEMA_LIST` for schemas and `REQ TABLES_LIST` for tables. `TABLES_LIST` rows carry `{schema, name, verbs, primary_keys}`, plus each schema's verbs; the extension uses those fields directly to address later ops.
+Attached catalogs route everything through the `/ws` WebSocket session — `REQ SCHEMA_LIST` for schemas and `REQ TABLES_LIST` for tables. `TABLES_LIST` rows carry `{schema, name, verbs, row_ids, primary_keys, not_null, unique_keys}`, plus each schema's verbs; the extension uses those fields directly to address later ops.
 
 The WebSocket session is the only data path. The native extension makes HTTP
 calls only for OAuth; the browser build makes none.
@@ -36,30 +36,21 @@ calls only for OAuth; the browser build makes none.
 ### Reads and writes
 
 Served tables are entries of a `CrossingAttach` (`third_party/crossing`, the
-`duckdb-crossing` submodule). Crossing's optimizer pass folds every crossable
+`duckdb-crossing` submodule), whose source is `N6kSource` (`src/n6k_client/n6k_source.cpp`).
+Crossing owns everything about a statement: its optimizer pass folds every crossable
 operator — filters, projections, limits, sorts, aggregates, joins between
-served tables — onto the source and hands `N6kSession` (`src/n6k_client/n6k_source.cpp`)
-one `LogicalOperator` fragment per scan and per write. The client renders that
-fragment to Substrait JSON (`third_party/crossing/src/render/substrait/substrait_render.cpp`, yyjson, no
-protobuf) and ships it:
+served tables, writes — onto the source, and it plans, commits and rolls back on far itself.
+n6k only moves its frames.
 
-- **reads**: `REQ READ_PLAN {plan}` → Arrow stream; the reader parks the worker
-  between frames through crossing's waker.
-- **writes**: `REQ WRITE_PLAN {verb, schema, table, key_columns, set_columns, plan}`
-  + Arrow seam rows when the rows were gathered locally, or the shipped plan when
-  the rows come from served tables. Keyed writes address rows by the table's
-  primary key.
-- **transactions**: a non-autocommit DuckDB transaction opens `REQ TXN_BEGIN` on
-  first use and ends it with `TXN_COMMIT` / `TXN_ROLLBACK`.
-- **CREATE TABLE AS**: JSON schema sent as `OP_CREATE_TABLE`, then rows inserted
-  with `REQ INSERT`.
+A transaction's first use of far calls `N6kSource::Connect`, which opens a
+[link](docs/n6k-network-protocol.md#links): `LINK_OPEN`, then crossing's streams over
+`STREAM_DATA`. Plans travel as Substrait JSON in stream headers, DDL as SQL text, and rows as Arrow IPC
+encoded and decoded by `src/common/n6k_link.cpp`, which both sides share. A read-only autocommit
+statement ends its link itself; any other transaction ends it on `COMMIT` or `ROLLBACK`.
 
-The server (`src/n6k_server/request_handlers.cpp`) decodes the Substrait JSON
-into DuckDB's `Relation` API (`third_party/crossing/src/render/substrait/substrait_decode.cpp`)
-over the served catalog; a transaction pins one `Connection` per `(ns, txn)`.
-A write hands the seam (the Arrow rows, or the decoded plan) to crossing's
-`ExecuteWrite`, which builds the INSERT, UPDATE or DELETE as parser nodes and
-binds it on that connection. No SQL text is assembled for writes.
+The server (`src/n6k_server/serve_reactor.cpp`) runs each link on a thread of its own: a
+`Connection`, then crossing's `CrossingFar::Serve`, which binds every statement as native DuckDB
+over the served catalog.
 
 ### RPC
 

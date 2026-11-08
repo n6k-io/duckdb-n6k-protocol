@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <chrono>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -334,14 +335,14 @@ public:
 		INFO(sql);
 		const auto plan = Explain(sql);
 		INFO(plan);
-		REQUIRE(plan.find("Crossing Read") != std::string::npos);
+		REQUIRE(plan.find("Crossing Remote") != std::string::npos);
 	}
 
 	void Folds(const std::string &sql) {
 		INFO(sql);
 		const auto plan = Explain(sql);
 		INFO(plan);
-		REQUIRE(plan.substr(0, plan.find('\n')).find("Crossing Read") != std::string::npos);
+		REQUIRE(plan.substr(0, plan.find('\n')).find("Crossing Remote") != std::string::npos);
 	}
 
 	void Same(const std::string &sql) {
@@ -367,24 +368,43 @@ public:
 
 	TwinPlan LastPlan() {
 		std::lock_guard<std::mutex> lk(lock);
-		for (auto frame = sent.rbegin(); frame != sent.rend(); ++frame) {
+		std::map<int64_t, std::string> partial;
+		std::string last_plan;
+		for (auto &frame : sent) {
 			size_t offset = 0;
-			auto handle = msgpack::unpack(frame->data(), frame->size(), offset);
+			auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
 			const auto &header = handle.get();
-			const auto op = n6k::GetInt(header, "op", -1);
-			if (n6k::GetInt(header, "t", -1) != static_cast<int64_t>(n6k::FrameType::REQ) ||
-			    (op != n6k::OP_READ_PLAN && op != n6k::OP_WRITE_PLAN)) {
+			if (n6k::GetInt(header, "t", -1) != static_cast<int64_t>(n6k::FrameType::STREAM_DATA) ||
+			    n6k::GetInt(header, "stream", -1) != 0) {
 				continue;
 			}
-			n6k::JsonDoc doc(n6k::GetStr(header, "plan"));
-			if (!doc.Parsed()) {
-				throw std::runtime_error("a plan frame's plan is not JSON");
+			auto &assembled = partial[n6k::GetInt(header, "link", -1)];
+			assembled.append(frame.data() + offset, frame.size() - offset);
+			const auto *fin = n6k::FindKey(header, "fin");
+			if (!fin || !fin->via.boolean) {
+				continue;
 			}
-			TwinPlan plan;
-			Walk(doc.Root(), plan);
-			return plan;
+			// `[u32 header_len]PLAN\n<ends transaction>\n<streams>\n<slices>\n<plan>`, as crossing frames it.
+			constexpr size_t LENGTH_BYTES = 4;
+			if (assembled.compare(LENGTH_BYTES, 5, "PLAN\n") == 0) {
+				auto plan_at = LENGTH_BYTES + 5;
+				for (int line = 0; line < 3; line++) {
+					plan_at = assembled.find('\n', plan_at) + 1;
+				}
+				last_plan = assembled.substr(plan_at);
+			}
+			assembled.clear();
 		}
-		throw std::runtime_error("no plan crossed the wire");
+		if (last_plan.empty()) {
+			throw std::runtime_error("no plan crossed the wire");
+		}
+		n6k::JsonDoc doc(last_plan);
+		if (!doc.Parsed()) {
+			throw std::runtime_error("a plan frame's plan is not JSON");
+		}
+		TwinPlan plan;
+		Walk(doc.Root(), plan);
+		return plan;
 	}
 
 	size_t SentCount(n6k::FrameType type) {
@@ -623,6 +643,12 @@ public:
 
 	std::vector<std::string> FarRows(const std::string &sql) {
 		return TwinRows(far_con, sql);
+	}
+
+	void FarFunction(ScalarFunction function) {
+		CreateScalarFunctionInfo info(std::move(function));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		far_con.context->RegisterFunction(info);
 	}
 
 	TwinClient &Client() {

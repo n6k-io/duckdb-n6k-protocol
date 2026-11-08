@@ -66,6 +66,7 @@ TEST_CASE("update, delete, insert, returning, merge and conflict clauses run on 
 	     "UPDATE " + PEOPLE + " SET age = 99 WHERE id = 1 RETURNING id, age",
 	     {"1|99"},
 	     {"1|alice|99", "2|bob|25", "3|charlie|35"}},
+	    {PEOPLE, "DELETE FROM " + PEOPLE + " WHERE id = 1 RETURNING name", {"alice"}, {"2|bob|25", "3|charlie|35"}},
 	    {KV, "UPDATE " + KV + " SET v = 99 WHERE id = 1", {"1"}, {"1|99", "2|20"}},
 	    {KV, "DELETE FROM " + KV + " WHERE id = 1", {"1"}, {"2|20"}},
 	    {KV, "DELETE FROM " + KV, {"2"}, {}},
@@ -141,13 +142,15 @@ TEST_CASE("update, delete, insert, returning, merge and conflict clauses run on 
 		REQUIRE(twin.FarRows("SELECT * FROM " + KV + " ORDER BY id") == RowList {"1|5", "2|20"});
 	}
 
-	SECTION("an update of a keyless table is refused") {
+	SECTION("a keyless table updates and deletes") {
 		N6kTwin twin;
 		SeedWriteTables(twin);
 		twin.Attach();
 
-		twin.NearFails("UPDATE db.main.keyless SET age = 1 WHERE id = 1", ExceptionType::BINDER, "no key");
-		REQUIRE(twin.FarRows("SELECT age FROM db.main.keyless") == RowList {"30"});
+		twin.Near("UPDATE db.main.keyless SET age = 1 WHERE id = 1");
+		REQUIRE(twin.FarRows("SELECT age FROM db.main.keyless") == RowList {"1"});
+		twin.Near("DELETE FROM db.main.keyless WHERE id IN (SELECT id FROM db.main.keyless)");
+		REQUIRE(twin.FarRows("SELECT age FROM db.main.keyless") == RowList {});
 	}
 }
 
@@ -164,7 +167,7 @@ TEST_CASE("an insert into an ENUM column keeps valid labels and refuses others",
 	REQUIRE(twin.ServeError().empty());
 }
 
-TEST_CASE("constraints are enforced and what the wire cannot carry is refused", "[twin][writes]") {
+TEST_CASE("constraints, defaults and generated columns reach the server and are enforced", "[twin][writes]") {
 	N6kTwin twin;
 	twin.Far("CREATE TABLE db.main.a (id INTEGER)");
 	twin.Far("INSERT INTO db.main.a VALUES (1)");
@@ -190,17 +193,40 @@ TEST_CASE("constraints are enforced and what the wire cannot carry is refused", 
 		twin.NearFails("INSERT INTO db.main.k VALUES (2, 10)", ExceptionType::CONSTRAINT, "");
 	}
 
-	for (const char *column : {"v INTEGER DEFAULT 7", "v INTEGER CHECK (v > 0)", "v INTEGER GENERATED ALWAYS AS (1)"}) {
-		DYNAMIC_SECTION(column << " is refused") {
-			twin.NearFails(std::string("CREATE TABLE db.main.k (id INTEGER, ") + column + ")", ExceptionType::BINDER,
-			               "not supported");
-			twin.Client().NearFails("SELECT * FROM db.main.k", ExceptionType::CATALOG, "k");
-		}
+	SECTION("a default applies to a column an insert leaves out") {
+		twin.Near("CREATE TABLE db.main.k (id INTEGER, v INTEGER DEFAULT 7)");
+		twin.Near("INSERT INTO db.main.k (id) VALUES (1)");
+		REQUIRE(twin.Rows("SELECT * FROM db.main.k") == RowList {"1|7"});
 	}
 
-	SECTION("adding a column with a default is refused") {
-		twin.NearFails("ALTER TABLE db.main.a ADD COLUMN d INTEGER DEFAULT 7", ExceptionType::BINDER, "default");
-		REQUIRE(twin.Client().Rows("SELECT * FROM db.main.a") == RowList {"1"});
+	SECTION("a check is enforced") {
+		twin.Near("CREATE TABLE db.main.k (id INTEGER, v INTEGER CHECK (v > 0))");
+		twin.Near("INSERT INTO db.main.k VALUES (1, 1)");
+		twin.NearFails("INSERT INTO db.main.k VALUES (2, -1)", ExceptionType::CONSTRAINT, "");
+		REQUIRE(twin.Rows("SELECT * FROM db.main.k") == RowList {"1|1"});
+	}
+
+	SECTION("a check refuses the first row inserted") {
+		twin.Near("CREATE TABLE db.main.t_c (i INTEGER CHECK (i > 0))");
+		twin.NearFails("INSERT INTO db.main.t_c VALUES (-1)", ExceptionType::CONSTRAINT, "");
+		REQUIRE(twin.Rows("SELECT count(*) FROM db.main.t_c") == RowList {"0"});
+	}
+
+	SECTION("a generated column reads back") {
+		twin.Near("CREATE TABLE db.main.k (id INTEGER, v INTEGER GENERATED ALWAYS AS (id + 1))");
+		twin.Near("INSERT INTO db.main.k (id) VALUES (1)");
+		REQUIRE(twin.Rows("SELECT * FROM db.main.k") == RowList {"1|2"});
+	}
+
+	SECTION("adding a column with a default fills existing rows") {
+		twin.Near("ALTER TABLE db.main.a ADD COLUMN d INTEGER DEFAULT 7");
+		REQUIRE(twin.Client().Rows("SELECT * FROM db.main.a") == RowList {"1|7"});
+	}
+
+	SECTION("drop table reaches the server") {
+		twin.Near("DROP TABLE db.main.a");
+		twin.Client().NearFails("SELECT * FROM db.main.a", ExceptionType::CATALOG, "a");
+		REQUIRE(twin.FarRows("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'a'") == RowList {"0"});
 	}
 
 	SECTION("adding a column without a default works") {
@@ -217,6 +243,12 @@ TEST_CASE("constraints are enforced and what the wire cannot carry is refused", 
 	SECTION("describe shows the server's constraints") {
 		REQUIRE(twin.Rows("SELECT column_name, \"null\", key FROM (DESCRIBE db.main.described)") ==
 		        RowList {"id|NO|PRI", "n|NO|NULL", "x|YES|NULL"});
+	}
+
+	SECTION("describe shows crossing's source default on every column") {
+		twin.Near("CREATE TABLE db.main.t_k (i BIGINT PRIMARY KEY, v VARCHAR)");
+		REQUIRE(twin.Rows("SELECT column_name, \"default\" FROM (DESCRIBE db.main.t_k)") ==
+		        RowList {"i|set_by_source()", "v|set_by_source()"});
 	}
 
 	REQUIRE(twin.ServeError().empty());

@@ -37,6 +37,8 @@ class Connection;
 namespace n6k {
 
 struct AuthResult;
+class N6kLinkState;
+struct FarRun;
 
 // One session opened by an OPEN: the `ns` every response for it is stamped with, and the catalog its
 // ops are qualified against.
@@ -68,13 +70,10 @@ struct RequestSlot {
 	shared_ptr<ClientContext> context;
 	// Immutable, as `ns` and `req_id`.
 	std::string catalog;
-	// Other catalogs the request's plan names, as AdmitPlanCatalog spelled them. Guarded by the
-	// reactor's map_mu_.
-	std::unordered_set<std::string> plan_catalogs;
 };
 
 // A paused catalog's drain state. Until `holding`, the reader may still admit REQs for it, so `running`
-// can still grow. After it, a running request's AdmitPlanCatalog can still briefly add to `running`
+// can still grow. After it, a running link's AdmitPlanCatalog can still briefly add to `running`
 // before it fails on the pause.
 struct InflightState {
 	bool holding;
@@ -103,33 +102,26 @@ inline int64_t SteadyNowMs() {
 	    .count();
 }
 
-struct PinnedTxn {
-	// A worker holds it for as long as its statement runs. ExpireIdle only try_locks it; DropAllTxns blocks on
-	// it after the workers drain.
+// One far transaction, served by CrossingFar on its own thread. Its entry outlives the thread until the client's
+// LINK_CLOSE, keeping its place under max_links, and frames arriving after the thread ended are dropped.
+struct ServedLink {
+	int64_t ns = 0;
+	uint32_t link = 0;
+	std::string catalog;
+	std::shared_ptr<N6kLinkState> state;
+	std::thread thread;
+	std::atomic<bool> done {false};
+	// Reader thread only.
+	bool closing = false;
+	std::vector<std::string> held_control;
+	// A pause holds what the client sends on stream 0: statements and transaction ends.
+
 	std::mutex mu;
-	// When a request last let go of it (or it began), for idle_txn_timeout_ms.
-	std::atomic<int64_t> last_used_ms {SteadyNowMs()};
-	void Touch() {
-		last_used_ms.store(SteadyNowMs());
-	}
-	std::unique_ptr<Connection> conn;
-	// Set when its session closes; `conn` is then interrupted without `mu` and destroyed by the last holder.
-	std::atomic<bool> dropped {false};
-};
-
-struct TxnKey {
-	int64_t ns;
-	int64_t txn;
-
-	bool operator==(const TxnKey &other) const {
-		return ns == other.ns && txn == other.txn;
-	}
-};
-
-struct TxnKeyHash {
-	size_t operator()(const TxnKey &key) const {
-		return std::hash<int64_t> {}(key.ns) ^ (std::hash<int64_t> {}(key.txn) << 1);
-	}
+	std::shared_ptr<FarRun> far;
+	bool cancelled = false;
+	std::string cancel_reason;
+	// Guarded by the reactor's map_mu_.
+	std::unordered_set<std::string> plan_catalogs;
 };
 
 // A catalog accepted before it is attached: an OPEN for it parks until ResolvePending settles it.
@@ -164,6 +156,8 @@ struct Upstream {
 	std::mutex track_mu;
 	std::unordered_set<int64_t> opening;
 	std::unordered_set<InflightKey, InflightKeyHash> inflight;
+	// Links opened through it and not yet closed; req_id is the link id.
+	std::unordered_set<InflightKey, InflightKeyHash> links;
 	// The reader's copy of the reactor's `forwarded_` for this upstream: a frame on any other ns is dropped.
 	std::unordered_set<int64_t> forwarded;
 	// Why it stopped: set by whichever of its reader or writer noticed first.
@@ -278,8 +272,8 @@ public:
 	// Throws if it is not paused. Safe to call from any thread.
 	InflightState Inflight(const std::string &catalog);
 
-	// Cancel and interrupt every request running against `catalog`, including statements in its sessions'
-	// open transactions. Returns how many requests were running. Safe to call from any thread.
+	// Cancel and interrupt every request running against `catalog`, including statements on open links. Returns how
+	// many requests were running. Safe to call from any thread.
 	int64_t CancelInflight(const std::string &catalog);
 
 	void SendFrame(std::string frame);
@@ -305,16 +299,9 @@ public:
 	// nothing. Safe to call from any thread.
 	int NotifyInvalidate(const std::string &catalog, const std::vector<std::string> &schemas);
 
-	// A plan on `slot`'s session names `catalog`. Throws unless a session on this connection has it
-	// open and it is not paused; from then on Inflight and CancelInflight count the request against it.
-	void AdmitPlanCatalog(RequestSlot &slot, const std::string &catalog);
-
-	// A transaction pinned to its own Connection for the life of (ns, txn). Every request that names
-	// the txn runs on that Connection under its mutex. Throws once `slot` is cancelled, so a session's
-	// transactions cannot outlive its close.
-	int64_t BeginTxn(RequestSlot &slot);
-	std::shared_ptr<PinnedTxn> FindTxn(int64_t ns, int64_t txn);
-	std::shared_ptr<PinnedTxn> TakeTxn(int64_t ns, int64_t txn);
+	// A plan on `link`'s session names `catalog`. Throws unless a session on this connection has it
+	// open and it is not paused; from then on Inflight and CancelInflight count the link against it.
+	void AdmitPlanCatalog(ServedLink &link, const std::string &catalog);
 
 	// Backpressure and cancellation are invisible from outside: a correctly paced stream and one
 	// that never filled its window look identical on the wire.
@@ -421,10 +408,9 @@ private:
 	// Joins every worker. Idempotent, so Run() and ~ServeReactor may both call it.
 	void StopWorkers();
 	std::shared_ptr<RequestSlot> FindSlot(int64_t ns, uint32_t req_id);
-	// Interrupt every in-flight request's own Connection. Does not reach a request in a pinned transaction,
-	// which runs on PinnedTxn::conn. A request that has not yet published its context has nothing to interrupt;
-	// only a streamed response sees `stopping_` later, so a non-streamed op already past RunRequest's check runs
-	// to completion.
+	// Interrupt every in-flight request's own Connection. A request that has not yet published its context has nothing
+	// to interrupt; only a streamed response sees `stopping_` later, so a non-streamed op already past RunRequest's
+	// check runs to completion.
 	void InterruptWorkers();
 	// Reader thread only.
 	void TrackSession(int64_t ns, const std::string &catalog);
@@ -592,11 +578,20 @@ private:
 	std::mutex map_mu_;
 	std::unordered_map<InflightKey, std::shared_ptr<RequestSlot>, InflightKeyHash> inflight_;
 
-	std::mutex txn_mu_;
-	int64_t next_txn_ = 1;
-	std::unordered_map<TxnKey, std::shared_ptr<PinnedTxn>, TxnKeyHash> txns_;
-	void DropTxnsOf(int64_t ns);
-	void DropAllTxns();
+	// By (ns, link). The reader adds and removes; other threads read under links_mu_.
+	std::mutex links_mu_;
+	std::unordered_map<InflightKey, std::shared_ptr<ServedLink>, InflightKeyHash> links_;
+	// Reader thread only.
+	void HandleLinkFrame(FrameType type, int64_t ns, const msgpack::object &header, const std::string &frame,
+	                     const char *body, size_t body_len);
+	void OpenServedLink(int64_t ns, uint32_t link);
+	void DeliverHeldControl(const std::string &catalog);
+	void ReapLinks();
+	void StopLinksOf(int64_t ns, const std::string &reason);
+	void StopAllLinks();
+	// From any thread. Ends the link's transaction; the first reason is what the client hears.
+	void CancelServedLink(ServedLink &link, const std::string &reason);
+	void RunServedLink(const std::shared_ptr<ServedLink> &link);
 
 	// Workers start only while the queue outgrows the idle ones, up to options_.workers. active_workers_
 	// counts admitted requests not yet retired (queued, running or parked); Run() waits on it to drain.

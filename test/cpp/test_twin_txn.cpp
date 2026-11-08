@@ -154,6 +154,23 @@ TEST_CASE("a stale client errors and invalidation refreshes it", "[twin][txn]") 
 		REQUIRE(twin.Rows("SELECT table_name FROM duckdb_tables() WHERE database_name = 'db'") == RowList {"t"});
 	}
 
+	SECTION("n6k_invalidate_cache reveals a view created on the server") {
+		REQUIRE(twin.Rows("SELECT count(*) FROM db.main.t") == RowList {"1"});
+		twin.Far("CREATE VIEW db.main.v AS SELECT 1 AS x");
+		twin.NearErrors("SELECT x FROM db.main.v");
+		REQUIRE(twin.Rows("SELECT * FROM n6k_invalidate_cache('db', 'main')") == RowList {"1"});
+		REQUIRE(twin.Rows("SELECT x FROM db.main.v") == RowList {"1"});
+	}
+
+	SECTION("n6k_invalidate_cache clears a view dropped on the server") {
+		twin.Far("CREATE VIEW db.main.v AS SELECT 1 AS x");
+		twin.Near("CALL n6k_invalidate_cache('db', 'main')");
+		REQUIRE(twin.Rows("SELECT x FROM db.main.v") == RowList {"1"});
+		twin.Far("DROP VIEW db.main.v");
+		twin.Near("CALL n6k_invalidate_cache('db', 'main')");
+		twin.NearErrors("SELECT x FROM db.main.v");
+	}
+
 	SECTION("a push makes a new table visible") {
 		REQUIRE(twin.Rows("SELECT count(*) FROM db.main.t") == RowList {"1"});
 		twin.Far("CREATE TABLE db.main.appeared (i INTEGER)");

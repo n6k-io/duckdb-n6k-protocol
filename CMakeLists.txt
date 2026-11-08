@@ -18,7 +18,6 @@ n6k_common_includes()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/third_party/crossing/crossing.cmake)
 crossing_sources(CROSSING_SOURCES)
-crossing_substrait_render_sources(CROSSING_SUBSTRAIT_SOURCES)
 crossing_substrait_includes(CROSSING_INCLUDES)
 include_directories(${CROSSING_INCLUDES})
 
@@ -37,11 +36,13 @@ n6k_common_sources(
   n6k_catalog_list
   n6k_exception_types
   n6k_arrow_frame_decoder
+  arrow_ipc_encode
+  n6k_link
   n6k_served
   n6k_host_callback
   n6k_ws_log)
 n6k_nanoarrow_sources(EXTENSION_SOURCES)
-list(APPEND EXTENSION_SOURCES ${CROSSING_SOURCES} ${CROSSING_SUBSTRAIT_SOURCES})
+list(APPEND EXTENSION_SOURCES ${CROSSING_SOURCES})
 
 list(
   APPEND

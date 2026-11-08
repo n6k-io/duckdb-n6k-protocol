@@ -28,6 +28,7 @@
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -91,7 +92,7 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 	PackString(pk, "tables");
 	pk.pack_array(static_cast<uint32_t>(rows.size()));
 	for (auto &r : rows) {
-		pk.pack_map(6);
+		pk.pack_map(7);
 		PackString(pk, "schema");
 		pk.pack(r.schema);
 		PackString(pk, "name");
@@ -102,6 +103,8 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 		PackStrings(pk, r.primary_key);
 		PackString(pk, "not_null");
 		PackStrings(pk, r.not_null);
+		PackString(pk, "row_ids");
+		pk.pack(r.kind != "native_view");
 		PackString(pk, "unique_keys");
 		pk.pack_array(static_cast<uint32_t>(r.unique_keys.size()));
 		for (auto &unique_key : r.unique_keys) {
@@ -120,62 +123,7 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 	return std::string(sb.data(), sb.size());
 }
 
-struct TxnScope {
-	TxnScope() = default;
-	TxnScope(TxnScope &&) = default;
-	TxnScope &operator=(TxnScope &&) = default;
-	~TxnScope() {
-		if (pinned) {
-			StopInterrupts();
-			pinned->Touch();
-		}
-	}
-
-	// Before `guard` lets go of the transaction, so a late CANCEL cannot reach its next statement.
-	void StopInterrupts() {
-		if (slot) {
-			std::lock_guard<std::mutex> lk(slot->mu);
-			slot->context.reset();
-			slot = nullptr;
-		}
-	}
-
-	RequestSlot *slot = nullptr;
-	std::shared_ptr<PinnedTxn> pinned;
-	std::unique_lock<std::mutex> guard;
-	Connection *conn = nullptr;
-};
-
-static TxnScope ConnectionFor(ServeReactor &reactor, Connection &own, const SessionRef &sess,
-                              duckdb_yyjson::yyjson_val *root, RequestSlot &slot) {
-	TxnScope scope;
-	scope.conn = &own;
-	auto *txn_val = root ? duckdb_yyjson::yyjson_obj_get(root, "txn") : nullptr;
-	if (!txn_val) {
-		return scope;
-	}
-	if (!duckdb_yyjson::yyjson_is_int(txn_val)) {
-		throw InvalidInputException("n6k_server: \"txn\" must be an integer");
-	}
-	auto txn = duckdb_yyjson::yyjson_get_sint(txn_val);
-	scope.pinned = reactor.FindTxn(sess.ns, txn);
-	if (!scope.pinned) {
-		throw TransactionException("n6k_server: transaction %lld is not open on this session", txn);
-	}
-	scope.guard = std::unique_lock<std::mutex>(scope.pinned->mu);
-	if (!scope.pinned->conn || scope.pinned->dropped.load()) {
-		throw TransactionException("n6k_server: transaction %lld was already closed", txn);
-	}
-	scope.conn = scope.pinned->conn.get();
-	{
-		std::lock_guard<std::mutex> lk(slot.mu);
-		slot.context = scope.conn->context;
-	}
-	scope.slot = &slot;
-	return scope;
-}
-
-static void HandleTablesList(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
+static void HandleTablesList(ServeReactor &reactor, Connection &conn, const SessionRef &sess, const char *body,
                              size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
 	string schema_filter_str;
@@ -194,8 +142,6 @@ static void HandleTablesList(ServeReactor &reactor, Connection &own, const Sessi
 			has_filter = !schema_filter_str.empty();
 		}
 	}
-	auto scope = ConnectionFor(reactor, own, sess, body_len > 0 ? doc.Root() : nullptr, slot);
-	auto &conn = *scope.conn;
 	const std::string &catalog = sess.catalog;
 	optional_ptr<const string> schema_filter = has_filter ? &schema_filter_str : nullptr;
 	vector<TablePermissionRow> rows;
@@ -233,24 +179,19 @@ public:
 		if (result->HasError()) {
 			result->ThrowError();
 		}
-		if (materialized) {
-			result_ = std::move(result);
-			enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, result_->GetTypes(), result_->GetNames());
-		} else {
-			stream_ = make_uniq<QueryResultStream<ChunkFormat>>(std::move(result));
-			// A statement that expands into several has no schema until the one producing the result runs.
-			if (!stream_->MetadataAvailable()) {
-				chunk_ = FetchFromStream();
-			}
-			enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, stream_->GetTypes(), stream_->GetNames());
+		stream_ = make_uniq<QueryResultStream<ChunkFormat>>(std::move(result));
+		// A statement that expands into several has no schema until the one producing the result runs.
+		if (!stream_->MetadataAvailable()) {
+			chunk_ = FetchFromStream();
 		}
+		enc_ = make_uniq<ArrowIpcStreamEncoder>(*conn->context, stream_->GetTypes(), stream_->GetNames());
 		reactor.SendForRequest(slot, PackRespSchema(target_, enc_->SchemaMessage()));
 	}
 
 	PumpResult Pump(ServeReactor &reactor, RequestSlot &slot) override {
 		while (true) {
 			if (!chunk_) {
-				chunk_ = stream_ ? FetchFromStream() : result_->Fetch();
+				chunk_ = FetchFromStream();
 				if (!chunk_) {
 					auto eos = enc_->TakeEndOfStreamMessage();
 					if (!eos.empty()) {
@@ -287,9 +228,8 @@ public:
 
 	// Declared before `enc_`, which holds a reference to its context.
 	std::unique_ptr<Connection> conn;
-	// What the result may still read while it streams: the plan, and OP_RPC_TABLE's staged input. Declared
-	// before `result_` so they outlive it.
-	shared_ptr<Relation> rel;
+	// What the result may still read while it streams: OP_RPC_TABLE's staged input. Declared before `stream_` so it
+	// outlives it.
 	std::string input;
 	InsertArrowBytes input_bytes {nullptr, 0};
 
@@ -341,7 +281,6 @@ private:
 
 	FrameTarget target_;
 	idx_t batch_rows_;
-	unique_ptr<QueryResult> result_;
 	unique_ptr<QueryResultStream<ChunkFormat>> stream_;
 	unique_ptr<ArrowIpcStreamEncoder> enc_;
 	unique_ptr<DataChunk> chunk_;
@@ -373,84 +312,13 @@ static std::unique_ptr<ParkedStream> HandleQuery(ServeReactor &reactor, std::uni
 	return StreamQuery(reactor, std::move(conn), sql, slot, RequestedBatchRows(root));
 }
 
-static SubstraitCatalogCheck PlanCatalogCheck(ServeReactor &reactor, RequestSlot &slot) {
-	return [&reactor, &slot](const string &catalog) {
-		reactor.AdmitPlanCatalog(slot, catalog);
-	};
-}
-
-static std::unique_ptr<ParkedStream> HandleReadPlan(ServeReactor &reactor, std::unique_ptr<Connection> &own,
-                                                    const SessionRef &sess, const char *body, size_t body_len,
-                                                    RequestSlot &slot) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	JsonDoc doc(body, body_len);
-	if (!doc.Parsed()) {
-		throw InvalidInputException("n6k_server: OP_READ_PLAN body is not valid JSON");
-	}
-	auto *root = doc.Root();
-	auto plan = JsonGetStr(root, "plan");
-	if (plan.empty()) {
-		throw InvalidInputException("n6k_server: OP_READ_PLAN requires a \"plan\" field");
-	}
-	const auto batch_rows = RequestedBatchRows(root);
-	auto scope = ConnectionFor(reactor, *own, sess, root, slot);
-	auto &conn = *scope.conn;
-	auto rel = DecodeSubstraitJson(conn, sess.catalog, plan, PlanCatalogCheck(reactor, slot));
-	auto statement = make_uniq<RelationStatement>(rel);
-	auto result = scope.pinned ? conn.Query(std::move(statement)) : conn.Submit(std::move(statement));
-	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(own), target, batch_rows));
-	if (scope.pinned) {
-		// Materialized, so the rows no longer need the transaction's Connection: a slow reader must not
-		// hold its commit back.
-		scope.StopInterrupts();
-		scope.guard.unlock();
-	} else {
-		stream->rel = rel;
-	}
-	stream->Start(reactor, slot, std::move(result), scope.pinned != nullptr);
-	return std::move(stream);
-}
-
-static void HandleTxnBegin(ServeReactor &reactor, const SessionRef &sess, RequestSlot &slot) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	reactor.EndRequest(slot, PackRespEndTxn(target, reactor.BeginTxn(slot)));
-}
-
-static void HandleTxnEnd(ServeReactor &reactor, const SessionRef &sess, const char *body, size_t body_len,
-                         RequestSlot &slot, bool commit) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	JsonDoc doc(body, body_len);
-	if (!doc.Parsed()) {
-		throw InvalidInputException("n6k_server: transaction body is not valid JSON");
-	}
-	auto *txn_val = duckdb_yyjson::yyjson_obj_get(doc.Root(), "txn");
-	if (!txn_val || !duckdb_yyjson::yyjson_is_int(txn_val)) {
-		throw InvalidInputException("n6k_server: a transaction end requires \"txn\"");
-	}
-	auto txn = duckdb_yyjson::yyjson_get_sint(txn_val);
-	auto pinned = reactor.TakeTxn(sess.ns, txn);
-	if (!pinned) {
-		throw TransactionException("n6k_server: transaction %lld is not open on this session", txn);
-	}
-	std::lock_guard<std::mutex> guard(pinned->mu);
-	if (commit) {
-		pinned->conn->Commit();
-	} else {
-		pinned->conn->Rollback();
-	}
-	pinned->conn.reset();
-	reactor.EndRequest(slot, PackRespEndOk(target));
-}
-
-static void HandleTableSchema(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
+static void HandleTableSchema(ServeReactor &reactor, Connection &conn, const SessionRef &sess, const char *body,
                               size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
 	if (!doc.Parsed()) {
 		throw InvalidInputException("n6k_server: OP_TABLE_SCHEMA body is not valid JSON");
 	}
-	auto scope = ConnectionFor(reactor, own, sess, doc.Root(), slot);
-	auto &conn = *scope.conn;
 	const std::string &catalog = sess.catalog;
 	auto schema = JsonGetStr(doc.Root(), "schema");
 	auto table = JsonGetStr(doc.Root(), "table");
@@ -491,32 +359,7 @@ static void HandleExec(ServeReactor &reactor, Connection &conn, const char *body
 	reactor.EndRequest(slot, PackRespEndRowcount(target, rowcount));
 }
 
-static void HandleCreateTable(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                              size_t body_len, RequestSlot &slot) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	using namespace duckdb_yyjson; // NOLINT
-	JsonDoc doc(body, body_len);
-	if (!doc.Parsed()) {
-		throw InvalidInputException("n6k_server: OP_CREATE_TABLE body is not valid JSON");
-	}
-	auto *root = doc.Root();
-	auto schema = JsonGetStr(root, "schema");
-	auto name = JsonGetStr(root, "name");
-	auto *cols = yyjson_obj_get(root, "columns");
-	if (schema.empty() || name.empty() || !cols || !yyjson_is_arr(cols)) {
-		throw InvalidInputException("n6k_server: OP_CREATE_TABLE requires \"schema\", \"name\", and \"columns\"");
-	}
-	auto sql = BuildCreateTableSql(sess.catalog, schema, name, cols, JsonGetStrArray(root, "primary_key"),
-	                               JsonGetStrArrays(root, "unique_keys"));
-	auto scope = ConnectionFor(reactor, own, sess, root, slot);
-	auto result = scope.conn->Query(sql);
-	if (result->HasError()) {
-		result->ThrowError();
-	}
-	reactor.EndRequest(slot, PackRespEndOk(target));
-}
-
-static void HandleCreateSchema(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
+static void HandleCreateSchema(ServeReactor &reactor, Connection &conn, const SessionRef &sess, const char *body,
                                size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
 	JsonDoc doc(body, body_len);
@@ -529,8 +372,7 @@ static void HandleCreateSchema(ServeReactor &reactor, Connection &own, const Ses
 		throw InvalidInputException("n6k_server: OP_CREATE_SCHEMA requires \"schema\"");
 	}
 	auto sql = BuildCreateSchemaSql(sess.catalog, schema, JsonGetStr(root, "on_conflict"));
-	auto scope = ConnectionFor(reactor, own, sess, root, slot);
-	auto &context = *scope.conn->context;
+	auto &context = *conn.context;
 	bool grants_create = false;
 	context.RunFunctionInTransaction([&]() {
 		grants_create = CatalogGrantsCreate(context, Catalog::GetCatalog(context, Identifier(sess.catalog)));
@@ -538,77 +380,7 @@ static void HandleCreateSchema(ServeReactor &reactor, Connection &own, const Ses
 	if (!grants_create) {
 		throw PermissionException("n6k_server: catalog '%s' does not allow CREATE SCHEMA", sess.catalog);
 	}
-	auto result = scope.conn->Query(sql);
-	if (result->HasError()) {
-		result->ThrowError();
-	}
-	reactor.EndRequest(slot, PackRespEndOk(target));
-}
-
-static void HandleAlterTable(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                             size_t body_len, RequestSlot &slot) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	JsonDoc doc(body, body_len);
-	if (!doc.Parsed()) {
-		throw InvalidInputException("n6k_server: OP_ALTER_TABLE body is not valid JSON");
-	}
-	auto *root = doc.Root();
-	auto schema = JsonGetStr(root, "schema");
-	auto table = JsonGetStr(root, "table");
-	auto kind = JsonGetStr(root, "kind");
-	if (schema.empty() || table.empty() || kind.empty()) {
-		throw InvalidInputException("n6k_server: OP_ALTER_TABLE requires \"schema\", \"table\", and \"kind\"");
-	}
-	auto *details = duckdb_yyjson::yyjson_obj_get(root, "details");
-	auto sql = BuildAlterSql(sess.catalog, schema, table, kind, details);
-	auto scope = ConnectionFor(reactor, own, sess, root, slot);
-	auto result = scope.conn->Query(sql);
-	if (result->HasError()) {
-		result->ThrowError();
-	}
-	reactor.EndRequest(slot, PackRespEndOk(target));
-}
-
-static OnCreateConflict ViewOnConflict(const std::string &on_conflict) {
-	if (on_conflict == "error") {
-		return OnCreateConflict::ERROR_ON_CONFLICT;
-	}
-	if (on_conflict == "ignore") {
-		return OnCreateConflict::IGNORE_ON_CONFLICT;
-	}
-	if (on_conflict == "replace") {
-		return OnCreateConflict::REPLACE_ON_CONFLICT;
-	}
-	throw InvalidInputException("n6k_server: OP_CREATE_VIEW \"on_conflict\" must be error, ignore or replace");
-}
-
-static void HandleCreateView(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                             size_t body_len, RequestSlot &slot) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	JsonDoc doc(body, body_len);
-	if (!doc.Parsed()) {
-		throw InvalidInputException("n6k_server: OP_CREATE_VIEW body is not valid JSON");
-	}
-	auto *root = doc.Root();
-	auto schema = JsonGetStr(root, "schema");
-	auto name = JsonGetStr(root, "name");
-	auto plan = JsonGetStr(root, "plan");
-	if (schema.empty() || name.empty() || plan.empty()) {
-		throw InvalidInputException("n6k_server: OP_CREATE_VIEW requires \"schema\", \"name\", and \"plan\"");
-	}
-	auto on_conflict = ViewOnConflict(JsonGetStr(root, "on_conflict"));
-	auto names_json = JsonGetStrArray(root, "names");
-	vector<string> names(names_json.begin(), names_json.end());
-	auto scope = ConnectionFor(reactor, own, sess, root, slot);
-	auto &conn = *scope.conn;
-
-	auto info =
-	    make_uniq<CreateViewInfo>(QualifiedName(Identifier(sess.catalog), Identifier(schema), Identifier(name)));
-	info->query = DecodeSubstraitView(conn, sess.catalog, plan, names, PlanCatalogCheck(reactor, slot));
-	info->on_conflict = on_conflict;
-	auto statement = make_uniq<CreateStatement>();
-	statement->info = std::move(info);
-	auto result = conn.Query(std::move(statement));
+	auto result = conn.Query(sql);
 	if (result->HasError()) {
 		result->ThrowError();
 	}
@@ -739,34 +511,6 @@ static void HandleHasFunction(ServeReactor &reactor, Connection &conn, const cha
 	reactor.EndRequest(slot, PackRespEndExists(target, exists));
 }
 
-static void HandleDropView(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                           size_t body_len, RequestSlot &slot) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	JsonDoc doc(body, body_len);
-	if (!doc.Parsed()) {
-		throw InvalidInputException("n6k_server: OP_DROP_VIEW body is not valid JSON");
-	}
-	auto *root = doc.Root();
-	auto schema = JsonGetStr(root, "schema");
-	auto name = JsonGetStr(root, "name");
-	if (schema.empty() || name.empty()) {
-		throw InvalidInputException("n6k_server: OP_DROP_VIEW requires \"schema\" and \"name\"");
-	}
-	auto scope = ConnectionFor(reactor, own, sess, root, slot);
-	auto &conn = *scope.conn;
-
-	auto statement = make_uniq<DropStatement>();
-	statement->info->type = CatalogType::VIEW_ENTRY;
-	statement->info->SetQualifiedName(Identifier(sess.catalog), Identifier(schema), Identifier(name));
-	statement->info->if_not_found =
-	    JsonGetBool(root, "if_exists") ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
-	auto result = conn.Query(std::move(statement));
-	if (result->HasError()) {
-		result->ThrowError();
-	}
-	reactor.EndRequest(slot, PackRespEndOk(target));
-}
-
 static void HandleInsert(ServeReactor &reactor, Connection &conn, const std::string &catalog, const char *body,
                          size_t body_len, RequestSlot &slot) {
 	const FrameTarget target {slot.ns, slot.req_id};
@@ -795,83 +539,6 @@ static void HandleInsert(ServeReactor &reactor, Connection &conn, const std::str
 	rel->Insert(Identifier(catalog), Identifier(schema), Identifier(table));
 
 	reactor.EndRequest(slot, PackRespEndRowcount(target, rowcount));
-}
-
-static CrossingVerb WriteVerbOf(const std::string &verb) {
-	if (verb == "insert") {
-		return CrossingVerb::INSERT;
-	}
-	if (verb == "update") {
-		return CrossingVerb::UPDATE;
-	}
-	if (verb == "delete") {
-		return CrossingVerb::DELETE_;
-	}
-	throw InvalidInputException("n6k_server: OP_WRITE_PLAN verb '%s' is not insert, update or delete", verb);
-}
-
-// ExecuteWrite binds and runs inside a transaction. A pinned connection has one open; the worker's
-// own connection gets one for the statement.
-static idx_t WriteInTransaction(Connection &conn, bool pinned, const CrossingWriteTarget &target,
-                                unique_ptr<TableRef> seam) {
-	if (pinned) {
-		return ExecuteWrite(*conn.context, target, std::move(seam));
-	}
-	conn.BeginTransaction();
-	idx_t changed;
-	try {
-		changed = ExecuteWrite(*conn.context, target, std::move(seam));
-	} catch (...) {
-		conn.Rollback();
-		throw;
-	}
-	conn.Commit();
-	return changed;
-}
-
-static void HandleWritePlan(ServeReactor &reactor, Connection &own, const SessionRef &sess, const char *body,
-                            size_t body_len, RequestSlot &slot) {
-	const FrameTarget target {slot.ns, slot.req_id};
-	const std::string &catalog = sess.catalog;
-	auto *nl = static_cast<const char *>(memchr(body, '\n', body_len));
-	if (!nl) {
-		throw InvalidInputException("n6k_server: OP_WRITE_PLAN body missing header newline");
-	}
-	size_t header_len = static_cast<size_t>(nl - body);
-	JsonDoc doc(body, header_len);
-	if (!doc.Parsed()) {
-		throw InvalidInputException("n6k_server: OP_WRITE_PLAN header is not valid JSON");
-	}
-	auto *root = doc.Root();
-	CrossingWriteTarget write;
-	write.catalog = catalog;
-	write.schema = JsonGetStr(root, "schema");
-	write.table = JsonGetStr(root, "table");
-	write.verb = WriteVerbOf(JsonGetStr(root, "verb"));
-	write.key_columns = JsonGetStrArray(root, "key_columns");
-	write.set_columns = JsonGetStrArray(root, "set_columns");
-	write.reads_rows = JsonGetBool(root, "reads_rows", true);
-	auto plan = JsonGetStr(root, "plan");
-	if (write.schema.empty() || write.table.empty()) {
-		throw InvalidInputException("n6k_server: OP_WRITE_PLAN requires \"schema\" and \"table\"");
-	}
-	auto scope = ConnectionFor(reactor, own, sess, root, slot);
-	auto &conn = *scope.conn;
-
-	const uint8_t *arrow = reinterpret_cast<const uint8_t *>(body) + header_len + 1;
-	size_t arrow_len = body_len - header_len - 1;
-	InsertArrowBytes bytes {arrow, arrow_len};
-	unique_ptr<TableRef> seam;
-	if (arrow_len > 0) {
-		seam = conn.TableFunction(N6K_INSERT_SCAN_FN, {Value::POINTER(reinterpret_cast<uintptr_t>(&bytes))})
-		           ->GetTableRef();
-	} else if (!plan.empty()) {
-		seam = DecodeSubstraitJson(conn, catalog, plan, PlanCatalogCheck(reactor, slot))->GetTableRef();
-	} else if (write.reads_rows) {
-		throw InvalidInputException("n6k_server: OP_WRITE_PLAN carries neither rows nor a plan");
-	}
-	auto rowcount = WriteInTransaction(conn, scope.pinned != nullptr, write, std::move(seam));
-	reactor.EndRequest(slot, PackRespEndRowcount(target, NumericCast<int64_t>(rowcount)));
 }
 
 // A generator in the host process, reached through three scalar UDFs it registered on the served
@@ -1266,40 +933,14 @@ std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_p
 		break;
 	case OP_QUERY:
 		return HandleQuery(reactor, own, body, body_len, slot);
-	case OP_READ_PLAN:
-		return HandleReadPlan(reactor, own, sess, body, body_len, slot);
-	case OP_WRITE_PLAN:
-		HandleWritePlan(reactor, conn, sess, body, body_len, slot);
-		break;
-	case OP_TXN_BEGIN:
-		HandleTxnBegin(reactor, sess, slot);
-		break;
-	case OP_TXN_COMMIT:
-		HandleTxnEnd(reactor, sess, body, body_len, slot, true);
-		break;
-	case OP_TXN_ROLLBACK:
-		HandleTxnEnd(reactor, sess, body, body_len, slot, false);
-		break;
 	case OP_INSERT:
 		HandleInsert(reactor, conn, catalog, body, body_len, slot);
 		break;
 	case OP_EXEC:
 		HandleExec(reactor, conn, body, body_len, slot);
 		break;
-	case OP_CREATE_TABLE:
-		HandleCreateTable(reactor, conn, sess, body, body_len, slot);
-		break;
 	case OP_CREATE_SCHEMA:
 		HandleCreateSchema(reactor, conn, sess, body, body_len, slot);
-		break;
-	case OP_ALTER_TABLE:
-		HandleAlterTable(reactor, conn, sess, body, body_len, slot);
-		break;
-	case OP_CREATE_VIEW:
-		HandleCreateView(reactor, conn, sess, body, body_len, slot);
-		break;
-	case OP_DROP_VIEW:
-		HandleDropView(reactor, conn, sess, body, body_len, slot);
 		break;
 	case OP_HAS_FUNCTION:
 		HandleHasFunction(reactor, conn, body, body_len, slot);

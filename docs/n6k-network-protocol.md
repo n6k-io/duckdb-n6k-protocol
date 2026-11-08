@@ -80,7 +80,7 @@ first". See [Sessions](#sessions).
 
 | Value | Name | Direction | Header keys + body |
 |-------|------|-----------|--------------------|
-| 1 | REQ | C→S | `{op, …op-args}` (see REQ ops); INSERT/WRITE_PLAN/RPC_TABLE append a raw Arrow body |
+| 1 | REQ | C→S | `{op, …op-args}` (see REQ ops); INSERT/RPC_TABLE append a raw Arrow body |
 | 2 | RESP_SCHEMA | S→C | `{}`; body = Arrow-IPC schema message |
 | 3 | RESP_CHUNK | S→C | Arrow chunk `{arrow:true}` + Arrow body; **or** a list chunk (no body; variants in `schema.json`) |
 | 4 | RESP_END | S→C | fields in `schema.json`; terminal frame (implies end-of-stream) |
@@ -99,6 +99,13 @@ first". See [Sessions](#sessions).
 | 17 | OPEN_ERR | S→C | `{ns, exception_type, exception_message, retriable?}` — the OPEN failed (unserved catalog, duplicate `ns`, `ns` 0, a pending catalog the host reported failed, or a catalog the host could not resolve). Only that session fails; the socket and its other sessions are unaffected. |
 | 18 | OPEN_PENDING | S→C | `{ns, message?}` — the catalog is accepted but not ready, or the host is resolving it. Sent instead of `OPEN_ACK` and repeated every `open_pending_interval_ms` until exactly one `OPEN_ACK` or `OPEN_ERR` ends the open. `message` is a human-readable status. |
 | 19 | HELLO_PENDING | S→C | `{message?}`; connection-scoped. The server is still authenticating. Sent instead of HELLO_ACK, repeated every `open_pending_interval_ms`, until exactly one HELLO_ACK or HELLO_ERR. |
+| 20 | LINK_OPEN | C→S | `{link}` — opens a far transaction (see [Links](#links)). No reply. |
+| 21 | LINK_CANCEL | C→S | `{link}` — stops what the link is running and rolls its transaction back. |
+| 22 | LINK_CLOSE | C→S | `{link}` — the client is done with the link. |
+| 23 | LINK_END | S→C | `{link, exception_type?, exception_message?}` — the far transaction ended; with an error when it failed or was refused. |
+| 24 | STREAM_DATA | either | `{link, stream, fin}`; body = one piece of a stream frame. |
+| 25 | STREAM_END | either | `{link, stream, exception_type?, exception_message?}` — the sender's end of the stream is closed. |
+| 26 | STREAM_CREDIT | either | `{link, stream, n}` — the receiver took `n` more frames of the stream. |
 
 ## REQ ops
 
@@ -152,11 +159,43 @@ leaves batching to DuckDB. Production clients omit it and let the server pick a
 batch size per [Chunk sizing](#chunk-sizing); a server is free to treat it as
 advisory, but honouring it is what makes the flow-control tests meaningful.
 
-`ALTER_TABLE` `kind` is one of `"add_column"` (details: `{name, type}`),
-`"drop_column"` (details: `{name}`), `"rename_column"` (details:
-`{old_name, new_name}`). Unsupported alter kinds (column type change,
-table rename, defaults, constraints) are rejected client-side with
-`BinderException` before the RPC is sent.
+`CREATE_SCHEMA {schema, on_conflict}` creates a schema in the session's catalog, outside any transaction;
+`on_conflict` is `error` or `ignore`. It needs the `schema_ddl` capability. A catalog that grants no create refuses it
+with `PermissionException`. The client refuses `CREATE SCHEMA` in a transaction, nested schemas and `CREATE OR REPLACE
+SCHEMA` with `BinderException`.
+
+Reads, writes, table and view DDL, and transactions travel on links, not as REQ ops.
+
+## Links
+
+A link is one far transaction of a session, served by crossing's far side (`CrossingFar` in `third_party/crossing`). The
+client picks a `link` id, never reused on that session, and sends `LINK_OPEN`. There is no reply: the client may send on
+the link's streams at once.
+
+**Streams.** A link carries numbered streams, each with one end at either side. Stream 0 is the control stream; the
+others carry rows. Either end may send first, and frames that arrive for a stream its receiver has not opened yet are
+held for it. Which streams exist, and what they mean, is crossing's.
+
+**Frames.** A stream frame is `[u32 little-endian header length][header][Arrow IPC]`. The header is crossing's, and a
+transport carries it unread. The Arrow part is absent on a frame with no rows; otherwise each direction of a stream is
+one Arrow IPC stream, its schema message in the first frame with rows and then one record batch per frame, with no
+end-of-stream marker. Columns are positional and named `c0`, `c1`, …. A stream frame travels as one or more
+`STREAM_DATA` frames of at most 512 KiB of body each, `fin` set on the last.
+
+**Flow control.** On a stream other than 0, a sender may have `default_batch_credits` frames in flight in each
+direction. The receiver sends `STREAM_CREDIT {n}` as it takes frames. Stream 0 has no credit. A peer that sends past its
+credit, holds more than 1 GiB queued on one link, or opens more than 2²⁰ streams on one link breaks the protocol, and
+the connection is closed.
+
+**Ends.** `STREAM_END` closes the sender's end; an error in it reaches the other end. `exception_type` on link and
+stream frames is DuckDB's own name for the type (`Exception::ExceptionTypeToString`, e.g. `Catalog`), not an
+`EXCEPTION_TYPES` class name. `LINK_CANCEL` fails what the link is running and rolls it back. `LINK_END` reports the
+far transaction ended, after every frame the server sent on the link; it carries an error when the transaction failed,
+was cancelled or was refused, and ends every stream the client has not seen end. A link keeps its place under the
+server's `max_links` until the client's `LINK_CLOSE`, and frames for an ended link are dropped.
+
+A paused catalog holds its links' control frames until it resumes. A dropped connection ends every link on it, and a
+link never moves to a new connection.
 
 `CREATE_TABLE` `columns` entries are `{name, type, not_null?}`. Optional `primary_key` (string[]) and `unique_keys`
 (string[][]) declare table constraints. Other constraints, defaults and generated columns are rejected client-side with
@@ -185,18 +224,17 @@ missing capability is fatal. Each name is defined at exactly one level.
 
 | Name | Level | Meaning |
 |------|-------|---------|
-| `crossing` | connect | `READ_PLAN` / `WRITE_PLAN` crossing ops are implemented. |
+| `crossing` | connect | [Links](#links) are implemented. |
 | `jsonrpc` | connect | Text frames carry JSON-RPC 2.0 requests the socket owner answers ([Text frames](#text-frames)). |
 | `mcp` | connect | Text frames carry an MCP session (implies `jsonrpc`). |
-| `catalog_plans` | open | A `READ_PLAN`, `WRITE_PLAN` or `CREATE_VIEW` plan may name a table `[catalog, schema, table]`, for any catalog a session on this socket has open. |
+| `catalog_plans` | open | A plan on a link may name a table `[catalog, schema, table]`, for any catalog a session on this socket has open. |
 | `has_function` | open | `HAS_FUNCTION {name, args}` is implemented: `RESP_END {exists}` says whether the session's server has a scalar or aggregate function taking exactly those argument types, with no cast. A client without this capability treats every answer as no and keeps named function calls out of its plans. |
 | `schema_ddl` | open | `CREATE_SCHEMA` is implemented. A client without this capability refuses `CREATE SCHEMA`. |
-| `table_ddl` | open | `CREATE_TABLE` honours `not_null`, `primary_key`, `unique_keys` and `txn`, and `ALTER_TABLE` honours `txn`. A client without this capability refuses a `CREATE TABLE` with constraints and table DDL in a transaction. |
 
 `catalog_plans` is granted only for a catalog the server serves itself, never one it forwards upstream. A
-plan naming a catalog no session on the socket has open fails with `CatalogException`, and one naming a
-paused catalog fails with a retriable `TransactionException`. The plan runs in its own session's
-transaction (`txn`), so it sees only the other catalogs' committed state.
+plan naming a catalog no session on the socket has open fails with a `Catalog` error, and one naming a
+paused catalog fails with a `TransactionContext` error. The plan runs in its own link's transaction, so it
+sees only the other catalogs' committed state.
 
 `jsonrpc` and `mcp` (`APP_HELLO_CAPS`) are granted only when the app serving the
 socket provides them, not by the n6k server itself. The SSOT is `HELLO_CAPS` / `APP_HELLO_CAPS` / `OPEN_CAPS` in
@@ -260,9 +298,13 @@ Each entry in the `tables` array:
 | `schema` | string | no | `"main"` |
 | `name` | string | yes | — |
 | `verbs` | string[] | no | `[]` |
+| `row_ids` | bool | no | `true` |
 | `primary_keys` | string[] | no | `[]` |
 | `not_null` | string[] | no | `[]` |
 | `unique_keys` | string[][] | no | `[]` |
+
+`row_ids` says whether the table has a `rowid`; a view has not. Without it a write that addresses rows by `rowid`,
+such as one with a subquery in its `WHERE`, is refused.
 
 `not_null` and `unique_keys` list constraints the server enforces: the NOT NULL column names, and the columns of each
 UNIQUE constraint other than the primary key.
@@ -308,8 +350,8 @@ The client uses `{schema, name}` as the table identity on subsequent
    deadline and fails only after `open_pending_stall_ms` without a frame for that
    `ns`, or on a drop. A pending catalog is listed by `CATALOG_LIST`, and
    `CANCEL {ns, id: 0}` abandons a pending open.
-4. Client issues `REQ` frames on an OPENed `ns`; server replies with matching
-   `req_id` and `ns`.
+4. Client issues `REQ` frames and opens [links](#links) on an OPENed `ns`; server replies with matching
+   `req_id` or `link`, and `ns`.
 5. **Flow control.** Streaming responses start with
    `default_batch_credits` batches of budget. Server decrements on each
    `RESP_CHUNK`; pauses at 0. Client sends `CREDIT{id, n}` (the refill count
@@ -371,8 +413,7 @@ One Arrow `RecordBatch` per `RESP_CHUNK`. The reference server sends one DuckDB
 
 ## HTTP endpoints
 
-None. Every operation — including DDL, via `OP_CREATE_TABLE` and
-`OP_ALTER_TABLE` — flows over the `/ws` WebSocket session. A conforming server
+None. Every operation — including DDL, on a link — flows over the `/ws` WebSocket session. A conforming server
 needs to serve exactly one endpoint.
 
 The only HTTP a client speaks is OAuth: discovery, token exchange and the

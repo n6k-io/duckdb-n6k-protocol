@@ -300,6 +300,171 @@
       "type": "object",
       "properties": {
         "t": {
+          "const": 20
+        },
+        "link": {
+          "type": "integer"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "link"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 21
+        },
+        "link": {
+          "type": "integer"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "link"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 22
+        },
+        "link": {
+          "type": "integer"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "link"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 23
+        },
+        "link": {
+          "type": "integer"
+        },
+        "exception_type": {
+          "type": "string"
+        },
+        "exception_message": {
+          "type": "string"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "link"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 24
+        },
+        "link": {
+          "type": "integer"
+        },
+        "stream": {
+          "type": "integer"
+        },
+        "fin": {
+          "type": "boolean"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "link",
+        "stream",
+        "fin"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 25
+        },
+        "link": {
+          "type": "integer"
+        },
+        "stream": {
+          "type": "integer"
+        },
+        "exception_type": {
+          "type": "string"
+        },
+        "exception_message": {
+          "type": "string"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "link",
+        "stream"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": 26
+        },
+        "link": {
+          "type": "integer"
+        },
+        "stream": {
+          "type": "integer"
+        },
+        "n": {
+          "type": "integer"
+        },
+        "ns": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "link",
+        "stream",
+        "n"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
           "const": 8
         },
         "op": {
@@ -563,9 +728,6 @@
         "schema": {
           "type": "string"
         },
-        "txn": {
-          "type": "integer"
-        },
         "ns": {
           "type": "integer"
         }
@@ -594,9 +756,6 @@
         },
         "table": {
           "type": "string"
-        },
-        "txn": {
-          "type": "integer"
         },
         "ns": {
           "type": "integer"
@@ -639,175 +798,6 @@
         "id",
         "schema",
         "table"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 14
-        },
-        "id": {
-          "type": "integer"
-        },
-        "plan": {
-          "type": "string"
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "_batch_rows": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "plan"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 15
-        },
-        "id": {
-          "type": "integer"
-        },
-        "verb": {
-          "type": "string"
-        },
-        "schema": {
-          "type": "string"
-        },
-        "table": {
-          "type": "string"
-        },
-        "key_columns": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "set_columns": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "reads_rows": {
-          "type": "boolean"
-        },
-        "plan": {
-          "type": "string"
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "verb",
-        "schema",
-        "table",
-        "key_columns",
-        "set_columns",
-        "plan"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 16
-        },
-        "id": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 17
-        },
-        "id": {
-          "type": "integer"
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "txn"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 18
-        },
-        "id": {
-          "type": "integer"
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "txn"
       ],
       "additionalProperties": false
     },
@@ -935,151 +925,6 @@
           "const": 1
         },
         "op": {
-          "const": 10
-        },
-        "id": {
-          "type": "integer"
-        },
-        "schema": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "columns": {
-          "type": "array"
-        },
-        "primary_key": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "unique_keys": {
-          "type": "array",
-          "items": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "schema",
-        "name",
-        "columns"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 21
-        },
-        "id": {
-          "type": "integer"
-        },
-        "schema": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "on_conflict": {
-          "type": "string",
-          "enum": [
-            "error",
-            "ignore",
-            "replace"
-          ]
-        },
-        "names": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "plan": {
-          "type": "string"
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "schema",
-        "name",
-        "on_conflict",
-        "names",
-        "plan"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 22
-        },
-        "id": {
-          "type": "integer"
-        },
-        "schema": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "if_exists": {
-          "type": "boolean"
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "schema",
-        "name",
-        "if_exists"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
           "const": 24
         },
         "id": {
@@ -1135,47 +980,6 @@
         "id",
         "name",
         "args"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "t": {
-          "const": 1
-        },
-        "op": {
-          "const": 11
-        },
-        "id": {
-          "type": "integer"
-        },
-        "schema": {
-          "type": "string"
-        },
-        "table": {
-          "type": "string"
-        },
-        "kind": {
-          "type": "string"
-        },
-        "details": {
-          "type": "object"
-        },
-        "txn": {
-          "type": "integer"
-        },
-        "ns": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "t",
-        "op",
-        "id",
-        "schema",
-        "table",
-        "kind"
       ],
       "additionalProperties": false
     }

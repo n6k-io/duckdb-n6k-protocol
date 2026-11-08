@@ -2,7 +2,9 @@
 
 #include "frame_codec.hpp"
 #include "host_callbacks.hpp"
+#include "crossing_far.hpp"
 #include "n6k_exception_types.hpp"
+#include "n6k_link.hpp"
 #include "n6k_served.hpp"
 #include "n6k_ws_log.hpp"
 #include "n6k_sql_builder.hpp"
@@ -585,7 +587,16 @@ InflightState ServeReactor::Inflight(const std::string &catalog) {
 	}
 	std::lock_guard<std::mutex> lk(map_mu_);
 	for (auto &entry : inflight_) {
-		if (entry.second->catalog == catalog || entry.second->plan_catalogs.count(catalog) != 0) {
+		if (entry.second->catalog == catalog) {
+			state.running++;
+		}
+	}
+	std::lock_guard<std::mutex> links_lk(links_mu_);
+	for (auto &entry : links_) {
+		auto &link = *entry.second;
+		// A link waiting for the client's next statement is an open transaction, not a running request.
+		if (!link.done.load() && link.state && link.state->ControlIdleSinceMs() == 0 &&
+		    (link.catalog == catalog || link.plan_catalogs.count(catalog) != 0)) {
 			state.running++;
 		}
 	}
@@ -598,7 +609,7 @@ int64_t ServeReactor::CancelInflight(const std::string &catalog) {
 		std::lock_guard<std::mutex> lk(map_mu_);
 		for (auto &entry : inflight_) {
 			auto &slot = *entry.second;
-			if (slot.catalog != catalog && slot.plan_catalogs.count(catalog) == 0) {
+			if (slot.catalog != catalog) {
 				continue;
 			}
 			running++;
@@ -614,22 +625,21 @@ int64_t ServeReactor::CancelInflight(const std::string &catalog) {
 			}
 		}
 	}
-	std::unordered_set<int64_t> sessions;
+	std::vector<std::shared_ptr<ServedLink>> links;
 	{
-		std::lock_guard<std::mutex> lk(push_mu_);
-		for (auto &entry : push_sessions_) {
-			if (entry.second == catalog) {
-				sessions.insert(entry.first);
+		std::lock_guard<std::mutex> lk(map_mu_);
+		std::lock_guard<std::mutex> links_lk(links_mu_);
+		for (auto &entry : links_) {
+			auto &link = *entry.second;
+			if (!link.done.load() && link.state && link.state->ControlIdleSinceMs() == 0 &&
+			    (link.catalog == catalog || link.plan_catalogs.count(catalog) != 0)) {
+				links.push_back(entry.second);
 			}
 		}
 	}
-	// A statement in a transaction runs on the pinned connection, not the worker's own. Interrupting an
-	// idle one is harmless: DuckDB clears the flag when the next statement starts.
-	std::lock_guard<std::mutex> lk(txn_mu_);
-	for (auto &entry : txns_) {
-		if (sessions.count(entry.first.ns) != 0 && entry.second->conn) {
-			entry.second->conn->Interrupt();
-		}
+	for (auto &link : links) {
+		running++;
+		CancelServedLink(*link, "n6k_server: catalog \"" + catalog + "\" cancelled its running requests");
 	}
 	return running;
 }
@@ -765,6 +775,7 @@ void ServeReactor::ApplyCatalogChanges() {
 			for (auto &req : reqs) {
 				AdmitAndQueueRequest(req.sess, req.req_id, req.op, std::move(req.body));
 			}
+			DeliverHeldControl(change.catalog);
 			continue;
 		}
 		const bool ok = change.kind == CatalogChange::Kind::READY;
@@ -843,6 +854,7 @@ void ServeReactor::EvictForwarded(Upstream &up, const std::string &catalog, cons
 		}
 		const auto ns = fwd->first;
 		std::vector<uint32_t> inflight;
+		std::vector<uint32_t> links;
 		bool opening;
 		{
 			std::lock_guard<std::mutex> lk(up.track_mu);
@@ -856,12 +868,24 @@ void ServeReactor::EvictForwarded(Upstream &up, const std::string &catalog, cons
 					++key;
 				}
 			}
+			for (auto key = up.links.begin(); key != up.links.end();) {
+				if (key->ns == ns) {
+					links.push_back(key->req_id);
+					key = up.links.erase(key);
+				} else {
+					++key;
+				}
+			}
 		}
 		if (opening) {
 			SendFrame(PackOpenErr(ns, "InvalidInputException", reason));
 		}
 		for (auto req_id : inflight) {
 			SendError(*this, FrameTarget {ns, req_id}, "InvalidInputException", reason);
+		}
+		const ErrorData link_error(ExceptionType::INVALID_INPUT, reason);
+		for (auto link : links) {
+			SendFrame(PackLinkEnd(ns, link, &link_error));
 		}
 		up.Send(PackCloseSession(ns));
 		fwd = forwarded_.erase(fwd);
@@ -879,6 +903,7 @@ void ServeReactor::ApplyUpstreamGone(int id, const std::string &reason_in) {
 	std::string reason = reason_in;
 	std::unordered_set<int64_t> opening;
 	std::unordered_set<InflightKey, InflightKeyHash> inflight;
+	std::unordered_set<InflightKey, InflightKeyHash> links;
 	{
 		std::lock_guard<std::mutex> lk(up->track_mu);
 		if (reason.empty()) {
@@ -886,6 +911,7 @@ void ServeReactor::ApplyUpstreamGone(int id, const std::string &reason_in) {
 		}
 		opening.swap(up->opening);
 		inflight.swap(up->inflight);
+		links.swap(up->links);
 	}
 	{
 		std::lock_guard<std::mutex> lk(resolve_mu_);
@@ -916,6 +942,12 @@ void ServeReactor::ApplyUpstreamGone(int id, const std::string &reason_in) {
 		for (auto &key : inflight) {
 			if (key.ns == ns) {
 				SendError(*this, FrameTarget {ns, key.req_id}, "IOException", message);
+			}
+		}
+		const ErrorData link_error(ExceptionType::IO, message);
+		for (auto &key : links) {
+			if (key.ns == ns) {
+				SendFrame(PackLinkEnd(ns, key.req_id, &link_error));
 			}
 		}
 		fwd = forwarded_.erase(fwd);
@@ -1112,6 +1144,7 @@ void ServeReactor::EvictSession(int64_t ns, const std::string &reason) {
 	for (auto &req : TakeHeldOf(ns)) {
 		SendError(*this, FrameTarget {ns, req.req_id}, "InvalidInputException", reason);
 	}
+	StopLinksOf(ns, reason);
 	CloseSessionAndCancelItsRequests(ns);
 	for (auto &req : inflight) {
 		if (req.second) {
@@ -1143,8 +1176,8 @@ void ServeReactor::TrackSession(int64_t ns, const std::string &catalog) {
 	push_sessions_[ns] = catalog;
 }
 
-void ServeReactor::AdmitPlanCatalog(RequestSlot &slot, const std::string &catalog) {
-	if (StringUtil::CIEquals(catalog, slot.catalog)) {
+void ServeReactor::AdmitPlanCatalog(ServedLink &link, const std::string &catalog) {
+	if (StringUtil::CIEquals(catalog, link.catalog)) {
 		return;
 	}
 	std::string opened;
@@ -1165,7 +1198,7 @@ void ServeReactor::AdmitPlanCatalog(RequestSlot &slot, const std::string &catalo
 	// Counted before the pause is checked: a pause that lands in between then waits for this request.
 	{
 		std::lock_guard<std::mutex> lk(map_mu_);
-		slot.plan_catalogs.insert(opened);
+		link.plan_catalogs.insert(opened);
 	}
 	std::lock_guard<std::mutex> lk(resolve_mu_);
 	if (paused_.count(opened) != 0) {
@@ -1176,6 +1209,234 @@ void ServeReactor::AdmitPlanCatalog(RequestSlot &slot, const std::string &catalo
 void ServeReactor::UntrackSession(int64_t ns) {
 	std::lock_guard<std::mutex> lk(push_mu_);
 	push_sessions_.erase(ns);
+}
+
+// The Connection outlives CrossingFar, and a canceller holding this outlives both's use.
+struct FarRun {
+	FarRun(DatabaseInstance &db, const std::string &catalog, CrossingFarOptions options)
+	    : connection(db), far(connection, catalog, std::move(options)) {
+	}
+	Connection connection;
+	CrossingFar far;
+};
+
+void ServeReactor::RunServedLink(const std::shared_ptr<ServedLink> &link) {
+	ErrorData failure;
+	try {
+		CrossingFarOptions options;
+		auto *entry = link.get();
+		options.catalogs = [this, entry](const string &catalog) {
+			AdmitPlanCatalog(*entry, catalog);
+		};
+		auto run = std::make_shared<FarRun>(db_, link->catalog, std::move(options));
+		MarkServed(*run->connection.context);
+		string cancel_reason;
+		bool cancelled;
+		{
+			std::lock_guard<std::mutex> guard(link->mu);
+			link->far = run;
+			cancelled = link->cancelled;
+			cancel_reason = link->cancel_reason;
+		}
+		if (cancelled) {
+			run->far.Cancel(cancel_reason);
+		}
+		run->far.Serve(*link->state);
+	} catch (const std::exception &ex) {
+		failure = ErrorData(ex);
+	}
+	{
+		std::lock_guard<std::mutex> guard(link->mu);
+		link->far.reset();
+		// A client waiting on a stream the statement never reached hears why from this.
+		if (link->cancelled) {
+			failure = ErrorData(ExceptionType::INTERRUPT, link->cancel_reason);
+		}
+	}
+	SendFrame(PackLinkEnd(link->ns, link->link, failure.HasError() ? &failure : nullptr));
+	link->done.store(true);
+}
+
+void ServeReactor::CancelServedLink(ServedLink &link, const std::string &reason) {
+	std::shared_ptr<FarRun> run;
+	{
+		std::lock_guard<std::mutex> guard(link.mu);
+		if (link.cancelled) {
+			return;
+		}
+		link.cancelled = true;
+		link.cancel_reason = reason;
+		run = link.far;
+	}
+	link.state->Fail(ErrorData(ExceptionType::INTERRUPT, reason));
+	if (run) {
+		run->far.Cancel(reason);
+	}
+}
+
+void ServeReactor::OpenServedLink(int64_t ns, uint32_t id) {
+	const InflightKey key {ns, id};
+	const std::string *catalog = LookupSessionCatalog(ns);
+	if (catalog == nullptr) {
+		const ErrorData error(ExceptionType::INVALID_INPUT,
+		                      "unknown session ns=" + std::to_string(ns) + "; send FT_OPEN first");
+		SendFrame(PackLinkEnd(ns, id, &error));
+		return;
+	}
+	std::lock_guard<std::mutex> lk(links_mu_);
+	if (links_.count(key) != 0) {
+		throw InvalidInputException("n6k: link %llu opened twice", id);
+	}
+	if (links_.size() >= static_cast<size_t>(options_.max_links)) {
+		const ErrorData error(ExceptionType::INVALID_INPUT, "too many open transactions on this connection (limit " +
+		                                                        std::to_string(options_.max_links) + ")");
+		SendFrame(PackLinkEnd(ns, id, &error));
+		return;
+	}
+	auto link = std::make_shared<ServedLink>();
+	link->ns = ns;
+	link->link = id;
+	link->catalog = *catalog;
+	link->state = std::make_shared<N6kLinkState>(db_, ns, id, idx_t(1),
+	                                             [this](std::string frame) { SendFrame(std::move(frame)); });
+	links_[key] = link;
+	link->thread = std::thread([this, link]() { RunServedLink(link); });
+}
+
+void ServeReactor::HandleLinkFrame(FrameType type, int64_t ns, const msgpack::object &header, const std::string &frame,
+                                   const char *body, size_t body_len) {
+	const auto id = GetInt(header, "link", -1);
+	if (id < 0 || id > std::numeric_limits<uint32_t>::max()) {
+		throw InvalidInputException("n6k: a link frame names no link");
+	}
+	const auto link_id = static_cast<uint32_t>(id);
+	if (type == FrameType::LINK_OPEN) {
+		OpenServedLink(ns, link_id);
+		return;
+	}
+	std::shared_ptr<ServedLink> link;
+	{
+		std::lock_guard<std::mutex> lk(links_mu_);
+		auto it = links_.find(InflightKey {ns, link_id});
+		if (it != links_.end()) {
+			link = it->second;
+		}
+	}
+	if (!link || link->done.load()) {
+		if (link && type == FrameType::LINK_CLOSE) {
+			link->closing = true;
+		}
+		return;
+	}
+	switch (type) {
+	case FrameType::LINK_CANCEL:
+		cancels_.fetch_add(1);
+		CancelServedLink(*link, "n6k_server: the client cancelled its transaction");
+		break;
+	case FrameType::LINK_CLOSE:
+		link->closing = true;
+		CancelServedLink(*link, "n6k_server: the client closed its transaction");
+		break;
+	case FrameType::STREAM_DATA:
+		if (GetInt(header, "stream", -1) == 0 && held_.count(link->catalog) != 0) {
+			link->held_control.push_back(frame);
+			break;
+		}
+		link->state->Deliver(type, header, body, body_len);
+		break;
+	case FrameType::STREAM_END:
+	case FrameType::STREAM_CREDIT:
+		link->state->Deliver(type, header, body, body_len);
+		break;
+	default:
+		throw InvalidInputException("n6k: a client cannot send frame type %d", static_cast<int>(type));
+	}
+}
+
+void ServeReactor::DeliverHeldControl(const std::string &catalog) {
+	std::vector<std::shared_ptr<ServedLink>> links;
+	{
+		std::lock_guard<std::mutex> lk(links_mu_);
+		for (auto &entry : links_) {
+			if (entry.second->catalog == catalog && !entry.second->held_control.empty()) {
+				links.push_back(entry.second);
+			}
+		}
+	}
+	for (auto &link : links) {
+		auto held = std::move(link->held_control);
+		link->held_control.clear();
+		if (link->done.load()) {
+			continue;
+		}
+		for (auto &frame : held) {
+			msgpack::object_handle oh;
+			const char *body;
+			size_t body_len;
+			ParseFrame(frame, oh, body, body_len);
+			link->state->Deliver(FrameType::STREAM_DATA, oh.get(), body, body_len);
+		}
+	}
+}
+
+void ServeReactor::ReapLinks() {
+	std::lock_guard<std::mutex> lk(links_mu_);
+	for (auto it = links_.begin(); it != links_.end();) {
+		auto &link = *it->second;
+		if (!link.done.load()) {
+			++it;
+			continue;
+		}
+		if (link.thread.joinable()) {
+			link.thread.join();
+		}
+		link.held_control.clear();
+		if (link.closing) {
+			it = links_.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+void ServeReactor::StopLinksOf(int64_t ns, const std::string &reason) {
+	std::vector<std::shared_ptr<ServedLink>> links;
+	{
+		std::lock_guard<std::mutex> lk(links_mu_);
+		for (auto &entry : links_) {
+			if (entry.first.ns == ns) {
+				entry.second->closing = true;
+				if (!entry.second->done.load()) {
+					links.push_back(entry.second);
+				}
+			}
+		}
+	}
+	for (auto &link : links) {
+		CancelServedLink(*link, reason);
+	}
+}
+
+void ServeReactor::StopAllLinks() {
+	std::vector<std::shared_ptr<ServedLink>> links;
+	{
+		std::lock_guard<std::mutex> lk(links_mu_);
+		for (auto &entry : links_) {
+			links.push_back(entry.second);
+		}
+	}
+	for (auto &link : links) {
+		if (!link->done.load()) {
+			CancelServedLink(*link, "n6k_server: the connection is closing");
+		}
+	}
+	for (auto &link : links) {
+		if (link->thread.joinable()) {
+			link->thread.join();
+		}
+	}
+	std::lock_guard<std::mutex> lk(links_mu_);
+	links_.clear();
 }
 
 int ServeReactor::NotifyInvalidate(const std::string &catalog, const std::vector<std::string> &schemas) {
@@ -1197,78 +1458,6 @@ int ServeReactor::NotifyInvalidate(const std::string &catalog, const std::vector
 		SendFrame(PackPushInvalidate(ns, schemas));
 	}
 	return static_cast<int>(targets.size());
-}
-
-int64_t ServeReactor::BeginTxn(RequestSlot &slot) {
-	auto pinned = std::make_shared<PinnedTxn>();
-	pinned->conn = std::unique_ptr<Connection>(new Connection(db_));
-	MarkServed(*pinned->conn->context);
-	pinned->conn->BeginTransaction();
-	{
-		// Checked under txn_mu_: a session close sets `cancel` before DropTxnsOf takes it.
-		std::lock_guard<std::mutex> lk(txn_mu_);
-		if (!slot.cancel.load()) {
-			auto txn = next_txn_++;
-			txns_[TxnKey {slot.ns, txn}] = std::move(pinned);
-			return txn;
-		}
-	}
-	pinned->conn->Rollback();
-	throw InterruptException();
-}
-
-std::shared_ptr<PinnedTxn> ServeReactor::FindTxn(int64_t ns, int64_t txn) {
-	std::lock_guard<std::mutex> lk(txn_mu_);
-	auto it = txns_.find(TxnKey {ns, txn});
-	return it == txns_.end() ? nullptr : it->second;
-}
-
-std::shared_ptr<PinnedTxn> ServeReactor::TakeTxn(int64_t ns, int64_t txn) {
-	std::lock_guard<std::mutex> lk(txn_mu_);
-	auto it = txns_.find(TxnKey {ns, txn});
-	if (it == txns_.end()) {
-		return nullptr;
-	}
-	auto pinned = std::move(it->second);
-	txns_.erase(it);
-	return pinned;
-}
-
-void ServeReactor::DropTxnsOf(int64_t ns) {
-	std::vector<std::shared_ptr<PinnedTxn>> dropped;
-	{
-		std::lock_guard<std::mutex> lk(txn_mu_);
-		for (auto it = txns_.begin(); it != txns_.end();) {
-			if (it->first.ns == ns) {
-				dropped.push_back(std::move(it->second));
-				it = txns_.erase(it);
-			} else {
-				++it;
-			}
-		}
-	}
-	// Out of `txns_`, nothing but the destructor touches `conn`, so reading it unlocked is safe.
-	for (auto &pinned : dropped) {
-		pinned->dropped.store(true);
-		if (pinned->conn) {
-			pinned->conn->Interrupt();
-		}
-	}
-}
-
-void ServeReactor::DropAllTxns() {
-	std::vector<std::shared_ptr<PinnedTxn>> dropped;
-	{
-		std::lock_guard<std::mutex> lk(txn_mu_);
-		for (auto &entry : txns_) {
-			dropped.push_back(std::move(entry.second));
-		}
-		txns_.clear();
-	}
-	for (auto &pinned : dropped) {
-		std::lock_guard<std::mutex> plk(pinned->mu);
-		pinned->conn.reset();
-	}
 }
 
 void ServeReactor::CloseSessionAndCancelItsRequests(int64_t ns) {
@@ -1300,10 +1489,37 @@ void ServeReactor::CloseSessionAndCancelItsRequests(int64_t ns) {
 			QueueParked(entry.second, RequestTask::Kind::CANCEL);
 		}
 	}
-	DropTxnsOf(ns);
+	StopLinksOf(ns, "n6k_server: the session closed");
 }
 
 void ServeReactor::ExpireIdle() {
+	ReapLinks();
+	if (options_.idle_txn_timeout_ms > 0 || options_.idle_stream_timeout_ms > 0) {
+		const auto now = SteadyNowMs();
+		std::vector<std::pair<std::shared_ptr<ServedLink>, std::string>> expired;
+		{
+			std::lock_guard<std::mutex> lk(links_mu_);
+			for (auto &entry : links_) {
+				auto &link = *entry.second;
+				if (link.done.load() || !link.state) {
+					continue;
+				}
+				const auto parked = link.state->ControlIdleSinceMs();
+				if (options_.idle_txn_timeout_ms > 0 && parked != 0 && parked < now - options_.idle_txn_timeout_ms) {
+					expired.emplace_back(entry.second, "n6k_server: transaction idle for more than " +
+					                                       std::to_string(options_.idle_txn_timeout_ms) + " ms");
+				} else if (options_.idle_stream_timeout_ms > 0 && parked == 0 && link.state->SendParked() &&
+				           link.state->LastProgressMs() < now - options_.idle_stream_timeout_ms) {
+					expired.emplace_back(entry.second, "n6k_server: stream idle for more than " +
+					                                       std::to_string(options_.idle_stream_timeout_ms) +
+					                                       " ms without credit");
+				}
+			}
+		}
+		for (auto &entry : expired) {
+			CancelServedLink(*entry.first, entry.second);
+		}
+	}
 	if (options_.idle_stream_timeout_ms > 0) {
 		const auto cutoff =
 		    std::chrono::steady_clock::now() - std::chrono::milliseconds(options_.idle_stream_timeout_ms);
@@ -1323,39 +1539,6 @@ void ServeReactor::ExpireIdle() {
 			                              std::to_string(options_.idle_stream_timeout_ms) + " ms without credit",
 			                          false));
 			QueueParked(slot, RequestTask::Kind::CANCEL);
-		}
-	}
-	if (options_.idle_txn_timeout_ms > 0) {
-		const auto cutoff = SteadyNowMs() - options_.idle_txn_timeout_ms;
-		// Taken out of `txns_` with `mu` held, so a request that found it first sees it closed.
-		std::vector<std::pair<std::shared_ptr<PinnedTxn>, std::unique_lock<std::mutex>>> expired;
-		{
-			std::lock_guard<std::mutex> lk(txn_mu_);
-			for (auto it = txns_.begin(); it != txns_.end();) {
-				if (it->second->last_used_ms.load() < cutoff) {
-					std::unique_lock<std::mutex> held(it->second->mu, std::try_to_lock);
-					if (held.owns_lock()) {
-						expired.emplace_back(std::move(it->second), std::move(held));
-						it = txns_.erase(it);
-						continue;
-					}
-				}
-				++it;
-			}
-		}
-		for (auto &entry : expired) {
-			auto &pinned = entry.first;
-			auto guard = std::move(entry.second);
-			if (!pinned->conn) {
-				continue;
-			}
-			try {
-				pinned->conn->Rollback();
-			} catch (const std::exception &e) {
-				DUCKDB_LOG_WARNING(context_, "n6k_server: rolling back an idle transaction: %s",
-				                   ErrorData(e).Message());
-			}
-			pinned->conn.reset();
 		}
 	}
 }
@@ -2012,13 +2195,20 @@ int64_t ServeReactor::Run() {
 			const auto type = static_cast<FrameType>(GetInt(h, "t", -1));
 			const auto req_id = static_cast<uint32_t>(GetInt(h, "id", 0));
 			const auto ns = GetInt(h, "ns", 0);
-			if (ns != 0 && (type == FrameType::REQ || type == FrameType::CREDIT || type == FrameType::CANCEL)) {
+			if (ns != 0 && (type == FrameType::REQ || type == FrameType::CREDIT || type == FrameType::CANCEL ||
+			                IsLinkFrame(type))) {
 				auto fwd = forwarded_.find(ns);
 				if (fwd != forwarded_.end()) {
 					auto &up = *fwd->second.up;
 					if (type == FrameType::REQ) {
 						std::lock_guard<std::mutex> lk(up.track_mu);
 						up.inflight.insert(InflightKey {ns, req_id});
+					} else if (type == FrameType::LINK_OPEN) {
+						std::lock_guard<std::mutex> lk(up.track_mu);
+						up.links.insert(InflightKey {ns, static_cast<uint32_t>(GetInt(h, "link", 0))});
+					} else if (type == FrameType::LINK_CLOSE) {
+						std::lock_guard<std::mutex> lk(up.track_mu);
+						up.links.erase(InflightKey {ns, static_cast<uint32_t>(GetInt(h, "link", 0))});
 					} else if (type == FrameType::CANCEL && req_id == 0) {
 						{
 							std::lock_guard<std::mutex> lk(up.track_mu);
@@ -2027,12 +2217,19 @@ int64_t ServeReactor::Run() {
 							for (auto key = up.inflight.begin(); key != up.inflight.end();) {
 								key = key->ns == ns ? up.inflight.erase(key) : std::next(key);
 							}
+							for (auto key = up.links.begin(); key != up.links.end();) {
+								key = key->ns == ns ? up.links.erase(key) : std::next(key);
+							}
 						}
 						forwarded_.erase(fwd);
 					}
 					up.Send(frame);
 					continue;
 				}
+			}
+			if (IsLinkFrame(type)) {
+				HandleLinkFrame(type, ns, h, frame, raw_body, raw_body_len);
+				continue;
 			}
 			switch (type) {
 			case FrameType::REQ: {
@@ -2059,7 +2256,7 @@ int64_t ServeReactor::Run() {
 					          std::string("request header: ") + e.what());
 					break;
 				}
-				if (op == OP_INSERT || op == OP_RPC_TABLE || op == OP_WRITE_PLAN) {
+				if (op == OP_INSERT || op == OP_RPC_TABLE) {
 					body.push_back('\n');
 					body.append(raw_body, raw_body_len);
 				}
@@ -2135,6 +2332,7 @@ int64_t ServeReactor::Run() {
 	// Leave the registry first, so a push arriving during teardown is not queued onto a writer that is
 	// about to stop.
 	registration.Release();
+	StopAllLinks();
 	{
 		// A parked stream is on no worker, so it would never see `stopping_` by itself.
 		std::lock_guard<std::mutex> lk(map_mu_);
@@ -2160,7 +2358,6 @@ int64_t ServeReactor::Run() {
 	}
 	StopWorkers();
 	StopCallbackThreads();
-	DropAllTxns();
 	// Before the writer stops: an upstream's reader forwards onto it.
 	for (auto &entry : upstreams_) {
 		StopUpstream(*entry.second);

@@ -70,9 +70,8 @@ ArrowIpcStreamEncoder::~ArrowIpcStreamEncoder() {
 }
 
 std::string ArrowIpcStreamEncoder::TakeNewlyWrittenBytes() {
-	auto total = static_cast<size_t>(buf_.size_bytes);
-	std::string out(reinterpret_cast<const char *>(buf_.data) + cursor_, total - cursor_);
-	cursor_ = total;
+	std::string out(reinterpret_cast<const char *>(buf_.data), static_cast<size_t>(buf_.size_bytes));
+	buf_.size_bytes = 0;
 	return out;
 }
 

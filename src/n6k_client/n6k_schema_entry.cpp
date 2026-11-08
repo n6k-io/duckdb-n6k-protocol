@@ -149,7 +149,7 @@ optional_ptr<CatalogEntry> N6kSchemaEntry::CreateType(CatalogTransaction transac
 }
 
 void N6kSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	if (info.type == CatalogType::VIEW_ENTRY) {
+	if (info.type == CatalogType::VIEW_ENTRY || info.type == CatalogType::TABLE_ENTRY) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::DROP;
 		ddl.schema = name.GetIdentifierName();

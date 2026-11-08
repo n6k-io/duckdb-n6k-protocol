@@ -39,7 +39,6 @@ private:
 	ArrowBuffer buf_;
 	ArrowIpcOutputStream out_stream_;
 	ArrowIpcWriter writer_;
-	size_t cursor_ = 0;
 	bool finalized_ = false;
 };
 

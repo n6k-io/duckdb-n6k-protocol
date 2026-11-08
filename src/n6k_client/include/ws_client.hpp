@@ -4,6 +4,7 @@
 #include "ws_reactor.hpp"
 
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/typedefs.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -19,9 +20,12 @@
 
 namespace duckdb {
 
+class DatabaseInstance;
 class Logger;
 
 namespace n6k {
+
+class N6kLinkState;
 
 struct Frame {
 	FrameType type;
@@ -124,6 +128,11 @@ public:
 
 	void SendCancel(uint32_t req_id);
 
+	// One far transaction. `should_abort` guards the reconnect this call runs when the connection is down. A link
+	// never survives the connection: a drop fails it.
+	std::shared_ptr<N6kLinkState> OpenLink(DatabaseInstance &db, idx_t streams, const AbortCheck &should_abort);
+	void CloseLink(N6kLinkState &link);
+
 	// Server-initiated PUSH dispatch; invoked on the thread delivering inbound frames. A PUSH that arrives while
 	// no handler is set is dropped.
 	using PushHandler = std::function<void(uint8_t op, const std::string &body)>;
@@ -194,6 +203,8 @@ private:
 	// Re-establish after a drop: close the old channel, open one under a fresh ns, and OPEN again. Throws if
 	// the peer is unusable, so the caller sees why.
 	void Reconnect(const AbortCheck &should_abort);
+	// Reconnect if the connection beneath dropped or was replaced; throw if the client still has none.
+	void EnsureConnected(const AbortCheck &should_abort);
 
 	// Open a channel, run the handshake on it, and throw the reason it is unusable. `answered` is true once
 	// the OPEN wait ends with an OPEN_ACK, an OPEN_ERR or a recorded handshake error; false for a timeout, a
@@ -232,6 +243,10 @@ private:
 
 	std::mutex reqs_mu_;
 	std::unordered_map<uint32_t, std::shared_ptr<RequestState>> reqs_;
+
+	std::atomic<uint32_t> next_link_id_ {1};
+	std::mutex links_mu_;
+	std::unordered_map<uint32_t, std::shared_ptr<N6kLinkState>> links_;
 
 	std::mutex push_handler_mu_;
 	PushHandler push_handler_;

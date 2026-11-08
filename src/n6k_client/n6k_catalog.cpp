@@ -26,8 +26,7 @@ namespace duckdb {
 
 N6kCatalog::N6kCatalog(AttachedDatabase &db, string base_url_p, std::shared_ptr<CatalogSession> session_p)
     : Catalog(db), base_url(std::move(base_url_p)), session(std::move(session_p)),
-      attach(db, Crossing<N6kSource>::Adapt(
-                     make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName().GetIdentifierName()))) {
+      attach(db, make_uniq<N6kSource>(db.GetDatabase(), session, db.GetName().GetIdentifierName())) {
 	session->SetPushHandler([this](uint8_t op, const std::string &body) {
 		if (op == n6k::OP_CATALOG_INVALIDATED) {
 			HandlePushInvalidate(body);
@@ -41,7 +40,7 @@ N6kCatalog::~N6kCatalog() {
 }
 
 N6kSource &N6kCatalog::Source() {
-	return attach.Source<N6kSource>();
+	return static_cast<N6kSource &>(attach.Source());
 }
 
 void N6kCatalog::OnDetach(ClientContext &context) {
