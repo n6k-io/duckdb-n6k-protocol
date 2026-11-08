@@ -945,9 +945,6 @@ std::unique_ptr<ParkedStream> HandleRequest(ServeReactor &reactor, std::unique_p
 	case OP_HAS_FUNCTION:
 		HandleHasFunction(reactor, conn, body, body_len, slot);
 		break;
-	case OP_HAS_FUNCTION:
-		HandleHasFunction(reactor, conn, body, body_len, slot);
-		break;
 	case OP_RPC_SCALAR:
 		return HandleRpcScalar(reactor, own, catalog, body, body_len, slot);
 	case OP_RPC_TABLE:
