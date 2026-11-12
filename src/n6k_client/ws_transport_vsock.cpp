@@ -62,9 +62,9 @@ void VsockTransport::Start(MessageFn on_message, CloseFn on_close, OpenFn on_ope
 	const auto pointers = std::to_string(ring_ptr) + ", " +
 	                      std::to_string(reinterpret_cast<uintptr_t>(N6kIoThread::Instance().DoorbellAddress()));
 	const std::string args = "'" + key_ + "', '" + EscapeSingleQuotedJsLiteral(connection_id_) + "', " + pointers;
+	// n6k.* calls go to the main runtime thread: under threads>1 this can run on a compute pthread, whose JS scope
+	// has no globalThis.n6k (see n6k_wasm_main_thread.hpp).
 	if (ws_url_.empty()) {
-		// Main runtime thread: under threads>1 this can run on a compute pthread, whose JS scope has no
-		// globalThis.n6k (see n6k_wasm_main_thread.hpp).
 		auto result = RunScriptStringOnMain("n6k.vsockAdopt(" + args + ")");
 		if (result != "OK") {
 			FailStart(ring, nullptr, result);

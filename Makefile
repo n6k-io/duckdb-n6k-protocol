@@ -68,23 +68,23 @@ cpp-test:
 	@echo "cpp-test: running (log: $(CPP_TEST_RUN_LOG))"
 	@build/cpp-test/n6k_unittest $(TEST_ARGS) > $(CPP_TEST_RUN_LOG) 2>&1; status=$$?; tail -40 $(CPP_TEST_RUN_LOG); exit $$status
 
-# Regenerate TS + C++ mirrors of packages/python/src/n6k_protocol/protocol.py.
-# Source of truth lives in Python; outputs are committed to git.
 .PHONY: glue-gen glue-check
 GLUE_GENERATED := src/n6k_client/include/n6k_glue_generated.hpp
 
 glue-gen:
 	cd packages/npm && bun scripts/glue-gen.ts
 
-# Verify the committed glue header matches packages/npm/src/glue.
+# Verify the committed glue header matches the sources glue-gen.ts bundles.
 glue-check: glue-gen
 	@if ! git diff --quiet -- $(GLUE_GENERATED) || git ls-files --others --exclude-standard -- $(GLUE_GENERATED) | grep -q .; then \
-		echo "ERROR: $(GLUE_GENERATED) is out of sync with packages/npm/src/glue"; \
+		echo "ERROR: $(GLUE_GENERATED) is out of sync with the sources glue-gen.ts bundles"; \
 		echo "       run 'make glue-gen' and commit the changes."; \
 		exit 1; \
 	fi
 	@echo "glue header is up to date"
 
+# Regenerate TS + C++ mirrors of packages/python/src/n6k_protocol/protocol.py.
+# Source of truth lives in Python; outputs are committed to git.
 .PHONY: protocol-gen protocol-check
 PROTOCOL_GENERATED := packages/npm/src/protocol-generated.ts src/common/include/n6k_protocol_generated.hpp packages/python/src/n6k_protocol/schema.json
 

@@ -39,7 +39,6 @@ export type N6kDuckDBOptions = Omit<
 
 export type N6kDuckDBStatus =
   | "initializing"
-  | "loading-extensions"
   | "attaching"
   | "ready"
   | "error";

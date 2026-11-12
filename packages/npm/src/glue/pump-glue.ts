@@ -23,7 +23,7 @@ export type N6kPumpApi = {
     statusPtr: number,
     wsUrl: string,
   ): string;
-  // From the transport's Stop, after C++ is off the rings: drain, close the socket, free the ring.
+  // Only once C++ is off the rings: drain, close the socket, free the ring.
   close(key: string): void;
 };
 

@@ -38,7 +38,7 @@ void *PumpThreadMain(void *arg) {
 		signal->cv.notify_all();
 	}
 	// Not emscripten_unwind_to_js_event_loop: without a live runtime the thread exits and its worker returns to
-	// the pool, dropping proxied calls. std::thread can't be used here either (emscripten#17091).
+	// the pool, dropping proxied calls.
 	emscripten_exit_with_live_runtime();
 	return nullptr;
 }
@@ -66,6 +66,7 @@ N6kPumpThread &N6kPumpThread::Instance() {
 
 N6kPumpThread::N6kPumpThread() {
 	StartSignal signal;
+	// Not std::thread (emscripten#17091).
 	if (pthread_create(&tid_, nullptr, PumpThreadMain, &signal) != 0) {
 		throw IOException("n6k: failed to start the pump thread");
 	}

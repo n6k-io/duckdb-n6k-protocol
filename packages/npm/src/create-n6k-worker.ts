@@ -210,7 +210,7 @@ export function createN6kWorker({
         initWaiter = null;
         reject(
           new Error(
-            "n6k: the n6k_client extension did not answer n6k-init; it predates the embedded glue",
+            "n6k: no answer to n6k-init: LOAD n6k_client has not run, or the extension predates the embedded glue",
           ),
         );
       }, ATTACH_TIMEOUT_MS);

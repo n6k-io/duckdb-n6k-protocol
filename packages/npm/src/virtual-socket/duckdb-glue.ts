@@ -1,4 +1,4 @@
-// duckdb-worker half of the vsock: tracks each transport's duckdb-side endpoint so close can close it.
+// Main-glue half of the vsock: tracks each transport's duckdb-side endpoint so close can close it.
 
 import { duckdbEndpoint, type ChannelLayout, type Endpoint } from "./channel";
 

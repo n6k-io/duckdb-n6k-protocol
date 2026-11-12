@@ -82,8 +82,7 @@ export function installMainGlue(
   };
 
   const vsock = createVsockRegistry();
-  // Ring offset per open transport: read by n6k-vsock-selftest, and tells whether a ring free belongs to the
-  // currently registered endpoint.
+  // Ring offset per open transport; tells whether a ring free belongs to the currently registered endpoint.
   const ringOf = new Map<string, number>();
   // Dialed transports' doorbells, for n6k-reconnect.
   const doorbellOf = new Map<string, number>();
@@ -202,7 +201,7 @@ export function installMainGlue(
   };
   globalThis.n6k = api;
 
-  // duckdb-wasm's own handler also sees these; once the database is open it ignores unknown types.
+  // duckdb-wasm's own handler also sees these; once instantiated it ignores unknown types.
   globalThis.addEventListener("message", (ev: MessageEvent) => {
     const m = ev.data;
     if (!m || typeof m !== "object") return;
