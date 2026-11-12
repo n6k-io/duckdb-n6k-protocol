@@ -16,19 +16,6 @@ import {
   runPump,
 } from "./virtual-socket/pump";
 import { logger as log, isDebugEnabled } from "./logger";
-
-let liveWorkers = 0;
-const trackedWorkers = new WeakSet<Worker>();
-function trackWorker(w: Worker, label: string): void {
-  trackedWorkers.add(w);
-  liveWorkers++;
-  log.debug(`worker+ ${label} (live workers: ${liveWorkers})`);
-}
-function untrackWorker(w: Worker, label: string): void {
-  if (!trackedWorkers.delete(w)) return;
-  liveWorkers--;
-  log.debug(`worker- ${label} (live workers: ${liveWorkers})`);
-}
 import { CAP_JSONRPC } from "./protocol-generated";
 import {
   createJsonRpcClient,
@@ -38,9 +25,7 @@ import {
 import type { WsStatus } from "./types";
 import { N6K_VERSION } from "./version";
 
-export type CreateN6kWorkerOpts = {
-  // duckdb-wasm's own worker; LOAD n6k_client installs the glue in it.
-  mainWorkerUrl: string;
+export type N6kControlOptions = {
   onStatus?: (catalog: string, status: WsStatus) => void;
   // The server added or removed catalogs on a registered wsId; `catalogs` is the full new list.
   onCatalogsChanged?: (wsId: string, catalogs: string[]) => void;
@@ -69,11 +54,7 @@ export type RegisteredWebsocket = {
   close: () => void;
 };
 
-export type N6kWorkerHandle = {
-  worker: Worker;
-  // Call once LOAD n6k_client has run: hands the extension's glue its control port. Rejects if the glue is
-  // missing (an extension build without it) or speaks another protocol version.
-  attach: () => Promise<void>;
+export type N6kControl = {
   // Close the socket under an attached catalog, and so under every catalog on it, failing their in-flight
   // requests. It redials on the next request from any of them. Throws for an app-registered socket, which only
   // replaceWebsocket can swap. Logs and does nothing for an unknown catalog; status via onStatus.
@@ -95,7 +76,7 @@ export type N6kWorkerHandle = {
   ) => Promise<void>;
   // Catalog names the server serves on a registered wsId (OP_CATALOG_LIST; no ATTACH needed).
   listCatalogs: (wsId: string) => Promise<string[]>;
-  // Stop the pumps and close the control channel. Does NOT touch the duckdb `worker` (owned by
+  // Stop the pumps and close the control channel. Does NOT touch the duckdb worker (owned by
   // AsyncDuckDB.terminate()).
   dispose: () => void;
 };
@@ -111,13 +92,18 @@ type Pump = {
   intentional: boolean;
 };
 
-export function createN6kWorker({
-  mainWorkerUrl,
-  onStatus,
-  onCatalogsChanged,
-  onInvalidated,
-  instanceId = 0,
-}: CreateN6kWorkerOpts): N6kWorkerHandle {
+// `worker` is the one passed to `new AsyncDuckDB(logger, worker)`; LOAD n6k_client must have run in it.
+// Rejects if the extension's glue does not answer n6k-init (not loaded, or an extension predating it) or
+// speaks another protocol version.
+export async function openN6kControl(
+  worker: Worker,
+  {
+    onStatus,
+    onCatalogsChanged,
+    onInvalidated,
+    instanceId = 0,
+  }: N6kControlOptions = {},
+): Promise<N6kControl> {
   if (typeof SharedArrayBuffer === "undefined") {
     throw new TypeError(
       "n6k requires cross-origin isolation (SharedArrayBuffer is not available). " +
@@ -189,22 +175,9 @@ export function createN6kWorker({
   // Private channel for n6k control frames; keeps them off duckdb-wasm's RPC postMessage binding.
   const n6kChannel = new MessageChannel();
 
-  const worker = new Worker(mainWorkerUrl, { type: "classic" });
-  trackWorker(worker, `#${instanceId} duckdb-worker`);
-  worker.addEventListener("error", function (e) {
-    log.error("duckdb-worker error:", e.message || e);
-    log.error(
-      "duckdb-worker error detail — filename:",
-      e.filename,
-      "lineno:",
-      e.lineno,
-    );
-  });
-
   const ATTACH_TIMEOUT_MS = 10_000;
-  let attached: Promise<void> | undefined;
   function attach(): Promise<void> {
-    attached ??= new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         initWaiter = null;
         reject(
@@ -231,7 +204,6 @@ export function createN6kWorker({
         [n6kChannel.port2],
       );
     });
-    return attached;
   }
   let initWaiter: ((error?: Error) => void) | null = null;
 
@@ -834,12 +806,15 @@ export function createN6kWorker({
     } catch {
       /* ignore */
     }
-    untrackWorker(worker, `#${instanceId} duckdb-worker`);
   }
 
+  try {
+    await attach();
+  } catch (error) {
+    dispose();
+    throw error;
+  }
   return {
-    worker,
-    attach,
     reconnect,
     registerWebsocket,
     replaceWebsocket,

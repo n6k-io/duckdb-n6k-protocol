@@ -1,7 +1,4 @@
-import {
-  HelloRefusedError,
-  type RegisteredWebsocket,
-} from "../create-n6k-worker";
+import { HelloRefusedError, type RegisteredWebsocket } from "../n6k-control";
 import { logger as log } from "../logger";
 
 export type SocketToken = string | (() => string | Promise<string>);

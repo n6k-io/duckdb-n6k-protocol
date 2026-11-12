@@ -1,5 +1,5 @@
 import { createDuckDB } from "../../create-duckdb";
-import type { RegisteredWebsocket } from "../../create-n6k-worker";
+import type { RegisteredWebsocket } from "../../n6k-control";
 import { createWasmConnect, queryViaSend } from "../../wasm-lease";
 import { parseSqlTables } from "../../metadata/parse-sql-tables";
 import { withLease, type ConnectionLike } from "../../connection-shape";

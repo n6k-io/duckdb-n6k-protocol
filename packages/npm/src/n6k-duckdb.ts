@@ -23,7 +23,7 @@ import {
   type CreateDuckDBOptions,
   type DuckDBInstance,
 } from "./create-duckdb";
-import type { RegisteredWebsocket } from "./create-n6k-worker";
+import type { RegisteredWebsocket } from "./n6k-control";
 import { logger as log, stopwatch } from "./logger";
 import type { WsStatus } from "./types";
 import { createWasmConnect, type WasmDatabase } from "./wasm-lease";

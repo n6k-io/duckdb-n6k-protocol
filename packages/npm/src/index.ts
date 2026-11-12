@@ -1,8 +1,10 @@
 export {
-  createN6kWorker,
+  openN6kControl,
   HelloRefusedError,
+  type N6kControl,
+  type N6kControlOptions,
   type RegisteredWebsocket,
-} from "./create-n6k-worker";
+} from "./n6k-control";
 export {
   JsonRpcError,
   type JsonRpcCallOptions,
