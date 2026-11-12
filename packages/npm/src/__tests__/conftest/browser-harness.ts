@@ -1,7 +1,7 @@
 import path from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { CHROMIUM_PATH } from "./browser-gate";
-import { N6K_URL } from "../_server-gate";
+import { N6K_URL, WS_URL } from "../_server-gate";
 import type { ConnectionLike } from "../../connection-shape";
 import type { WsStatus } from "../../types";
 import { N6K_WORKER_ENTRIES, n6kWorkerUrl } from "../../workers/manifest";
@@ -57,6 +57,8 @@ export type BrowserSetupOptions = {
   maxThreads?: number;
   // Page script to bundle instead of in-page-entry.ts; it must set __n6kReady (or __n6kError).
   entry?: string;
+  // Serve every response under a strict CSP: workers same-origin only, sockets only to the test server.
+  strictCsp?: boolean;
 };
 
 type WireResult = {
@@ -135,33 +137,39 @@ export async function setupBrowserDuckdb(
     ),
   };
 
+  const headers: Record<string, string> = { ...COI_HEADERS };
+  if (opts.strictCsp) {
+    headers["Content-Security-Policy"] =
+      "default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; " +
+      `worker-src 'self'; connect-src 'self' ${new URL(WS_URL).origin}`;
+  }
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
       const { pathname } = new URL(req.url);
       if (pathname === "/") {
         return new Response(PAGE_HTML, {
-          headers: { "content-type": "text/html", ...COI_HEADERS },
+          headers: { "content-type": "text/html", ...headers },
         });
       }
       const inline = inlineAssets[pathname];
       if (inline !== undefined) {
         return new Response(inline, {
-          headers: { "content-type": "text/javascript", ...COI_HEADERS },
+          headers: { "content-type": "text/javascript", ...headers },
         });
       }
       if (pathname.startsWith("/duckdb/")) {
         const f = Bun.file(path.join(DIST, pathname.slice("/duckdb/".length)));
         if (await f.exists())
-          return new Response(f, { headers: { ...COI_HEADERS } });
+          return new Response(f, { headers: { ...headers } });
       }
       const extFile = Bun.file(path.join(WASM_DIR, pathname));
       if (await extFile.exists()) {
-        return new Response(extFile, { headers: { ...COI_HEADERS } });
+        return new Response(extFile, { headers: { ...headers } });
       }
       return new Response("not found", {
         status: 404,
-        headers: { ...COI_HEADERS },
+        headers: { ...headers },
       });
     },
   });

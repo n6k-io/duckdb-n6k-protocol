@@ -30,10 +30,12 @@ import {
   type JsonRpcEndpoint,
 } from "./jsonrpc";
 import type { WsStatus } from "./types";
+import { N6K_VERSION } from "./version";
 
 export type CreateN6kWorkerOpts = {
+  // duckdb-wasm's own worker; LOAD n6k_client installs the glue in it.
   mainWorkerUrl: string;
-  duckdbWorkerUrl: string | URL;
+  // The pump for app-registered sockets; dialed sockets are pumped inside the extension.
   wsWorkerUrl: string | URL;
   onStatus?: (catalog: string, status: WsStatus) => void;
   // The server added or removed catalogs on a registered wsId; `catalogs` is the full new list.
@@ -65,6 +67,9 @@ export type RegisteredWebsocket = {
 
 export type N6kWorkerHandle = {
   worker: Worker;
+  // Call once LOAD n6k_client has run: hands the extension's glue its control port. Rejects if the glue is
+  // missing (an extension build without it) or speaks another protocol version.
+  attach: () => Promise<void>;
   // Close the socket under an attached catalog, and so under every catalog on it, failing their in-flight
   // requests. It redials on the next request from any of them. Throws for an app-registered socket, which only
   // replaceWebsocket can swap. Logs and does nothing for an unknown catalog; status via onStatus.
@@ -98,7 +103,6 @@ const unref = (handle: unknown) => (handle as { unref?: () => void }).unref?.();
 
 export function createN6kWorker({
   mainWorkerUrl,
-  duckdbWorkerUrl,
   wsWorkerUrl,
   onStatus,
   onCatalogsChanged,
@@ -169,11 +173,13 @@ export function createN6kWorker({
   // Closed while C++ still held a connection over the socket; torn down once it lets go.
   const closing = new Set<string>();
 
-  // One pump per connection transport (one C++ dial), by the transport's key.
+  // One per connection transport (one C++ dial), by the transport's key. `pump`: the page's pump for an
+  // adopted socket; a dialed socket's pump runs inside the extension.
   type Channel = {
     connectionId: string;
-    pump: Worker;
-    ringOffset: number;
+    pump?: Worker;
+    ringOffset?: number;
+    open: boolean;
   };
   const channels = new Map<string, Channel>();
   // The catalogs riding each connection, as C++ reports them, so status is reported per catalog.
@@ -184,11 +190,7 @@ export function createN6kWorker({
   // Private channel for n6k control frames; keeps them off duckdb-wasm's RPC postMessage binding.
   const n6kChannel = new MessageChannel();
 
-  // Emscripten spawns pthreads from this worker's own URL; the hash tells them which duckdb bundle to run
-  // (loaded in duckdb-worker.ts).
-  const workerUrl = new URL(duckdbWorkerUrl, globalThis.location?.href);
-  workerUrl.hash = encodeURIComponent(mainWorkerUrl);
-  const worker = new Worker(workerUrl, { type: "classic" });
+  const worker = new Worker(mainWorkerUrl, { type: "classic" });
   trackWorker(worker, `#${instanceId} duckdb-worker`);
   worker.addEventListener("error", function (e) {
     log.error("duckdb-worker error:", e.message || e);
@@ -199,16 +201,40 @@ export function createN6kWorker({
       e.lineno,
     );
   });
-  worker.postMessage(
-    {
-      type: "n6k-init",
-      mainWorkerUrl,
-      n6kPort: n6kChannel.port2,
-      debug,
-      instanceId,
-    },
-    [n6kChannel.port2],
-  );
+
+  const ATTACH_TIMEOUT_MS = 10_000;
+  let attached: Promise<void> | undefined;
+  function attach(): Promise<void> {
+    attached ??= new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        initWaiter = null;
+        reject(
+          new Error(
+            "n6k: the n6k_client extension did not answer n6k-init; it predates the embedded glue",
+          ),
+        );
+      }, ATTACH_TIMEOUT_MS);
+      initWaiter = (error) => {
+        clearTimeout(timer);
+        initWaiter = null;
+        if (error) reject(error);
+        else resolve();
+      };
+      worker.postMessage(
+        {
+          type: "n6k-init",
+          n6kPort: n6kChannel.port2,
+          protocolVersion: N6K_PROTOCOL_VERSION,
+          npmVersion: N6K_VERSION,
+          debug,
+          instanceId,
+        },
+        [n6kChannel.port2],
+      );
+    });
+    return attached;
+  }
+  let initWaiter: ((error?: Error) => void) | null = null;
 
   // ws-workers torn down on purpose; their "closed" message must not report as "disconnected".
   const intentionalClose = new WeakSet<Worker>();
@@ -679,13 +705,11 @@ export function createN6kWorker({
       );
     }
     setConnectionStatus(connectionId, "reconnecting");
-    for (const ch of channels.values()) {
+    for (const [key, ch] of channels) {
       if (ch.connectionId !== connectionId) continue;
-      try {
-        ch.pump.postMessage({ type: "close" });
-      } catch {
-        /* ignore */
-      }
+      // The glue closes the rings; C++ sees the drop and redials on the next request.
+      ch.open = false;
+      worker.postMessage({ type: "n6k-reconnect", key });
     }
   }
 
@@ -695,17 +719,32 @@ export function createN6kWorker({
     if (!e.data) return;
 
     switch (e.data.type) {
+      case "n6k-init-ack": {
+        initWaiter?.();
+        break;
+      }
+      case "n6k-init-error": {
+        initWaiter?.(new Error(e.data.message as string));
+        break;
+      }
       case "n6k-vsock-dial": {
-        const key: string = e.data.key;
-        const connectionId: string = e.data.connectionId;
-        const carrier = readCarrier(e.data);
-        const w = spawnPump(key, connectionId, carrier);
-        channels.set(key, {
-          connectionId,
-          pump: w,
-          ringOffset: carrier.ringOffset,
+        channels.set(e.data.key as string, {
+          connectionId: e.data.connectionId as string,
+          open: false,
         });
-        w.postMessage({ type: "open-pump", url: e.data.wsUrl });
+        break;
+      }
+      case "n6k-conn-status": {
+        const ch = channels.get(e.data.key as string);
+        if (!ch) break;
+        if (e.data.open) {
+          ch.open = true;
+          setConnectionStatus(ch.connectionId, "connected");
+        } else if (ch.open) {
+          ch.open = false;
+          log.error(`dialed socket disconnected: ${e.data.key}`);
+          setConnectionStatus(ch.connectionId, "disconnected");
+        }
         break;
       }
       case "n6k-vsock-adopt": {
@@ -718,6 +757,7 @@ export function createN6kWorker({
           connectionId,
           pump: w,
           ringOffset: carrier.ringOffset,
+          open: false,
         });
         const state = externalSockets.get(connectionId);
         if (!state) {
@@ -746,6 +786,8 @@ export function createN6kWorker({
         const ch = channels.get(key);
         if (!ch) break;
         channels.delete(key);
+        // A dialed ring was already freed by the extension's pump.
+        if (!ch.pump || ch.ringOffset === undefined) break;
         // Set BEFORE closing the pump so its release ack isn't missed.
         pendingRingFree.set(ch.pump, { key, ringOffset: ch.ringOffset });
         retirePump(ch.pump, `#${instanceId} ws-worker ${key}`);
@@ -794,7 +836,7 @@ export function createN6kWorker({
 
   function dispose(): void {
     for (const [key, ch] of channels) {
-      retirePump(ch.pump, `#${instanceId} ws-worker ${key}`);
+      if (ch.pump) retirePump(ch.pump, `#${instanceId} ws-worker ${key}`);
     }
     channels.clear();
     for (const [id, client] of rpcClients) closeRegistration(id, client);
@@ -815,6 +857,7 @@ export function createN6kWorker({
 
   return {
     worker,
+    attach,
     reconnect,
     registerWebsocket,
     replaceWebsocket,

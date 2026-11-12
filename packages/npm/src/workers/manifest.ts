@@ -2,7 +2,7 @@ import manifest from "./manifest.json" with { type: "json" };
 
 // Single source of truth for the n6k worker set; everyone else derives from this file.
 
-export type N6kWorkerExport = "duckdbWorkerUrl" | "wsWorkerUrl";
+export type N6kWorkerExport = "wsWorkerUrl";
 
 export interface N6kWorkerEntry {
   readonly exportName: N6kWorkerExport;

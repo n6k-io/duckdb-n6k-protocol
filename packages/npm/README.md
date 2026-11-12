@@ -2,7 +2,9 @@
 
 DuckDB-wasm driver for the n6k extension.
 
-Wraps `@duckdb/duckdb-wasm` so the n6k extension can talk to an n6k server over a WebSocket from inside WASM: a ws-worker owns the socket and moves frames to and from the extension through shared-memory rings.
+Wraps `@duckdb/duckdb-wasm` so the n6k extension can talk to an n6k server over a WebSocket from inside WASM. The extension carries its own JS glue: `LOAD n6k_client` installs it in duckdb-wasm's stock worker, and a pump thread inside the extension owns each dialed socket, moving frames to and from C++ through shared-memory rings.
+
+Without this package, a plain `AsyncDuckDB` on the threaded bundle can `LOAD n6k_client` and `ATTACH 'n6k://…' (TYPE n6k)` directly. The package adds app-registered sockets (`registerWebsocket`), per-catalog status and invalidation events.
 
 ## Install
 
@@ -26,17 +28,16 @@ npm install @n6k.io/db @duckdb/duckdb-wasm
 ```js
 import { createDuckDB } from '@n6k.io/db'
 
-// Selects the threaded (coi) bundle, wires the n6k workers, opens the database and
-// sets custom_extension_repository (defaults to the page origin).
+// Selects the threaded (coi) bundle, opens the database, sets custom_extension_repository
+// (defaults to the page origin) and runs LOAD n6k_client.
 const { conn } = await createDuckDB()
 
-await conn.query('LOAD n6k_client;')
 await conn.query("ATTACH 'n6k://example.com' AS remote (TYPE n6k);")
 const result = await conn.query('SELECT * FROM remote.main.demo;')
 const rows = result.toArray().map(r => r.toJSON())
 ```
 
-`createDuckDB()` spawns the duckdb worker plus one byte-pump ws-worker per attached catalog; the extension's C++ WebSocket client drives the protocol over shared-memory rings.
+`createDuckDB()` spawns duckdb-wasm's own worker. Dialed sockets are pumped inside the extension; each socket registered with `registerWebsocket` gets a byte-pump ws-worker. The extension's C++ client drives the protocol over shared-memory rings.
 
 ### Serving WASM Extensions
 
@@ -98,7 +99,7 @@ Returns a `DuckDBInstance`. Requires a cross-origin-isolated page; throws if the
 
 - **`bundle`** — a duckdb-wasm bundle to use instead of the jsDelivr coi bundle.
 - **`maximumThreads`** — see `CreateDuckDBOptions.maximumThreads`.
-- **`duckdbWorkerUrl` / `wsWorkerUrl`** — override the worker script URLs.
+- **`wsWorkerUrl`** — override the ws-worker script URL (used only for `registerWebsocket` sockets).
 - **`extensionRepository`** — `custom_extension_repository` (default: the page origin).
 - **`onStatus(catalog, status)`** — status of the socket under each catalog (`WsStatus`). Catalogs on one socket report together.
 
@@ -288,8 +289,8 @@ export async function handle(_req: Request) {
 
 The driver is quiet by default. Info/debug logs are gated behind a runtime
 flag; warnings and errors always print. All output is prefixed `[n6k]` on the
-main thread, `[n6k:duckdb-worker] #<instance id>` from the duckdb worker and
-`[n6k:ws-worker]` from ws-workers.
+main thread, `[n6k:main-glue] #<instance id>` from the extension's glue in the duckdb worker,
+`[n6k:pump]` from its pump thread and `[n6k:ws-worker]` from ws-workers.
 
 Enable:
 

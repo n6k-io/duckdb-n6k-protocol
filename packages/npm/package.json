@@ -11,7 +11,6 @@
     "./native/*": "./src/native/*.ts",
     "./native-wasm-adapter/*": "./src/native-wasm-adapter/*.ts",
     "./workers": "./src/workers/manifest.ts",
-    "./workers/duckdb-worker": "./src/workers/duckdb-worker.ts",
     "./copy-wasm-extensions": "./src/copy-wasm-extensions.ts"
   },
   "bin": {

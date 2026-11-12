@@ -39,7 +39,7 @@ const nativeLog = console.log.bind(console);
 const nativeWarn = console.warn.bind(console);
 const nativeError = console.error.bind(console);
 
-// Set only by duckdb-worker, which hosts one duckdb instance; lines from other threads are untagged.
+// Set only by the main glue, which serves one duckdb instance; lines from other threads are untagged.
 let instanceTag = "";
 export function setLogInstance(id: number): void {
   instanceTag = ` #${id}`;

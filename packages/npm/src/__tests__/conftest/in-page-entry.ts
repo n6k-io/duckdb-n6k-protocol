@@ -157,8 +157,7 @@ async function boot(): Promise<void> {
       catalogsChanged.push({ wsId, catalogs }),
     onInvalidated: (catalog, schemas) => invalidated.push({ catalog, schemas }),
   });
-  await conn.query("LOAD n6k_client;");
-  // Raise the scheduler pool AFTER LOAD — opening multi-threaded deadlocks dlopen.
+  // Raise the scheduler pool only after createDuckDB's LOAD — opening multi-threaded deadlocks dlopen.
   const maxThreads = globalThis.__n6kMaxThreads ?? 1;
   if (maxThreads > 1) await conn.query(`SET threads=${maxThreads};`);
   const serverUrl = globalThis.__n6kServerUrl ?? "n6k://localhost:8099";

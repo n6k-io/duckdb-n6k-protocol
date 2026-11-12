@@ -128,10 +128,6 @@ export class N6kDuckDB {
         onStatus: (catalog, status) => this.onConnStatus(catalog, status),
         onInvalidated: (catalog) => this.bumpInvalidation(catalog),
       });
-      this.update({ status: "loading-extensions" });
-      const sinceLoad = stopwatch();
-      await instance.conn.query("LOAD n6k_client;");
-      log.debug(`#${instance.id} n6k extension loaded (${sinceLoad()})`);
       await this.openSockets(instance);
       this.update({ status: "attaching" });
       for (const [alias, config] of Object.entries(this.configs)) {

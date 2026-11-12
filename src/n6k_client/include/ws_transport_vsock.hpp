@@ -14,8 +14,8 @@ namespace duckdb {
 namespace n6k {
 
 // A connection's bytes over two vsock rings in the shared wasm heap, moved to and from the WebSocket by a JS
-// pump worker. One pair per Start: a redial gets fresh rings and a fresh pump. Shutdown is the default no-op: the
-// pump's socket stays open until Stop().
+// pump: the pump thread for a dialed URL, the page's pump worker for a registered socket. One pair per Start: a redial
+// gets fresh rings and a fresh pump. Shutdown is the default no-op: the pump's socket stays open until Stop().
 class VsockTransport : public Transport {
 public:
 	// `connection_id`: the ConnectionHub it carries, so JS can tell which catalogs ride it.
@@ -29,6 +29,9 @@ public:
 	void Stop() override;
 
 private:
+	void StartDial(void *ring, const std::string &args, const std::string &pointers);
+	[[noreturn]] void FailStart(void *ring, int32_t *status, const std::string &reason);
+
 	std::string key_;
 	std::string connection_id_;
 	std::string ws_url_;

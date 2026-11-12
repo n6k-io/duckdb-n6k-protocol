@@ -13,7 +13,6 @@ export type CreateDuckDBOptions = {
   // can deadlock on LOAD/dlopen when scheduler pthreads are parked, so `SET threads` above 1
   // only after extensions are loaded.
   maximumThreads?: number;
-  duckdbWorkerUrl?: string;
   wsWorkerUrl?: string;
   extensionRepository?: string;
   onStatus?: (catalog: string, status: WsStatus) => void;
@@ -96,6 +95,7 @@ export async function createDuckDB(
 
   const {
     worker,
+    attach,
     reconnect,
     registerWebsocket,
     replaceWebsocket,
@@ -104,8 +104,6 @@ export async function createDuckDB(
   } = createN6kWorker({
     instanceId: id,
     mainWorkerUrl: bundle.mainWorker!,
-    duckdbWorkerUrl:
-      opts.duckdbWorkerUrl ?? N6K_DEFAULT_WORKER_URLS.duckdbWorkerUrl,
     wsWorkerUrl: opts.wsWorkerUrl ?? N6K_DEFAULT_WORKER_URLS.wsWorkerUrl,
     onStatus: opts.onStatus,
     onCatalogsChanged: opts.onCatalogsChanged,
@@ -167,6 +165,8 @@ export async function createDuckDB(
       opts.extensionRepository ?? globalThis.location.origin;
     log.debug("setting extension repository:", extensionRepo);
     await conn.query(`SET custom_extension_repository = '${extensionRepo}';`);
+    await conn.query("LOAD n6k_client;");
+    await attach();
 
     return {
       id,
