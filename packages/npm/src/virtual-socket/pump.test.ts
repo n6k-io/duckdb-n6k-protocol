@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import {
   duckdbEndpoint,
-  wsWorkerEndpoint,
+  pumpEndpoint,
   channelBytes,
   type ChannelLayout,
   type Endpoint,
@@ -23,7 +23,7 @@ function freshChannel() {
   const sab = new SharedArrayBuffer(channelBytes(LAYOUT));
   return {
     duck: duckdbEndpoint(sab, LAYOUT),
-    ws: wsWorkerEndpoint(sab, LAYOUT),
+    ws: pumpEndpoint(sab, LAYOUT),
   };
 }
 

@@ -4,9 +4,7 @@ import { CHROMIUM_PATH } from "./browser-gate";
 import { N6K_URL, WS_URL } from "../_server-gate";
 import type { ConnectionLike } from "../../connection-shape";
 import type { WsStatus } from "../../types";
-import { N6K_WORKER_ENTRIES, n6kWorkerUrl } from "../../workers/manifest";
 
-const SRC = path.resolve(import.meta.dir, "../..");
 const DIST = path.resolve(
   import.meta.dir,
   "../../../node_modules/@duckdb/duckdb-wasm/dist",
@@ -87,14 +85,11 @@ function decodeValue(v: unknown): unknown {
   return out;
 }
 
-async function bundleScript(
-  entry: string,
-  format: "iife" | "esm",
-): Promise<string> {
+async function bundleScript(entry: string): Promise<string> {
   const out = await Bun.build({
     entrypoints: [entry],
     target: "browser",
-    format,
+    format: "esm",
   });
   if (!out.success) {
     throw new Error(
@@ -114,27 +109,12 @@ export async function setupBrowserDuckdb(
     throw new Error("browser harness: no Chromium found (install playwright)");
   }
 
-  const pkgRoot = path.resolve(SRC, "..");
-  const [appJs, workerBundles] = await Promise.all([
-    bundleScript(
-      opts.entry ?? path.join(import.meta.dir, "in-page-entry.ts"),
-      "esm",
-    ),
-    Promise.all(
-      N6K_WORKER_ENTRIES.map((e) =>
-        bundleScript(path.join(pkgRoot, e.src), "iife"),
-      ),
-    ),
-  ]);
+  const appJs = await bundleScript(
+    opts.entry ?? path.join(import.meta.dir, "in-page-entry.ts"),
+  );
 
   const inlineAssets: Record<string, string> = {
     "/_n6k/app.js": appJs,
-    ...Object.fromEntries(
-      N6K_WORKER_ENTRIES.map((e, i) => [
-        n6kWorkerUrl(e.file),
-        workerBundles[i],
-      ]),
-    ),
   };
 
   const headers: Record<string, string> = { ...COI_HEADERS };

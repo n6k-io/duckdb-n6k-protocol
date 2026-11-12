@@ -10,7 +10,6 @@
     "./node": "./src/node.ts",
     "./native/*": "./src/native/*.ts",
     "./native-wasm-adapter/*": "./src/native-wasm-adapter/*.ts",
-    "./workers": "./src/workers/manifest.ts",
     "./copy-wasm-extensions": "./src/copy-wasm-extensions.ts"
   },
   "bin": {

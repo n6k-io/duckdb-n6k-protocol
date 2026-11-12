@@ -37,11 +37,7 @@ export type N6kDuckDBOptions = Omit<
   databases?: Record<string, DatabaseSpec>;
 };
 
-export type N6kDuckDBStatus =
-  | "initializing"
-  | "attaching"
-  | "ready"
-  | "error";
+export type N6kDuckDBStatus = "initializing" | "attaching" | "ready" | "error";
 
 export type N6kDuckDBSnapshot = {
   status: N6kDuckDBStatus;

@@ -106,8 +106,8 @@ export function duckdbEndpoint(
   return makeEndpoint(duckdbToWs, wsToDuckdb);
 }
 
-// The ws-worker's endpoint (mirror image).
-export function wsWorkerEndpoint(
+// The pump's endpoint (mirror image).
+export function pumpEndpoint(
   buf: ArrayBufferLike,
   layout: ChannelLayout = DEFAULT_CHANNEL_LAYOUT,
   baseOffset = 0,

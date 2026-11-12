@@ -1,4 +1,4 @@
-// The ws-worker byte pump: moves raw frames both ways between the WebSocket and the vsock channel; no parsing.
+// The byte pump for an app-registered socket: moves raw frames both ways between the WebSocket and the vsock channel; no parsing.
 // CRITICAL: never block the loop — a full RX ring deadlocks the duckdb peer; inbound overflows to a buffer, not Atomics.wait.
 
 import type { Endpoint } from "./channel";

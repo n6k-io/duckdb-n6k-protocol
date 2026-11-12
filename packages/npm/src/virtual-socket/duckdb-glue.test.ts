@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { wsWorkerEndpoint, channelBytes, type ChannelLayout } from "./channel";
+import { pumpEndpoint, channelBytes, type ChannelLayout } from "./channel";
 import { createVsockRegistry } from "./duckdb-glue";
 
 const LAYOUT: ChannelLayout = {
@@ -13,7 +13,7 @@ function heapSetup() {
   const mem = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
   const reg = createVsockRegistry();
   reg.register("cat", mem.buffer, LAYOUT, OFFSET);
-  const ws = wsWorkerEndpoint(mem.buffer, LAYOUT, OFFSET);
+  const ws = pumpEndpoint(mem.buffer, LAYOUT, OFFSET);
   return { reg, ws };
 }
 
