@@ -31,6 +31,8 @@ export type {
   TableRef,
   TableRefType,
 } from "./metadata/parse-sql-tables";
+export { splitStatements } from "./metadata/split-statements";
+export type { SplitStatement } from "./metadata/split-statements";
 export { describeN6kTable } from "./metadata/table-describe";
 export type {
   ColumnMeta,

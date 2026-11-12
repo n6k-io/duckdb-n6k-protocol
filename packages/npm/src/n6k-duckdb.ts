@@ -8,6 +8,10 @@ import {
 import type { ConnectionLike } from "./connection-shape";
 import { parseSqlTables, type TableRef } from "./metadata/parse-sql-tables";
 import {
+  splitStatements,
+  type SplitStatement,
+} from "./metadata/split-statements";
+import {
   describeN6kTable,
   type TableIdent,
   type TableMeta,
@@ -55,6 +59,10 @@ export type N6kDuckDBSnapshot = {
 export type N6kMetadataFns = {
   tablesOf(conn: ConnectionLike, sql: string): Promise<TableRef[]>;
   tableMeta(conn: ConnectionLike, ref: TableIdent): Promise<TableMeta>;
+  splitStatements(
+    conn: Pick<ConnectionLike, "query">,
+    sql: string,
+  ): Promise<SplitStatement[]>;
   catalogs: CatalogStore;
 };
 
@@ -94,6 +102,7 @@ export class N6kDuckDB {
     this.metadataFns = {
       tablesOf: parseSqlTables,
       tableMeta: describeN6kTable,
+      splitStatements,
       catalogs: createCatalogStore(
         (fn) => this.subscribe(fn),
         Object.keys(this.configs),

@@ -88,3 +88,7 @@ protocol-check:
 	fi
 	@echo "protocol mirrors are up to date"
 
+
+.PHONY: tags
+tags:
+	@scripts/tag_release.sh
