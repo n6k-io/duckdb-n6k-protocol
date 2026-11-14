@@ -232,3 +232,28 @@ TEST_CASE("a long stream is paced by credits and a full drain sends no cancel", 
 
 	REQUIRE(twin.ServeError().empty());
 }
+
+TEST_CASE("a stream released before its RESP_END arrives sends no cancel", "[twin][ops]") {
+	N6kTwin twin;
+	twin.Attach();
+
+	twin.HoldRespEnd();
+	REQUIRE(twin.Rows("SELECT n FROM db.n6k_testing_stream_counter(40000)").size() == 40000);
+	twin.ReleaseRespEnd();
+	// A later round trip on the same socket: once it answers, every frame sent before it was recorded.
+	REQUIRE(twin.Rows("SELECT * FROM n6k_catalog_query('db', 'SELECT 1')") == RowList {"1"});
+	REQUIRE(twin.SentCount(n6k::FrameType::CANCEL) == 0);
+
+	REQUIRE(twin.FarRows("SELECT cancels FROM n6k_serve_stats()") == RowList {"0"});
+	REQUIRE(twin.ServeError().empty());
+}
+
+TEST_CASE("a stream released before its end-of-stream marker sends a cancel", "[twin][ops]") {
+	N6kTwin twin;
+	twin.Attach();
+
+	REQUIRE(twin.Rows("SELECT n FROM db.n6k_testing_stream_counter(1000000) LIMIT 1").size() == 1);
+	REQUIRE(twin.Rows("SELECT * FROM n6k_catalog_query('db', 'SELECT 1')") == RowList {"1"});
+	REQUIRE(twin.SentCount(n6k::FrameType::CANCEL) == 1);
+	REQUIRE(twin.ServeError().empty());
+}
