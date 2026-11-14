@@ -46,7 +46,7 @@ remote_tag_sha() {
 
 new_tags=()
 
-# A tag elsewhere is fatal for duckdb (CI forces a VERSION bump per PR) but expected for python/npm.
+# A tag on another commit is fatal for duckdb but expected for python/npm.
 plan() {
 	local tag="$1" on_other_commit="$2"
 	local local_sha remote_sha
