@@ -1,7 +1,7 @@
 import { pumpEndpoint, type Endpoint } from "./channel";
 
-// The pump side of a channel in duckdb's heap. Every successful inbound publish and every close rings the n6k
-// I/O thread's doorbell, so it wakes to drain or to notice the drop instead of waiting out its bounded park.
+// The pump side of a channel in duckdb's heap. Every successful inbound publish and every close rings
+// N6kIoThread's doorbell, so it wakes to drain or to notice the drop.
 export function doorbellPumpEndpoint(
   heap: ArrayBufferLike,
   ringOffset: number,

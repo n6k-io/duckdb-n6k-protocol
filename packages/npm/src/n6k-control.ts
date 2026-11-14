@@ -114,7 +114,7 @@ export async function openN6kControl(
 
   const notifyStatus = onStatus || function () {};
 
-  // Snapshot page debug state and forward into every spawned worker (workers can't read localStorage).
+  // Snapshot page debug state and forward it to the main glue (the duckdb worker can't read localStorage).
   const debug = isDebugEnabled();
 
   // Ring region of an adopted transport: duckdb's shared WebAssembly.Memory + the C++ malloc offsets.
@@ -286,8 +286,8 @@ export async function openN6kControl(
         stopped = true;
         // Wakes a pump parked on rings C++ already closed, whose own wake was spent before this.
         inbound.kick?.();
-        // After the final drain, so queued frames still reach the socket. Without endpoint.close(), C++ never sees
-        // reconnect()'s drop.
+        // After the final drain, so queued frames still reach the socket. When dispose() retires a live pump, this
+        // close is how C++ sees the drop.
         return done.then(() => {
           endpoint.close();
           opened = false;
@@ -671,7 +671,6 @@ export async function openN6kControl(
     setConnectionStatus(connectionId, "reconnecting");
     for (const [key, ch] of channels) {
       if (ch.connectionId !== connectionId) continue;
-      // The glue closes the rings; C++ sees the drop and redials on the next request.
       ch.open = false;
       worker.postMessage({ type: "n6k-reconnect", key });
     }

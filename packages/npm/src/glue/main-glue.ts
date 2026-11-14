@@ -104,7 +104,7 @@ export function installMainGlue(
     Atomics.notify(doorbell, 0);
   };
 
-  // Reports each newly set bit; frees the word once the pump has released.
+  // Reports each newly set bit; see PUMP_* in ./pump-status.
   const watchStatus = async (key: string, statusPtr: number) => {
     const word = new Int32Array(memory.buffer, statusPtr, 1);
     let seen = 0;
@@ -213,7 +213,7 @@ export function installMainGlue(
             type: "n6k-init-error",
             message:
               `n6k protocol mismatch: extension v${N6K_PROTOCOL_VERSION}, ` +
-              `npm package v${init.protocolVersion}`,
+              `npm package protocol v${init.protocolVersion}`,
           });
           return;
         }

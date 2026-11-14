@@ -124,7 +124,7 @@ await conn.query(`ATTACH '' AS page_db (TYPE n6k, CONNECTION '${wsId}')`);
 ```
 
 `worker` is the one passed to `AsyncDuckDB`. Call it after `LOAD n6k_client`: it rejects if the extension does not
-answer `n6k-init` within 10s, or with `n6k protocol mismatch` if the extension and npm package versions differ.
+answer `n6k-init`, or with `n6k protocol mismatch` if the extension and npm package speak different protocol versions.
 `control.dispose()` does not terminate the worker.
 
 ### `wasmDir: string` (from `@n6k.io/db/node`)
@@ -322,6 +322,8 @@ Enable:
 localStorage.setItem("n6k:debug", "1"); // browser
 globalThis.N6K_DEBUG = true; // any scope (incl. workers, SSR)
 ```
+
+`[n6k:pump]` debug lines cannot be enabled: the pump thread sees neither.
 
 Disable: `localStorage.removeItem("n6k:debug")` and clear the global. Reload
 to pick up the change in already-spawned workers.

@@ -2,6 +2,7 @@
 
 #include "ws_transport_vsock.hpp"
 
+#include "n6k_glue_generated.hpp"
 #include "n6k_pump_thread.hpp"
 #include "n6k_str_utils.hpp"
 #include "n6k_wasm_main_thread.hpp"
@@ -13,9 +14,6 @@
 
 namespace duckdb {
 namespace n6k {
-
-// Mirrors PUMP_RELEASED in packages/npm/src/glue/pump-status.ts.
-static constexpr int32_t N6K_PUMP_RELEASED = 4;
 
 // MUST equal channelBytes(DEFAULT_CHANNEL_LAYOUT) in packages/npm/src/virtual-socket/channel.ts: both sides
 // build views over these exact bytes.
@@ -80,7 +78,7 @@ void VsockTransport::Start(MessageFn on_message, CloseFn on_close, OpenFn on_ope
 }
 
 void VsockTransport::StartDial(void *ring, const std::string &args, const std::string &pointers) {
-	// The pump reports socket status through this word; the main glue frees it once the pump has released.
+	// Status word: see PUMP_* in packages/npm/src/glue/pump-status.ts.
 	auto *status = static_cast<int32_t *>(std::calloc(1, sizeof(int32_t)));
 	if (!status) {
 		FailStart(ring, nullptr, "failed to allocate the status word");
@@ -94,7 +92,7 @@ void VsockTransport::StartDial(void *ring, const std::string &args, const std::s
 	                                        EscapeSingleQuotedJsLiteral(ws_url_) + "')");
 	if (result != "OK") {
 		RunScriptOnMain("n6k.vsockClose('" + key_ + "')");
-		// No pump will release it, so release it here: the main glue frees the word on this bit.
+		// No pump will release it, so release it here.
 		__atomic_or_fetch(status, N6K_PUMP_RELEASED, __ATOMIC_RELEASE);
 		__builtin_wasm_memory_atomic_notify(status, static_cast<int32_t>(-1));
 		FailStart(ring, nullptr, result);
@@ -135,7 +133,6 @@ void VsockTransport::Stop() {
 	ring1_.Close();
 	RunScriptOnMain("n6k.vsockClose('" + key_ + "')");
 	if (!ws_url_.empty()) {
-		// The pump drains, closes the socket and frees the ring.
 		const bool queued = N6kPumpThread::Instance().Post("n6kPump.close('" + key_ + "')");
 		D_ASSERT(queued);
 		(void)queued;

@@ -1,5 +1,5 @@
-// Runs on the extension's pump pthread: owns every dialed WebSocket and moves frames between it and its ring.
-// The thread stays in its JS event loop, so sockets keep flowing while duckdb's main worker is busy.
+// Runs on the extension's pump pthread (src/n6k_client/include/n6k_pump_thread.hpp): owns every dialed WebSocket
+// and moves frames between it and its ring.
 
 import { createLogger } from "../logger";
 import type { Endpoint } from "../virtual-socket/channel";
