@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import {
   duckdbEndpoint,
-  wsWorkerEndpoint,
+  pumpEndpoint,
   channelBytes,
   DEFAULT_CHANNEL_LAYOUT,
   type ChannelLayout,
@@ -16,7 +16,7 @@ function freshChannel(layout: ChannelLayout = LAYOUT) {
   const sab = new SharedArrayBuffer(channelBytes(layout));
   return {
     duck: duckdbEndpoint(sab, layout),
-    ws: wsWorkerEndpoint(sab, layout),
+    ws: pumpEndpoint(sab, layout),
   };
 }
 
@@ -101,7 +101,7 @@ describe("virtual-socket channel over shared WebAssembly.Memory at an offset", (
     return {
       mem,
       duck: duckdbEndpoint(mem.buffer, layout, OFFSET),
-      ws: wsWorkerEndpoint(mem.buffer, layout, OFFSET),
+      ws: pumpEndpoint(mem.buffer, layout, OFFSET),
     };
   }
 

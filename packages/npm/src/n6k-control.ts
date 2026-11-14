@@ -9,20 +9,13 @@ import {
   type FrameHeader,
 } from "./ws-framing";
 import { connectionReplyId } from "./virtual-socket/ws-demux";
+import { doorbellPumpEndpoint } from "./virtual-socket/doorbell-endpoint";
+import {
+  acceptInbound,
+  createInboundBuffer,
+  runPump,
+} from "./virtual-socket/pump";
 import { logger as log, isDebugEnabled } from "./logger";
-
-let liveWorkers = 0;
-const trackedWorkers = new WeakSet<Worker>();
-function trackWorker(w: Worker, label: string): void {
-  trackedWorkers.add(w);
-  liveWorkers++;
-  log.debug(`worker+ ${label} (live workers: ${liveWorkers})`);
-}
-function untrackWorker(w: Worker, label: string): void {
-  if (!trackedWorkers.delete(w)) return;
-  liveWorkers--;
-  log.debug(`worker- ${label} (live workers: ${liveWorkers})`);
-}
 import { CAP_JSONRPC } from "./protocol-generated";
 import {
   createJsonRpcClient,
@@ -30,11 +23,9 @@ import {
   type JsonRpcEndpoint,
 } from "./jsonrpc";
 import type { WsStatus } from "./types";
+import { N6K_VERSION } from "./version";
 
-export type CreateN6kWorkerOpts = {
-  mainWorkerUrl: string;
-  duckdbWorkerUrl: string | URL;
-  wsWorkerUrl: string | URL;
+export type N6kControlOptions = {
   onStatus?: (catalog: string, status: WsStatus) => void;
   // The server added or removed catalogs on a registered wsId; `catalogs` is the full new list.
   onCatalogsChanged?: (wsId: string, catalogs: string[]) => void;
@@ -63,8 +54,7 @@ export type RegisteredWebsocket = {
   close: () => void;
 };
 
-export type N6kWorkerHandle = {
-  worker: Worker;
+export type N6kControl = {
   // Close the socket under an attached catalog, and so under every catalog on it, failing their in-flight
   // requests. It redials on the next request from any of them. Throws for an app-registered socket, which only
   // replaceWebsocket can swap. Logs and does nothing for an unknown catalog; status via onStatus.
@@ -86,25 +76,34 @@ export type N6kWorkerHandle = {
   ) => Promise<void>;
   // Catalog names the server serves on a registered wsId (OP_CATALOG_LIST; no ATTACH needed).
   listCatalogs: (wsId: string) => Promise<string[]>;
-  // Terminate the ws-workers and close the control channel. Does NOT touch the
-  // duckdb `worker` (owned by AsyncDuckDB.terminate()); without it those handles pin the host loop.
+  // Stop the pumps and close the control channel. Does NOT touch the duckdb worker (owned by
+  // AsyncDuckDB.terminate()).
   dispose: () => void;
 };
 
-// These helper workers do their work over SAB/Atomics, not the event loop. Under Bun a
-// classic worker that parks on worker_threads' parentPort never releases the parent loop on
-// terminate(), so unref them at spawn; the duckdb worker stays ref'd and db.terminate() frees it.
-const unref = (handle: unknown) => (handle as { unref?: () => void }).unref?.();
+// Byte pump for one adopted transport: moves frames between an app-registered socket and its ring in duckdb's heap.
+type Pump = {
+  open: () => void;
+  wsIn: (frame: ArrayBuffer) => void;
+  wsClosed: (reason: string) => void;
+  // Resolves once nothing touches the ring again; the ring may then be freed.
+  retire: () => Promise<void>;
+  // Torn down on purpose: its close is not reported as "disconnected".
+  intentional: boolean;
+};
 
-export function createN6kWorker({
-  mainWorkerUrl,
-  duckdbWorkerUrl,
-  wsWorkerUrl,
-  onStatus,
-  onCatalogsChanged,
-  onInvalidated,
-  instanceId = 0,
-}: CreateN6kWorkerOpts): N6kWorkerHandle {
+// `worker` is the one passed to `new AsyncDuckDB(logger, worker)`; LOAD n6k_client must have run in it.
+// Rejects if the extension's glue does not answer n6k-init (not loaded, or an extension predating it) or
+// speaks another protocol version.
+export async function openN6kControl(
+  worker: Worker,
+  {
+    onStatus,
+    onCatalogsChanged,
+    onInvalidated,
+    instanceId = 0,
+  }: N6kControlOptions = {},
+): Promise<N6kControl> {
   if (typeof SharedArrayBuffer === "undefined") {
     throw new TypeError(
       "n6k requires cross-origin isolation (SharedArrayBuffer is not available). " +
@@ -115,12 +114,10 @@ export function createN6kWorker({
 
   const notifyStatus = onStatus || function () {};
 
-  // Snapshot page debug state and forward into every spawned worker (workers can't read localStorage).
+  // Snapshot page debug state and forward it to the main glue (the duckdb worker can't read localStorage).
   const debug = isDebugEnabled();
 
-  // Ring-region carrier forwarded to the pump ws-worker: duckdb's shared WebAssembly.Memory +
-  // the C++ malloc offset. The Memory object is structured-cloneable and shares by reference
-  // across postMessage.
+  // Ring region of an adopted transport: duckdb's shared WebAssembly.Memory + the C++ malloc offsets.
   type ChannelCarrier = {
     wasmMemory: WebAssembly.Memory;
     ringOffset: number;
@@ -132,15 +129,6 @@ export function createN6kWorker({
     doorbellOffset: m.doorbellOffset,
   });
 
-  // Pump ws-worker → its ring, pending a free. Set when C++ closes the transport; the free fires only
-  // when that pump acks it has released the ring ("pump-ring-released"), so we never free a region
-  // still in use.
-  const pendingRingFree = new Map<
-    Worker,
-    { key: string; ringOffset: number }
-  >();
-
-  const PUMP_RETIRE_MS = 5000;
   const LIST_TIMEOUT_MS = 10_000;
   type ConnectionRequest = {
     catalogs: string[];
@@ -155,7 +143,7 @@ export function createN6kWorker({
     // HELLO_ACK `capabilities`: negotiated here, read by the wasm hub via n6k.helloCapabilities.
     capabilities: string[];
     // The pump of the connection C++ holds over this socket, while it holds one.
-    pump?: Worker;
+    pump?: Pump;
     // Connection-scoped requests (no ns) issued from here, keyed by id; never reach a pump.
     requests: Map<number, ConnectionRequest>;
     nextReqId: number;
@@ -169,13 +157,16 @@ export function createN6kWorker({
   // Closed while C++ still held a connection over the socket; torn down once it lets go.
   const closing = new Set<string>();
 
-  // One pump per connection transport (one C++ dial), by the transport's key.
+  // One per connection transport (one C++ dial), by the transport's key. `pump`: the page's pump for an
+  // adopted socket; a dialed socket's pump runs inside the extension.
   type Channel = {
     connectionId: string;
-    pump: Worker;
-    ringOffset: number;
+    pump?: Pump;
+    ringOffset?: number;
+    open: boolean;
   };
   const channels = new Map<string, Channel>();
+  let disposed = false;
   // The catalogs riding each connection, as C++ reports them, so status is reported per catalog.
   const catalogsOf = new Map<string, Set<string>>();
   const connectionOf = new Map<string, string>();
@@ -184,34 +175,37 @@ export function createN6kWorker({
   // Private channel for n6k control frames; keeps them off duckdb-wasm's RPC postMessage binding.
   const n6kChannel = new MessageChannel();
 
-  // Emscripten spawns pthreads from this worker's own URL; the hash tells them which duckdb bundle to run
-  // (loaded in duckdb-worker.ts).
-  const workerUrl = new URL(duckdbWorkerUrl, globalThis.location?.href);
-  workerUrl.hash = encodeURIComponent(mainWorkerUrl);
-  const worker = new Worker(workerUrl, { type: "classic" });
-  trackWorker(worker, `#${instanceId} duckdb-worker`);
-  worker.addEventListener("error", function (e) {
-    log.error("duckdb-worker error:", e.message || e);
-    log.error(
-      "duckdb-worker error detail — filename:",
-      e.filename,
-      "lineno:",
-      e.lineno,
-    );
-  });
-  worker.postMessage(
-    {
-      type: "n6k-init",
-      mainWorkerUrl,
-      n6kPort: n6kChannel.port2,
-      debug,
-      instanceId,
-    },
-    [n6kChannel.port2],
-  );
-
-  // ws-workers torn down on purpose; their "closed" message must not report as "disconnected".
-  const intentionalClose = new WeakSet<Worker>();
+  const ATTACH_TIMEOUT_MS = 10_000;
+  function attach(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        initWaiter = null;
+        reject(
+          new Error(
+            "n6k: no answer to n6k-init: LOAD n6k_client has not run, or the extension predates the embedded glue",
+          ),
+        );
+      }, ATTACH_TIMEOUT_MS);
+      initWaiter = (error) => {
+        clearTimeout(timer);
+        initWaiter = null;
+        if (error) reject(error);
+        else resolve();
+      };
+      worker.postMessage(
+        {
+          type: "n6k-init",
+          n6kPort: n6kChannel.port2,
+          protocolVersion: N6K_PROTOCOL_VERSION,
+          npmVersion: N6K_VERSION,
+          debug,
+          instanceId,
+        },
+        [n6kChannel.port2],
+      );
+    });
+  }
+  let initWaiter: ((error?: Error) => void) | null = null;
 
   function setConnectionStatus(connectionId: string, status: WsStatus): void {
     connectionStatus.set(connectionId, status);
@@ -220,77 +214,87 @@ export function createN6kWorker({
     }
   }
 
-  // A ring still pending here is never freed: terminate() is not synchronous, so the pump may still be writing it.
-  function retirePump(w: Worker, label: string): void {
-    intentionalClose.add(w);
-    untrackWorker(w, label);
-    try {
-      w.postMessage({ type: "close" });
-    } catch {
-      /* ignore */
-    }
-    unref(
-      setTimeout(function () {
-        if (pendingRingFree.delete(w)) {
-          log.error(`pump never released its ring: ${label}`);
-        }
-        try {
-          w.terminate();
-        } catch {
-          /* ignore */
-        }
-      }, PUMP_RETIRE_MS),
-    );
-  }
-
-  // Byte-pump ws-worker: moves frames WS↔channel; the protocol is in the C++ ConnectionHub.
-  function spawnPump(
+  // The protocol is in the C++ ConnectionHub; this only moves bytes. Frames queued before open() wait in the TX ring.
+  function createPump(
     key: string,
     connectionId: string,
     carrier: ChannelCarrier,
-  ): Worker {
-    const label = `#${instanceId} ws-worker ${key} connection=${connectionId}`;
-    const w = new Worker(wsWorkerUrl, { type: "classic" });
-    trackWorker(w, label);
-    unref(w);
-    w.addEventListener("error", function (ev) {
-      log.error("ws-worker (pump) error:", ev.message || ev);
-    });
-    w.postMessage({ type: "init-channel", label, debug, ...carrier });
-
+    send: (frame: Uint8Array<ArrayBuffer>) => void,
+  ): Pump {
+    const label = `#${instanceId} pump ${key} connection=${connectionId}`;
+    const endpoint = doorbellPumpEndpoint(
+      carrier.wasmMemory.buffer,
+      carrier.ringOffset,
+      carrier.doorbellOffset,
+    );
+    const inbound = createInboundBuffer();
+    let stopped = false;
+    let opened = false;
     let connected = false;
     let disconnectNotified = false;
-    w.addEventListener("message", function (ev: MessageEvent) {
-      if (!ev.data) return;
-      if (ev.data.type === "pump-ring-released") {
-        const pending = pendingRingFree.get(w);
-        if (pending !== undefined) {
-          pendingRingFree.delete(w);
-          try {
-            worker.postMessage({ type: "n6k-vsock-free-ring", ...pending });
-          } catch {
-            // duckdb worker already torn down; region goes with the whole heap.
-          }
-        }
+    let done: Promise<void> = Promise.resolve();
+
+    function disconnected(reason: string): void {
+      if (!connected || disconnectNotified || pump.intentional) return;
+      disconnectNotified = true;
+      log.error(`pump disconnected: ${label} reason=${reason}`);
+      setConnectionStatus(connectionId, "disconnected");
+    }
+
+    function sendFrame(frame: Uint8Array<ArrayBuffer>): void {
+      if (!opened) {
+        disconnected("cannot send frame: socket not open");
         return;
       }
-      if (ev.data.type === "ready") {
+      try {
+        send(frame);
+      } catch (error) {
+        log.error("external vsock send failed:", error);
+      }
+    }
+
+    function stop(reason: string): void {
+      opened = false;
+      stopped = true;
+      endpoint.close();
+      disconnected(reason);
+    }
+
+    const pump: Pump = {
+      intentional: false,
+      open() {
+        opened = true;
+        done = runPump(
+          endpoint,
+          { send: sendFrame },
+          inbound,
+          () => stopped,
+        ).catch((error: unknown) => {
+          log.error("pump failed:", error);
+        });
         connected = true;
         setConnectionStatus(connectionId, "connected");
-      } else if (
-        (ev.data.type === "closed" || ev.data.type === "error") &&
-        connected &&
-        !disconnectNotified &&
-        !intentionalClose.has(w)
-      ) {
-        disconnectNotified = true;
-        log.error(
-          `ws-worker (pump) disconnected: ${label} reason=${ev.data.reason || "(none)"}`,
-        );
-        setConnectionStatus(connectionId, "disconnected");
-      }
-    } as EventListener);
-    return w;
+      },
+      wsIn(frame) {
+        if (stopped) return;
+        if (acceptInbound(endpoint, inbound, new Uint8Array(frame))) return;
+        stop("inbound overflow");
+      },
+      wsClosed: stop,
+      retire() {
+        pump.intentional = true;
+        stopped = true;
+        // Wakes a pump parked on rings C++ already closed, whose own wake was spent before this.
+        inbound.kick?.();
+        // After the final drain, so queued frames still reach the socket. When dispose() retires a live pump, this
+        // close is how C++ sees the drop.
+        return done.then(() => {
+          endpoint.close();
+          opened = false;
+        });
+      },
+    };
+    return pump;
   }
 
   // Attach the durable inbound bridge to an app socket under its id.
@@ -380,21 +384,14 @@ export function createN6kWorker({
         return;
       }
       // With no connection over the socket nothing awaits these: every session opens after its pump binds.
-      state.pump?.postMessage({ type: "ws-in", data: d }, [d]);
+      state.pump?.wsIn(d);
     };
     // Socket drop -> the pump over it; the driver never closes the app's socket.
     state.onClose = function () {
       failConnectionRequests(state, "n6k: socket closed");
       rpcClients.get(id)?.fail("n6k: socket closed");
       worker.postMessage({ type: "n6k-socket-down", id });
-      try {
-        state.pump?.postMessage({
-          type: "ws-closed",
-          reason: "app socket closed",
-        });
-      } catch {
-        // worker already terminated — nothing to notify.
-      }
+      state.pump?.wsClosed("app socket closed");
     };
     socket.addEventListener("message", state.onMessage as EventListener);
     socket.addEventListener("close", state.onClose);
@@ -408,15 +405,8 @@ export function createN6kWorker({
       setConnectionStatus(id, "reconnecting");
       if (prev.pump) {
         // Reported below as a recovery, not a drop. The connection redials onto this socket on its next request.
-        intentionalClose.add(prev.pump);
-        try {
-          prev.pump.postMessage({
-            type: "ws-closed",
-            reason: "websocket replaced",
-          });
-        } catch {
-          /* ignore */
-        }
+        prev.pump.intentional = true;
+        prev.pump.wsClosed("websocket replaced");
       }
       teardownExternalSocket(prev);
     }
@@ -679,13 +669,10 @@ export function createN6kWorker({
       );
     }
     setConnectionStatus(connectionId, "reconnecting");
-    for (const ch of channels.values()) {
+    for (const [key, ch] of channels) {
       if (ch.connectionId !== connectionId) continue;
-      try {
-        ch.pump.postMessage({ type: "close" });
-      } catch {
-        /* ignore */
-      }
+      ch.open = false;
+      worker.postMessage({ type: "n6k-reconnect", key });
     }
   }
 
@@ -695,50 +682,56 @@ export function createN6kWorker({
     if (!e.data) return;
 
     switch (e.data.type) {
+      case "n6k-init-ack": {
+        initWaiter?.();
+        break;
+      }
+      case "n6k-init-error": {
+        initWaiter?.(new Error(e.data.message as string));
+        break;
+      }
       case "n6k-vsock-dial": {
-        const key: string = e.data.key;
-        const connectionId: string = e.data.connectionId;
-        const carrier = readCarrier(e.data);
-        const w = spawnPump(key, connectionId, carrier);
-        channels.set(key, {
-          connectionId,
-          pump: w,
-          ringOffset: carrier.ringOffset,
+        channels.set(e.data.key as string, {
+          connectionId: e.data.connectionId as string,
+          open: false,
         });
-        w.postMessage({ type: "open-pump", url: e.data.wsUrl });
+        break;
+      }
+      case "n6k-conn-status": {
+        const ch = channels.get(e.data.key as string);
+        if (!ch) break;
+        if (e.data.open) {
+          ch.open = true;
+          setConnectionStatus(ch.connectionId, "connected");
+        } else if (ch.open) {
+          ch.open = false;
+          log.error(`dialed socket disconnected: ${e.data.key}`);
+          setConnectionStatus(ch.connectionId, "disconnected");
+        }
         break;
       }
       case "n6k-vsock-adopt": {
-        // Byte-pump over an app-registered socket: main thread bridges binary frames to/from the pump.
         const key: string = e.data.key;
         const connectionId: string = e.data.connectionId;
         const carrier = readCarrier(e.data);
-        const w = spawnPump(key, connectionId, carrier);
+        const state = externalSockets.get(connectionId);
+        const pump = createPump(key, connectionId, carrier, (frame) =>
+          state?.socket.send(frame),
+        );
         channels.set(key, {
           connectionId,
-          pump: w,
+          pump,
           ringOffset: carrier.ringOffset,
+          open: false,
         });
-        const state = externalSockets.get(connectionId);
         if (!state) {
-          w.postMessage({ type: "ws-closed", reason: "registration closed" });
+          pump.wsClosed("registration closed");
           break;
         }
-        state.pump = w;
-        w.addEventListener("message", function (ev: MessageEvent) {
-          if (ev.data && ev.data.type === "ws-out") {
-            try {
-              state.socket.send(ev.data.data as ArrayBuffer);
-            } catch (error) {
-              log.error("external vsock send failed:", error);
-            }
-          }
-        } as EventListener);
-        // Closed since vsockAdopt checked: no ws-closed here, a drop during the reopen would stop the catalog for
+        state.pump = pump;
+        // Closed since vsockAdopt checked: no wsClosed here, a drop during the reopen would stop the catalog for
         // good. The OPEN times out instead, and replaceWebsocket still recovers.
-        if (state.socket.readyState === WebSocket.OPEN) {
-          w.postMessage({ type: "open-pump-external" });
-        }
+        if (state.socket.readyState === WebSocket.OPEN) pump.open();
         break;
       }
       case "n6k-vsock-detach": {
@@ -746,9 +739,13 @@ export function createN6kWorker({
         const ch = channels.get(key);
         if (!ch) break;
         channels.delete(key);
-        // Set BEFORE closing the pump so its release ack isn't missed.
-        pendingRingFree.set(ch.pump, { key, ringOffset: ch.ringOffset });
-        retirePump(ch.pump, `#${instanceId} ws-worker ${key}`);
+        // A dialed ring was already freed by the extension's pump.
+        if (!ch.pump || ch.ringOffset === undefined) break;
+        const ringOffset = ch.ringOffset;
+        void ch.pump.retire().then(() => {
+          if (disposed) return;
+          worker.postMessage({ type: "n6k-vsock-free-ring", key, ringOffset });
+        });
         const state = externalSockets.get(ch.connectionId);
         if (state?.pump === ch.pump) state.pump = undefined;
         if (closing.has(ch.connectionId) && !state?.pump) {
@@ -793,9 +790,8 @@ export function createN6kWorker({
   };
 
   function dispose(): void {
-    for (const [key, ch] of channels) {
-      retirePump(ch.pump, `#${instanceId} ws-worker ${key}`);
-    }
+    disposed = true;
+    for (const ch of channels.values()) void ch.pump?.retire();
     channels.clear();
     for (const [id, client] of rpcClients) closeRegistration(id, client);
     for (const state of externalSockets.values()) teardownExternalSocket(state);
@@ -804,17 +800,20 @@ export function createN6kWorker({
     catalogsOf.clear();
     connectionOf.clear();
     connectionStatus.clear();
-    pendingRingFree.clear();
     try {
       n6kChannel.port1.close();
     } catch {
       /* ignore */
     }
-    untrackWorker(worker, `#${instanceId} duckdb-worker`);
   }
 
+  try {
+    await attach();
+  } catch (error) {
+    dispose();
+    throw error;
+  }
   return {
-    worker,
     reconnect,
     registerWebsocket,
     replaceWebsocket,

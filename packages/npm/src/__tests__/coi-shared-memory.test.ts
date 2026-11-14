@@ -26,7 +26,7 @@ backendDescribe()(`coi shared-memory heap [${backendName}]`, () => {
     async () => {
       const probe = await handle.probeMemory!();
       // The whole plan rests on this: duckdb's wasm heap is a SharedArrayBuffer
-      // we can hand to the ws-worker and pthreads. If any fail, the shared-heap
+      // we can hand to the page's pumps and pthreads. If any fail, the shared-heap
       // approach is not viable on this bundle.
       expect(probe.found).toBe(true);
       expect(probe.isSharedArrayBuffer).toBe(true);

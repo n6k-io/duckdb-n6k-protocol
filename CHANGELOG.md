@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Sockets registered with `registerWebsocket` are now pumped on the page's main thread. `ws-worker.js`, the
+`wsWorkerUrl` option and the `@n6k.io/db/workers` export are removed; drop them from serving and bundling.
+
 Reads, writes, DDL and transactions on an attached database now travel on links, crossing's far transactions, and
 the server runs them with crossing's far side. This is protocol version 13: it removes the `READ_PLAN`, `WRITE_PLAN`,
 `TXN_*`, `CREATE_TABLE`, `ALTER_TABLE`, `CREATE_VIEW` and `DROP_VIEW` ops and every `txn` field, and adds the `LINK_*`

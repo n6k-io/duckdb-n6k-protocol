@@ -20,9 +20,18 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 
+#ifdef WASM_LOADABLE_EXTENSIONS
+#include "n6k_glue_generated.hpp"
+#include "n6k_wasm_main_thread.hpp"
+#endif
+
 namespace duckdb {
 
 void LoadInternal(ExtensionLoader &loader) {
+#ifdef WASM_LOADABLE_EXTENSIONS
+	// globalThis.n6k for every later call into JS; a no-op if already installed.
+	n6k::RunScriptOnMain(n6k::N6K_MAIN_GLUE_JS);
+#endif
 	RegisterN6kRpc(loader);
 	RegisterN6kVersion(loader);
 	RegisterN6kSelftestThreadParkWake(loader);

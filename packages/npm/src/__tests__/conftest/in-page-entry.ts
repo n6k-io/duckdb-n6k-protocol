@@ -1,5 +1,5 @@
 import { createDuckDB } from "../../create-duckdb";
-import type { RegisteredWebsocket } from "../../create-n6k-worker";
+import type { RegisteredWebsocket } from "../../n6k-control";
 import { createWasmConnect, queryViaSend } from "../../wasm-lease";
 import { parseSqlTables } from "../../metadata/parse-sql-tables";
 import { withLease, type ConnectionLike } from "../../connection-shape";
@@ -157,8 +157,7 @@ async function boot(): Promise<void> {
       catalogsChanged.push({ wsId, catalogs }),
     onInvalidated: (catalog, schemas) => invalidated.push({ catalog, schemas }),
   });
-  await conn.query("LOAD n6k_client;");
-  // Raise the scheduler pool AFTER LOAD — opening multi-threaded deadlocks dlopen.
+  // After createDuckDB's LOAD: see CreateDuckDBOptions.maximumThreads.
   const maxThreads = globalThis.__n6kMaxThreads ?? 1;
   if (maxThreads > 1) await conn.query(`SET threads=${maxThreads};`);
   const serverUrl = globalThis.__n6kServerUrl ?? "n6k://localhost:8099";
