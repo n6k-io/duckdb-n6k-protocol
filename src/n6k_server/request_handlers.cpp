@@ -8,6 +8,7 @@
 #include "n6k_permissions.hpp"
 #include "n6k_protocol_generated.hpp"
 #include "n6k_sql_builder.hpp"
+#include "n6k_sql_escape.hpp"
 #include "crossing.hpp"
 #include "crossing_substrait.hpp"
 #include "serve_reactor.hpp"
@@ -32,6 +33,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 
 namespace duckdb {
@@ -83,16 +85,117 @@ static void PackStrings(msgpack::packer<msgpack::sbuffer> &pk, const std::vector
 	}
 }
 
+using RelationKey = std::pair<string, string>;
+
+struct ListingComments {
+	std::map<RelationKey, Value> relations;
+	std::map<RelationKey, vector<std::pair<string, string>>> columns;
+	std::map<string, Value> schemas;
+};
+
+static std::unique_ptr<QueryResult> QueryListing(Connection &conn, const string &sql) {
+	auto result = conn.Query(sql);
+	if (result->HasError()) {
+		result->ThrowError();
+	}
+	return std::move(result);
+}
+
+static string ListingFilter(const string &catalog, optional_ptr<const string> schema_filter) {
+	string where = " WHERE database_name = " + QuoteSqlLiteral(catalog);
+	if (schema_filter) {
+		where += " AND lower(schema_name) = lower(" + QuoteSqlLiteral(*schema_filter) + ")";
+	}
+	return where;
+}
+
+static ListingComments CollectListingComments(Connection &conn, const string &catalog,
+                                              optional_ptr<const string> schema_filter) {
+	ListingComments out;
+	const auto where = ListingFilter(catalog, schema_filter);
+	auto relations =
+	    QueryListing(conn, "SELECT schema_name, table_name, comment FROM duckdb_tables()" + where +
+	                           " UNION ALL SELECT schema_name, view_name, comment FROM duckdb_views()" + where);
+	while (auto chunk = relations->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++) {
+			out.relations[{StringValue::Get(chunk->GetValue(0, i)), StringValue::Get(chunk->GetValue(1, i))}] =
+			    chunk->GetValue(2, i);
+		}
+	}
+	auto columns = QueryListing(conn, "SELECT schema_name, table_name, column_name, comment FROM duckdb_columns()" +
+	                                      where + " AND comment IS NOT NULL ORDER BY column_index");
+	while (auto chunk = columns->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++) {
+			out.columns[{StringValue::Get(chunk->GetValue(0, i)), StringValue::Get(chunk->GetValue(1, i))}]
+			    .emplace_back(StringValue::Get(chunk->GetValue(2, i)), StringValue::Get(chunk->GetValue(3, i)));
+		}
+	}
+	auto schemas = QueryListing(conn, "SELECT schema_name, comment FROM duckdb_schemas()" + where);
+	while (auto chunk = schemas->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++) {
+			out.schemas[StringValue::Get(chunk->GetValue(0, i))] = chunk->GetValue(1, i);
+		}
+	}
+	return out;
+}
+
+static constexpr const char *FUNCTION_ROW_KEYS[] = {
+    "schema", "name", "type", "description", "comment", "parameters", "parameter_types", "return_type", "examples"};
+
+static vector<vector<Value>> CollectFunctionRows(Connection &conn, const string &catalog,
+                                                 optional_ptr<const string> schema_filter) {
+	auto result = QueryListing(conn, "SELECT schema_name, function_name, function_type, description, comment, "
+	                                 "parameters, parameter_types, return_type, examples FROM duckdb_functions()" +
+	                                     ListingFilter(catalog, schema_filter) +
+	                                     " ORDER BY schema_name, function_name, function_oid");
+	vector<vector<Value>> rows;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++) {
+			vector<Value> row;
+			for (idx_t c = 0; c < chunk->ColumnCount(); c++) {
+				row.push_back(chunk->GetValue(c, i));
+			}
+			rows.push_back(std::move(row));
+		}
+	}
+	return rows;
+}
+
+// VARCHAR → string, VARCHAR[] → array, NULL → nil.
+static void PackStringValue(msgpack::packer<msgpack::sbuffer> &pk, const Value &value) {
+	if (value.IsNull()) {
+		pk.pack_nil();
+		return;
+	}
+	if (value.type().id() == LogicalTypeId::LIST) {
+		auto &children = ListValue::GetChildren(value);
+		pk.pack_array(static_cast<uint32_t>(children.size()));
+		for (auto &child : children) {
+			PackStringValue(pk, child);
+		}
+		return;
+	}
+	pk.pack(StringValue::Get(value));
+}
+
+template <class KEY>
+static Value CommentOf(const std::map<KEY, Value> &comments, const KEY &key) {
+	auto it = comments.find(key);
+	return it == comments.end() ? Value() : it->second;
+}
+
 static std::string PackTablesChunk(const FrameTarget &target, const vector<TablePermissionRow> &rows,
-                                   const vector<SchemaPermissionRow> &schemas) {
+                                   const vector<SchemaPermissionRow> &schemas, const ListingComments &comments,
+                                   const vector<vector<Value>> &functions) {
 	msgpack::sbuffer sb;
 	msgpack::packer<msgpack::sbuffer> pk(&sb);
-	pk.pack_map(4 + NsKeyCount(target));
+	pk.pack_map(5 + NsKeyCount(target));
 	PackTIdInto(pk, FrameType::RESP_CHUNK, target);
 	PackString(pk, "tables");
 	pk.pack_array(static_cast<uint32_t>(rows.size()));
 	for (auto &r : rows) {
-		pk.pack_map(7);
+		const RelationKey key {r.schema, r.name};
+		pk.pack_map(9);
 		PackString(pk, "schema");
 		pk.pack(r.schema);
 		PackString(pk, "name");
@@ -110,15 +213,39 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 		for (auto &unique_key : r.unique_keys) {
 			PackStrings(pk, unique_key);
 		}
+		PackString(pk, "comment");
+		PackStringValue(pk, CommentOf(comments.relations, key));
+		PackString(pk, "column_comments");
+		auto columns = comments.columns.find(key);
+		if (columns == comments.columns.end()) {
+			pk.pack_map(0);
+		} else {
+			pk.pack_map(static_cast<uint32_t>(columns->second.size()));
+			for (auto &column : columns->second) {
+				pk.pack(column.first);
+				pk.pack(column.second);
+			}
+		}
 	}
 	PackString(pk, "schemas");
 	pk.pack_array(static_cast<uint32_t>(schemas.size()));
 	for (auto &schema : schemas) {
-		pk.pack_map(2);
+		pk.pack_map(3);
 		PackString(pk, "name");
 		pk.pack(schema.name);
 		PackString(pk, "verbs");
 		PackStrings(pk, schema.verbs);
+		PackString(pk, "comment");
+		PackStringValue(pk, CommentOf(comments.schemas, schema.name));
+	}
+	PackString(pk, "functions");
+	pk.pack_array(static_cast<uint32_t>(functions.size()));
+	for (auto &function : functions) {
+		pk.pack_map(static_cast<uint32_t>(function.size()));
+		for (idx_t c = 0; c < function.size(); c++) {
+			PackString(pk, FUNCTION_ROW_KEYS[c]);
+			PackStringValue(pk, function[c]);
+		}
 	}
 	return std::string(sb.data(), sb.size());
 }
@@ -154,7 +281,9 @@ static void HandleTablesList(ServeReactor &reactor, Connection &conn, const Sess
 		CollectCatalogPermissions(*conn.context, cat, schema_filter, nullptr, rows);
 		CollectSchemaPermissions(*conn.context, cat, schema_filter, schemas);
 	});
-	reactor.SendForRequest(slot, PackTablesChunk(target, rows, schemas));
+	auto comments = CollectListingComments(conn, catalog, schema_filter);
+	auto functions = CollectFunctionRows(conn, catalog, schema_filter);
+	reactor.SendForRequest(slot, PackTablesChunk(target, rows, schemas, comments, functions));
 	reactor.EndRequest(slot, PackRespEnd(target));
 }
 

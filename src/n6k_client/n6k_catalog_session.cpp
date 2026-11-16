@@ -197,6 +197,18 @@ public:
 			row.primary_keys = n6k::JsonGetStrArray(item, "primary_keys");
 			row.not_null = n6k::JsonGetStrArray(item, "not_null");
 			row.unique_keys = n6k::JsonGetStrArrays(item, "unique_keys");
+			row.comment = JsonGetStr(item, "comment");
+			auto *column_comments = duckdb_yyjson::yyjson_obj_get(item, "column_comments");
+			if (column_comments && duckdb_yyjson::yyjson_is_obj(column_comments)) {
+				size_t column_idx, column_n;
+				duckdb_yyjson::yyjson_val *column, *comment;
+				yyjson_obj_foreach(column_comments, column_idx, column_n, column, comment) {
+					if (duckdb_yyjson::yyjson_is_str(comment)) {
+						row.column_comments[duckdb_yyjson::yyjson_get_str(column)] =
+						    duckdb_yyjson::yyjson_get_str(comment);
+					}
+				}
+			}
 			out.tables.emplace_back(std::move(row));
 		}
 		auto *schemas = duckdb_yyjson::yyjson_obj_get(doc.Root(), "schemas");
@@ -212,6 +224,7 @@ public:
 			n6k::WsSchemaRow row;
 			row.name = JsonGetStr(item, "name");
 			row.verbs = n6k::JsonGetStrArray(item, "verbs");
+			row.comment = JsonGetStr(item, "comment");
 			out.schemas.emplace_back(std::move(row));
 		}
 		return out;

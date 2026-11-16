@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -26,11 +27,14 @@ struct WsTableRow {
 	vector<string> primary_keys;
 	vector<string> not_null;
 	std::vector<std::vector<std::string>> unique_keys;
+	string comment;
+	case_insensitive_map_t<string> column_comments;
 };
 
 struct WsSchemaRow {
 	string name;
 	vector<string> verbs;
+	string comment;
 };
 
 struct WsTableList {

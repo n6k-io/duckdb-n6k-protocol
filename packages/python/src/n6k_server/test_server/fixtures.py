@@ -52,6 +52,7 @@ def rpc_fixture_statements(catalog: str) -> list[str]:
         # `seq`, not `n`: the incremental-delivery test reads that column by name.
         f"CREATE MACRO {catalog}.main.slow_ticker(cnt, ms) AS TABLE "
         f"(SELECT n AS seq FROM n6k_testing_stream_counter(cnt, ms))",
+        f"COMMENT ON MACRO TABLE {catalog}.main.doubler IS 'twice n'",
     ]
 
 

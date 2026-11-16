@@ -14,6 +14,10 @@ and `STREAM_*` frames. A client and server of different versions do not connect.
 generated column now work on an attached database, as does writing to a table with no primary key. Writes in
 autocommit run in a server transaction, so a statement that fails after its write leaves nothing behind.
 
+`TABLES_LIST` now carries a `functions` array, one row per `duckdb_functions()` entry in the served catalog, and
+`comment` on table, view and schema rows plus `column_comments` on table rows. Table, view and column comments now
+show on an attached database in `duckdb_tables()` and `duckdb_columns()`.
+
 `n6k_serve_*` takes `max_links`: far transactions open at once on a connection, each on its own thread.
 
 The recursive part of a `WITH RECURSIVE` can no longer read an attached table; it fails with an error.
