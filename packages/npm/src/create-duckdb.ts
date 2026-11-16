@@ -1,10 +1,13 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
-import { createN6kWorker, type RegisteredWebsocket } from "./create-n6k-worker";
+import {
+  openN6kControl,
+  type N6kControl,
+  type RegisteredWebsocket,
+} from "./n6k-control";
 import { logger as log, stopwatch } from "./logger";
 
 import type { WsStatus } from "./types";
 import { N6K_VERSION } from "./version";
-import { N6K_DEFAULT_WORKER_URLS } from "./workers/manifest";
 
 export type CreateDuckDBOptions = {
   // Defaults to the jsDelivr CDN bundle; pass a local bundle for offline/hermetic use.
@@ -13,8 +16,6 @@ export type CreateDuckDBOptions = {
   // can deadlock on LOAD/dlopen when scheduler pthreads are parked, so `SET threads` above 1
   // only after extensions are loaded.
   maximumThreads?: number;
-  duckdbWorkerUrl?: string;
-  wsWorkerUrl?: string;
   extensionRepository?: string;
   onStatus?: (catalog: string, status: WsStatus) => void;
   // The server added or removed catalogs on a registered wsId; `catalogs` is the full new list.
@@ -41,6 +42,7 @@ function jsDelivrBundlesWithThreads(): duckdb.DuckDBBundles {
 }
 
 let nextInstanceId = 1;
+let liveWorkers = 0;
 
 export type DuckDBInstance = {
   id: number;
@@ -59,7 +61,7 @@ export type DuckDBInstance = {
   ) => Promise<void>;
   // Catalog names the server serves on a registered wsId.
   listCatalogs: (wsId: string) => Promise<string[]>;
-  // Terminates the duckdb worker, its pthreads and ws-workers. Idempotent.
+  // Terminates the duckdb worker and its pthreads. Idempotent.
   dispose: () => Promise<void>;
 };
 
@@ -94,23 +96,19 @@ export async function createDuckDB(
     );
   }
 
-  const {
-    worker,
-    reconnect,
-    registerWebsocket,
-    replaceWebsocket,
-    listCatalogs,
-    dispose: disposeWorkers,
-  } = createN6kWorker({
-    instanceId: id,
-    mainWorkerUrl: bundle.mainWorker!,
-    duckdbWorkerUrl:
-      opts.duckdbWorkerUrl ?? N6K_DEFAULT_WORKER_URLS.duckdbWorkerUrl,
-    wsWorkerUrl: opts.wsWorkerUrl ?? N6K_DEFAULT_WORKER_URLS.wsWorkerUrl,
-    onStatus: opts.onStatus,
-    onCatalogsChanged: opts.onCatalogsChanged,
-    onInvalidated: opts.onInvalidated,
+  const worker = new Worker(bundle.mainWorker!, { type: "classic" });
+  liveWorkers++;
+  log.debug(`worker+ #${id} duckdb-worker (live workers: ${liveWorkers})`);
+  worker.addEventListener("error", function (e) {
+    log.error("duckdb-worker error:", e.message || e);
+    log.error(
+      "duckdb-worker error detail — filename:",
+      e.filename,
+      "lineno:",
+      e.lineno,
+    );
   });
+  let control: N6kControl | undefined;
 
   const duckdbLogger: duckdb.Logger = {
     log: (entry) => log.debug("duckdb", entry),
@@ -121,8 +119,10 @@ export async function createDuckDB(
   const dispose = () => {
     disposed ??= (async () => {
       log.debug(`#${id} disposing`);
-      disposeWorkers();
+      control?.dispose();
       await db.terminate();
+      liveWorkers--;
+      log.debug(`worker- #${id} duckdb-worker (live workers: ${liveWorkers})`);
     })();
     return disposed;
   };
@@ -167,15 +167,22 @@ export async function createDuckDB(
       opts.extensionRepository ?? globalThis.location.origin;
     log.debug("setting extension repository:", extensionRepo);
     await conn.query(`SET custom_extension_repository = '${extensionRepo}';`);
+    await conn.query("LOAD n6k_client;");
+    control = await openN6kControl(worker, {
+      instanceId: id,
+      onStatus: opts.onStatus,
+      onCatalogsChanged: opts.onCatalogsChanged,
+      onInvalidated: opts.onInvalidated,
+    });
 
     return {
       id,
       db,
       conn,
-      reconnect,
-      registerWebsocket,
-      replaceWebsocket,
-      listCatalogs,
+      reconnect: control.reconnect,
+      registerWebsocket: control.registerWebsocket,
+      replaceWebsocket: control.replaceWebsocket,
+      listCatalogs: control.listCatalogs,
       dispose,
     };
   }

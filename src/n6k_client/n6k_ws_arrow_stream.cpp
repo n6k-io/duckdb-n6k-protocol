@@ -33,11 +33,18 @@ struct WsStreamPrivate {
 	size_t cur_off = 0;
 	bool saw_chunk = false;
 	bool done = false;
+	// The server sends the IPC EOS as its own RESP_CHUNK, immediately followed by RESP_END.
+	bool server_sent_eos = false;
 	// Polled between wait slices so an idle stream tears down promptly; empty → wait for terminal.
 	std::function<bool()> should_cancel;
 };
 
 constexpr std::chrono::seconds kFrameWaitSlice {1};
+
+bool IsIpcEndOfStream(const std::string &payload) {
+	static constexpr char kEos[] = {'\xFF', '\xFF', '\xFF', '\xFF', '\0', '\0', '\0', '\0'};
+	return payload.size() == sizeof(kEos) && std::memcmp(payload.data(), kEos, sizeof(kEos)) == 0;
+}
 
 // An idle gap is never EOF: a slice that expires with the stream still open just waits again.
 bool WaitNextFrameUntilTerminalOrCancel(WsStreamPrivate *priv, Frame &f) {
@@ -106,6 +113,7 @@ bool ReplenishCreditAndAdvanceToPayload(WsStreamPrivate *priv) {
 		switch (f.type) {
 		case FrameType::RESP_SCHEMA:
 		case FrameType::RESP_CHUNK:
+			priv->server_sent_eos = priv->server_sent_eos || IsIpcEndOfStream(f.payload);
 			priv->cur = std::move(f.payload);
 			priv->cur_off = 0;
 			priv->saw_chunk = (f.type == FrameType::RESP_CHUNK);
@@ -154,7 +162,7 @@ ArrowErrorCode WsStreamRead(struct ArrowIpcInputStream *stream, uint8_t *buf, in
 void WsStreamReleaseAndCancelIfUnfinished(struct ArrowIpcInputStream *stream) {
 	auto *priv = static_cast<WsStreamPrivate *>(stream->private_data);
 	if (priv) {
-		if (priv->req && !priv->done) {
+		if (priv->req && !priv->done && !priv->server_sent_eos) {
 			// Peek for an already-enqueued RESP_END/ERR to avoid a spurious CANCEL on a completed stream.
 			Frame f;
 			while (priv->req->Next(f, std::chrono::milliseconds(0))) {

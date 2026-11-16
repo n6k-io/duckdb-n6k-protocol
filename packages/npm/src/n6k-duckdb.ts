@@ -23,7 +23,7 @@ import {
   type CreateDuckDBOptions,
   type DuckDBInstance,
 } from "./create-duckdb";
-import type { RegisteredWebsocket } from "./create-n6k-worker";
+import type { RegisteredWebsocket } from "./n6k-control";
 import { logger as log, stopwatch } from "./logger";
 import type { WsStatus } from "./types";
 import { createWasmConnect, type WasmDatabase } from "./wasm-lease";
@@ -37,12 +37,7 @@ export type N6kDuckDBOptions = Omit<
   databases?: Record<string, DatabaseSpec>;
 };
 
-export type N6kDuckDBStatus =
-  | "initializing"
-  | "loading-extensions"
-  | "attaching"
-  | "ready"
-  | "error";
+export type N6kDuckDBStatus = "initializing" | "attaching" | "ready" | "error";
 
 export type N6kDuckDBSnapshot = {
   status: N6kDuckDBStatus;
@@ -128,10 +123,6 @@ export class N6kDuckDB {
         onStatus: (catalog, status) => this.onConnStatus(catalog, status),
         onInvalidated: (catalog) => this.bumpInvalidation(catalog),
       });
-      this.update({ status: "loading-extensions" });
-      const sinceLoad = stopwatch();
-      await instance.conn.query("LOAD n6k_client;");
-      log.debug(`#${instance.id} n6k extension loaded (${sinceLoad()})`);
       await this.openSockets(instance);
       this.update({ status: "attaching" });
       for (const [alias, config] of Object.entries(this.configs)) {

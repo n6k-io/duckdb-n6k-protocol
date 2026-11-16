@@ -17,6 +17,8 @@ struct N6kTableInfo {
 	vector<string> primary_keys;
 	vector<string> not_null;
 	std::vector<std::vector<std::string>> unique_keys;
+	string comment;
+	case_insensitive_map_t<string> column_comments;
 };
 
 class DatabaseInstance;

@@ -2,7 +2,9 @@
 
 DuckDB-wasm driver for the n6k extension.
 
-Wraps `@duckdb/duckdb-wasm` so the n6k extension can talk to an n6k server over a WebSocket from inside WASM: a ws-worker owns the socket and moves frames to and from the extension through shared-memory rings.
+Wraps `@duckdb/duckdb-wasm` so the n6k extension can talk to an n6k server over a WebSocket from inside WASM. The extension carries its own JS glue: `LOAD n6k_client` installs it in duckdb-wasm's stock worker, and a pump thread inside the extension owns each dialed socket, moving frames to and from C++ through shared-memory rings.
+
+Without this package, a plain `AsyncDuckDB` on the threaded bundle can `LOAD n6k_client` and `ATTACH 'n6k://…' (TYPE n6k)` directly. The package adds app-registered sockets (`registerWebsocket`), per-catalog status and invalidation events.
 
 ## Install
 
@@ -26,17 +28,16 @@ npm install @n6k.io/db @duckdb/duckdb-wasm
 ```js
 import { createDuckDB } from '@n6k.io/db'
 
-// Selects the threaded (coi) bundle, wires the n6k workers, opens the database and
-// sets custom_extension_repository (defaults to the page origin).
+// Selects the threaded (coi) bundle, opens the database, sets custom_extension_repository
+// (defaults to the page origin) and runs LOAD n6k_client.
 const { conn } = await createDuckDB()
 
-await conn.query('LOAD n6k_client;')
 await conn.query("ATTACH 'n6k://example.com' AS remote (TYPE n6k);")
 const result = await conn.query('SELECT * FROM remote.main.demo;')
 const rows = result.toArray().map(r => r.toJSON())
 ```
 
-`createDuckDB()` spawns the duckdb worker plus one byte-pump ws-worker per attached catalog; the extension's C++ WebSocket client drives the protocol over shared-memory rings.
+`createDuckDB()` spawns duckdb-wasm's own worker. Dialed sockets are pumped inside the extension; sockets registered with `registerWebsocket` are pumped on the page's main thread. The extension's C++ client drives the protocol over shared-memory rings.
 
 ### Serving WASM Extensions
 
@@ -98,9 +99,33 @@ Returns a `DuckDBInstance`. Requires a cross-origin-isolated page; throws if the
 
 - **`bundle`** — a duckdb-wasm bundle to use instead of the jsDelivr coi bundle.
 - **`maximumThreads`** — see `CreateDuckDBOptions.maximumThreads`.
-- **`duckdbWorkerUrl` / `wsWorkerUrl`** — override the worker script URLs.
 - **`extensionRepository`** — `custom_extension_repository` (default: the page origin).
 - **`onStatus(catalog, status)`** — status of the socket under each catalog (`WsStatus`). Catalogs on one socket report together.
+
+### `openN6kControl(worker, opts?: N6kControlOptions)`
+
+For an app that builds duckdb-wasm itself (threads bundle, cross-origin isolated). Plain `LOAD n6k_client` +
+`ATTACH 'n6k://…'` works without it; `openN6kControl` adds `registerWebsocket`, `replaceWebsocket`,
+`reconnect`, `listCatalogs` and the `onStatus` / `onCatalogsChanged` / `onInvalidated` callbacks.
+`createDuckDB` is built on it.
+
+```ts
+const worker = new Worker(bundle.mainWorker!);
+const db = new duckdb.AsyncDuckDB(logger, worker);
+await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+await db.open({ allowUnsignedExtensions: true, maximumThreads: 1 });
+const conn = await db.connect();
+await conn.query(`SET custom_extension_repository = '${location.origin}'`);
+await conn.query("LOAD n6k_client");
+
+const control = await openN6kControl(worker, { onStatus });
+const { wsId } = await control.registerWebsocket(ws, token);
+await conn.query(`ATTACH '' AS page_db (TYPE n6k, CONNECTION '${wsId}')`);
+```
+
+`worker` is the one passed to `AsyncDuckDB`. Call it after `LOAD n6k_client`: it rejects if the extension does not
+answer `n6k-init`, or with `n6k protocol mismatch` if the extension and npm package speak different protocol versions.
+`control.dispose()` does not terminate the worker.
 
 ### `wasmDir: string` (from `@n6k.io/db/node`)
 
@@ -155,7 +180,7 @@ const duckdb = new N6kDuckDB({
 
 ### Attaching an existing WebSocket
 
-`registerWebsocket(socket, token): Promise<RegisteredWebsocket>` and `replaceWebsocket(wsId, socket, token): Promise<void>` let you attach n6k onto a WebSocket your app already opened, instead of having the driver open its own. They are returned from `createDuckDB()`. Browser-only.
+`registerWebsocket(socket, token): Promise<RegisteredWebsocket>` and `replaceWebsocket(wsId, socket, token): Promise<void>` let you attach n6k onto a WebSocket your app already opened, instead of having the driver open its own. They are returned from `createDuckDB()` and `openN6kControl()`. Browser-only.
 
 ```ts
 const { conn, registerWebsocket, replaceWebsocket } = await createDuckDB();
@@ -288,8 +313,8 @@ export async function handle(_req: Request) {
 
 The driver is quiet by default. Info/debug logs are gated behind a runtime
 flag; warnings and errors always print. All output is prefixed `[n6k]` on the
-main thread, `[n6k:duckdb-worker] #<instance id>` from the duckdb worker and
-`[n6k:ws-worker]` from ws-workers.
+main thread, `[n6k:main-glue] #<instance id>` from the extension's glue in the duckdb worker
+and `[n6k:pump]` from its pump thread.
 
 Enable:
 
@@ -297,6 +322,8 @@ Enable:
 localStorage.setItem("n6k:debug", "1"); // browser
 globalThis.N6K_DEBUG = true; // any scope (incl. workers, SSR)
 ```
+
+`[n6k:pump]` debug lines cannot be enabled: the pump thread sees neither.
 
 Disable: `localStorage.removeItem("n6k:debug")` and clear the global. Reload
 to pick up the change in already-spawned workers.

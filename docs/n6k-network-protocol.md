@@ -302,6 +302,10 @@ Each entry in the `tables` array:
 | `primary_keys` | string[] | no | `[]` |
 | `not_null` | string[] | no | `[]` |
 | `unique_keys` | string[][] | no | `[]` |
+| `comment` | string \| null | no | `null` |
+| `column_comments` | map string → string | no | `{}` |
+
+`comment` is the table's or view's comment; `column_comments` holds only the columns that have one.
 
 `row_ids` says whether the table has a `rowid`; a view has not. Without it a write that addresses rows by `rowid`,
 such as one with a subquery in its `WHERE`, is refused.
@@ -321,10 +325,26 @@ The chunk also carries a `schemas` array, one entry per schema:
 |--------|------|----------|---------|
 | `name` | string | yes | — |
 | `verbs` | string[] | no | `[]` |
+| `comment` | string \| null | no | `null` |
 
 A schema's only verb is `create` (CREATE TABLE / CREATE VIEW in it). A plain
 catalog grants it unless attached READ_ONLY; bridge, provider and chained n6k
 catalogs grant none.
+
+The chunk also carries a `functions` array, one entry per `duckdb_functions()` row (one per overload) in the served
+catalog:
+
+| Column | Type |
+|--------|------|
+| `schema` | string |
+| `name` | string |
+| `type` | string (`scalar`, `aggregate`, `table`, `macro`, `table_macro`, ...) |
+| `description` | string \| null |
+| `comment` | string \| null |
+| `parameters` | string[] \| null |
+| `parameter_types` | string[] \| null |
+| `return_type` | string \| null |
+| `examples` | string[] \| null |
 
 The client uses `{schema, name}` as the table identity on subsequent
 `TABLE_SCHEMA` / `INSERT` frames.

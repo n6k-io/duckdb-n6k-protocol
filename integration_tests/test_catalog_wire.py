@@ -28,8 +28,15 @@ async def test_tables_list(target: Target) -> None:
         users = [t for t in chunk["tables"] if t["schema"] == "main" and t["name"] == "users"]
         assert users and "select" in users[0]["verbs"]
         assert users[0]["row_ids"] is True
+        assert users[0]["comment"] == "people"
+        assert users[0]["column_comments"] == {"name": "display name"}
         main = [s for s in chunk["schemas"] if s["name"] == "main"]
         assert main and main[0]["verbs"] == ["create"]
+        assert main[0]["comment"] is None
+        doubler = [f for f in chunk["functions"] if f["schema"] == "main" and f["name"] == "doubler"]
+        assert doubler and doubler[0]["type"] == "table_macro"
+        assert doubler[0]["comment"] == "twice n"
+        assert doubler[0]["parameters"] == ["n"]
 
 
 @pytest.mark.asyncio

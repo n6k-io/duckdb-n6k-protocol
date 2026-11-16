@@ -156,8 +156,8 @@ _F_NS: Any = ("ns", "integer", False)
 _F_NS_REQUIRED: Any = ("ns", "integer", True)
 _ARRAY_OF_STR: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
 _ARRAY_OF_STR_ARRAYS: dict[str, Any] = {"type": "array", "items": _ARRAY_OF_STR}
-# Each TABLES_LIST entry is a row object ({schema, name, verbs, primary_keys, not_null, unique_keys}); each schema
-# entry {name, verbs}.
+# Each TABLES_LIST entry is a row object ({schema, name, verbs, primary_keys, not_null, row_ids, unique_keys,
+# comment, column_comments}); each schema entry {name, verbs, comment}; each function entry a duckdb_functions() row.
 _ARRAY_OF_OBJ: dict[str, Any] = {"type": "array", "items": {"type": "object"}}
 
 # variant: {"name", "t", optional "op", "fields": [field, ...], optional
@@ -297,7 +297,12 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
     {
         "name": "RESP_CHUNK_TABLES",
         "t": FT_RESP_CHUNK,
-        "fields": [_F_ID, ("tables", _ARRAY_OF_OBJ, True), ("schemas", _ARRAY_OF_OBJ, True)],
+        "fields": [
+            _F_ID,
+            ("tables", _ARRAY_OF_OBJ, True),
+            ("schemas", _ARRAY_OF_OBJ, True),
+            ("functions", _ARRAY_OF_OBJ, True),
+        ],
     },
     {
         "name": "RESP_END",
