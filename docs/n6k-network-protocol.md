@@ -332,19 +332,19 @@ catalog grants it unless attached READ_ONLY; bridge, provider and chained n6k
 catalogs grant none.
 
 The chunk also carries a `functions` array, one entry per `duckdb_functions()` row (one per overload) in the served
-catalog:
+catalog, limited to the request's `schema` when it names one. Every key is always sent:
 
-| Column | Type |
-|--------|------|
-| `schema` | string |
-| `name` | string |
-| `type` | string (`scalar`, `aggregate`, `table`, `macro`, `table_macro`, ...) |
-| `description` | string \| null |
-| `comment` | string \| null |
-| `parameters` | string[] \| null |
-| `parameter_types` | string[] \| null |
-| `return_type` | string \| null |
-| `examples` | string[] \| null |
+| Column | Type | Required | Default |
+|--------|------|----------|---------|
+| `schema` | string | yes | — |
+| `name` | string | yes | — |
+| `type` | string, DuckDB's `duckdb_functions().function_type` | yes | — |
+| `description` | string \| null | yes | — |
+| `comment` | string \| null | yes | — |
+| `parameters` | (string \| null)[] \| null | yes | — |
+| `parameter_types` | (string \| null)[] \| null | yes | — |
+| `return_type` | string \| null | yes | — |
+| `examples` | (string \| null)[] \| null | yes | — |
 
 The client uses `{schema, name}` as the table identity on subsequent
 `TABLE_SCHEMA` / `INSERT` frames.

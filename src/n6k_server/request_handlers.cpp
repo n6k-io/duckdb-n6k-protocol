@@ -161,7 +161,7 @@ static vector<vector<Value>> CollectFunctionRows(Connection &conn, const string 
 	return rows;
 }
 
-// VARCHAR → string, VARCHAR[] → array, NULL → nil.
+// value must be NULL, VARCHAR or a (nested) list of those; any other type fails in StringValue::Get.
 static void PackStringValue(msgpack::packer<msgpack::sbuffer> &pk, const Value &value) {
 	if (value.IsNull()) {
 		pk.pack_nil();

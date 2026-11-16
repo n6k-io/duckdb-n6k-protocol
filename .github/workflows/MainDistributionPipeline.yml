@@ -66,11 +66,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
+      - run: |
           head="$(tr -d '[:space:]' < VERSION)"
-          base="$(git show "origin/$BASE_REF:VERSION" 2>/dev/null | tr -d '[:space:]')"
+          base="$(git tag -l 'duckdb/v*' | sed 's|^duckdb/v||' | sort -V | tail -1)"
           base="${base:-0.0.0}"
           echo "base=$base head=$head"
           if [[ ! "$head" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
