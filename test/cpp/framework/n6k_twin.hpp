@@ -20,6 +20,8 @@
 #include <atomic>
 #include <fcntl.h>
 #include <chrono>
+#include <cstring>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -30,6 +32,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace duckdb {
@@ -124,6 +127,7 @@ public:
 	}
 
 	~TwinClient() {
+		ReleaseRespEnd();
 		con.reset();
 		near_db.reset();
 		for (auto &link : links) {
@@ -429,7 +433,45 @@ public:
 		hold_credits.store(true);
 	}
 
+	void HoldRespEnd() {
+		std::lock_guard<std::mutex> lk(resp_end_mu);
+		hold_resp_end = true;
+	}
+
+	void ReleaseRespEnd() {
+		{
+			std::lock_guard<std::mutex> lk(resp_end_mu);
+			hold_resp_end = false;
+		}
+		resp_end_cv.notify_all();
+	}
+
 private:
+	static bool IsFrame(const std::string &frame, n6k::FrameType type) {
+		size_t offset = 0;
+		auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
+		return n6k::GetInt(handle.get(), "t", -1) == static_cast<int64_t>(type);
+	}
+
+	static bool IsEndOfStreamChunk(const std::string &frame) {
+		static constexpr char eos[] = {'\xFF', '\xFF', '\xFF', '\xFF', '\0', '\0', '\0', '\0'};
+		size_t offset = 0;
+		auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
+		return n6k::GetInt(handle.get(), "t", -1) == static_cast<int64_t>(n6k::FrameType::RESP_CHUNK) &&
+		       frame.size() - offset == sizeof(eos) && std::memcmp(frame.data() + offset, eos, sizeof(eos)) == 0;
+	}
+
+	static std::pair<int64_t, int64_t> FrameTarget(const std::string &frame) {
+		size_t offset = 0;
+		auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
+		return {n6k::GetInt(handle.get(), "ns", 0), n6k::GetInt(handle.get(), "id", -1)};
+	}
+
+	void AwaitRespEndRelease() {
+		std::unique_lock<std::mutex> lk(resp_end_mu);
+		resp_end_cv.wait(lk, [this] { return !hold_resp_end; });
+	}
+
 	static std::vector<std::string> Names(QueryResult &result) {
 		std::vector<std::string> names;
 		for (auto &name : result.GetNames()) {
@@ -474,12 +516,6 @@ private:
 		return true;
 	}
 
-	static bool IsCredit(const std::string &frame) {
-		size_t offset = 0;
-		auto handle = msgpack::unpack(frame.data(), frame.size(), offset);
-		return n6k::GetInt(handle.get(), "t", -1) == static_cast<int64_t>(n6k::FrameType::CREDIT);
-	}
-
 	void AwaitCreditPause() {
 		Connection stats(far);
 		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -493,21 +529,30 @@ private:
 	}
 
 	void Pump(int from, int to, bool record) {
+		std::set<std::pair<int64_t, int64_t>> eos_targets;
 		char header[n6k::STREAM_HEADER_BYTES];
 		while (ReadExact(from, header, sizeof(header))) {
 			std::string payload(n6k::StreamPayloadLength(header), '\0');
 			if (!payload.empty() && !ReadExact(from, &payload[0], payload.size())) {
 				break;
 			}
-			if (record &&
-			    static_cast<unsigned char>(header[4]) == static_cast<unsigned char>(n6k::StreamFrameType::N6K)) {
+			const bool n6k_frame =
+			    static_cast<unsigned char>(header[4]) == static_cast<unsigned char>(n6k::StreamFrameType::N6K);
+			if (record && n6k_frame) {
 				{
 					std::lock_guard<std::mutex> lk(lock);
 					sent.push_back(payload);
 				}
-				if (hold_credits.load() && IsCredit(payload)) {
+				if (hold_credits.load() && IsFrame(payload, n6k::FrameType::CREDIT)) {
 					AwaitCreditPause();
 					hold_credits.store(false);
+				}
+			}
+			if (!record && n6k_frame) {
+				if (IsEndOfStreamChunk(payload)) {
+					eos_targets.insert(FrameTarget(payload));
+				} else if (IsFrame(payload, n6k::FrameType::RESP_END) && eos_targets.erase(FrameTarget(payload)) != 0) {
+					AwaitRespEndRelease();
 				}
 			}
 			if (!WriteAll(to, header, sizeof(header)) || !WriteAll(to, payload.data(), payload.size())) {
@@ -572,6 +617,9 @@ private:
 	std::vector<std::string> sent;
 	std::string serve_error;
 	std::atomic<bool> hold_credits {false};
+	std::mutex resp_end_mu;
+	std::condition_variable resp_end_cv;
+	bool hold_resp_end = false;
 };
 
 class TwinNear {
@@ -726,6 +774,12 @@ public:
 	}
 	void HoldCreditsUntilPause() {
 		First().HoldCreditsUntilPause();
+	}
+	void HoldRespEnd() {
+		First().HoldRespEnd();
+	}
+	void ReleaseRespEnd() {
+		First().ReleaseRespEnd();
 	}
 
 private:

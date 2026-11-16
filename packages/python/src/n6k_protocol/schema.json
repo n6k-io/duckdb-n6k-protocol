@@ -621,6 +621,12 @@
             "type": "object"
           }
         },
+        "functions": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
         "ns": {
           "type": "integer"
         }
@@ -629,7 +635,8 @@
         "t",
         "id",
         "tables",
-        "schemas"
+        "schemas",
+        "functions"
       ],
       "additionalProperties": false
     },

@@ -145,6 +145,8 @@ void N6kSource::ListIfNeeded() {
 		info.primary_keys = row.primary_keys;
 		info.not_null = row.not_null;
 		info.unique_keys = row.unique_keys;
+		info.comment = row.comment;
+		info.column_comments = row.column_comments;
 		tables[row.schema][row.name] = std::move(info);
 	}
 	for (auto &row : listing.schemas) {
@@ -272,10 +274,14 @@ CrossingTable N6kSource::Describe(const string &schema, const string &name) {
 	table.verbs = CrossingVerbsNamed(info.verbs);
 	table.returning = true;
 	table.row_ids = info.row_ids;
+	table.comment = info.comment;
+	for (auto &column_name : table.column_names) {
+		auto comment = info.column_comments.find(column_name);
+		table.column_comments.push_back(comment == info.column_comments.end() ? string() : comment->second);
+	}
 	DeclareConstraints(table, info);
 	return table;
 }
-
 void N6kSource::DescribeChanged(const string &schema, CrossingTable &table) {
 	CrossingSource::DescribeChanged(schema, table);
 	table.catalog = floor_catalog;

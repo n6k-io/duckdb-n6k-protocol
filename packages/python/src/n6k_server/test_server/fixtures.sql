@@ -16,3 +16,5 @@ CREATE TABLE "{catalog}".main.users (id INTEGER, name VARCHAR, age INTEGER)
 INSERT INTO "{catalog}".main.users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35)
 CREATE TABLE "{catalog}".test_schema.products (id INTEGER, name VARCHAR, price DOUBLE)
 INSERT INTO "{catalog}".test_schema.products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)
+COMMENT ON TABLE "{catalog}".main.users IS 'people'
+COMMENT ON COLUMN "{catalog}".main.users.name IS 'display name'

@@ -270,3 +270,20 @@ TEST_CASE("concurrent column scans of one schema read live entries", "[twin][rea
 		REQUIRE(twin.ServeError().empty());
 	}
 }
+
+TEST_CASE("table, view and column comments reach the client catalog", "[twin][reads]") {
+	N6kTwin twin;
+	twin.Far("CREATE TABLE db.main.users (id INTEGER, name VARCHAR)");
+	twin.Far("COMMENT ON TABLE db.main.users IS 'people'");
+	twin.Far("COMMENT ON COLUMN db.main.users.name IS 'display name'");
+	twin.Far("CREATE VIEW db.main.adults AS SELECT * FROM db.main.users");
+	twin.Far("COMMENT ON VIEW db.main.adults IS 'grown ups'");
+	twin.Attach();
+
+	REQUIRE(twin.Rows("SELECT table_name, comment FROM duckdb_tables() WHERE database_name = 'db' ORDER BY 1") ==
+	        std::vector<std::string> {"adults|grown ups", "users|people"});
+	REQUIRE(twin.Rows("SELECT column_name, comment FROM duckdb_columns() WHERE database_name = 'db' AND "
+	                  "table_name = 'users' ORDER BY column_index") ==
+	        std::vector<std::string> {"id|NULL", "name|display name"});
+	REQUIRE(twin.ServeError().empty());
+}
