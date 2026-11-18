@@ -135,7 +135,7 @@ public:
 	virtual void CloseLink(n6k::N6kLinkState &link) = 0;
 	virtual int64_t Exec(const string &sql, const StreamCancelCheck &should_cancel) = 0;
 	virtual void Query(const string &sql, ArrowArrayStream *out, StreamCancelCheck should_cancel) = 0;
-	//! `schema` and `named_json` need CAP_RPC_SIGNATURES; empty leaves them out.
+	//! `schema` and `named_json` need CAP_RPC_SIGNATURES.
 	virtual void RpcScalar(const string &function, const string &schema, const string &args_json,
 	                       const string &named_json, ArrowArrayStream *out, StreamCancelCheck should_cancel) = 0;
 	virtual void RpcTable(const string &function, const string &args_json, const uint8_t *data, size_t len,

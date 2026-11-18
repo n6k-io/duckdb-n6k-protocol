@@ -301,7 +301,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("tables", _ARRAY_OF_OBJ, True),
             ("schemas", _ARRAY_OF_OBJ, True),
             ("functions", _ARRAY_OF_OBJ, True),
-            # Only when the request asked for it (CAP_RPC_SIGNATURES). docs/n6k-network-protocol.md
+            # Only when the request sets `table_functions`. docs/n6k-network-protocol.md
             # "TABLES_LIST table_functions row shape".
             ("table_functions", _ARRAY_OF_OBJ, False),
         ],
@@ -513,7 +513,6 @@ CAP_MCP: Final = "mcp"
 CAP_CATALOG_PLANS: Final = "catalog_plans"
 CAP_HAS_FUNCTION: Final = "has_function"
 CAP_SCHEMA_DDL: Final = "schema_ddl"
-# TABLES_LIST `table_functions` and RPC `schema` / `named`.
 CAP_RPC_SIGNATURES: Final = "rpc_signatures"
 
 # What this implementation supports at each level; client and server both send their set.

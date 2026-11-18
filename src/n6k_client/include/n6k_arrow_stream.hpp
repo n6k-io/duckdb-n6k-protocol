@@ -51,7 +51,8 @@ struct N6kScanFunctionData : public ArrowScanFunctionData {
 
 	explicit N6kScanFunctionData(shared_ptr<N6kStreamData> stream_data)
 	    : ArrowScanFunctionData(stream_data), owned_stream_data(std::move(stream_data)) {
-		// Full materialization at bind can't honor projected column_ids; disable pushdown (must match table fns).
+		// Full materialization at bind can't remap projected column_ids (segfault). Every TableFunction scanning this
+		// must leave projection_pushdown off too.
 		projection_pushdown_enabled = false;
 	}
 };

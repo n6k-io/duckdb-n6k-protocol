@@ -60,7 +60,8 @@ private:
 	mutex table_functions_lock;
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> table_functions;
 	case_insensitive_map_t<ListedFunction> listed_functions;
-	//! Never freed while the attach lives: a binder can hold a raw CatalogEntry* for the rest of the statement.
+	//! Never freed while the attach lives: a bound or prepared statement can hold a raw CatalogEntry* past an
+	//! invalidate. Grows by one entry per listed function changed or dropped.
 	vector<unique_ptr<CatalogEntry>> retired;
 };
 

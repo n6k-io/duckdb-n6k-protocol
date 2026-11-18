@@ -515,7 +515,6 @@ TableFunctionSet MakeN6kListedFunctionSet(DatabaseInstance &db, const n6k::WsTab
 				}
 				signature.AddParameter(std::move(name), std::move(type), std::move(default_value), kind);
 			}
-			// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 			tf.function_info = info;
 			bool duplicate = false;
 			for (idx_t i = 0; i < set.Size(); i++) {
@@ -657,7 +656,6 @@ TableFunction MakeN6kCatalogQueryFunction(std::shared_ptr<CatalogSession> sessio
 	TableFunction tf("query", {}, ArrowTableFunction::ArrowScanFunction, CatalogQueryBind,
 	                 ArrowTableFunction::ArrowScanInitGlobal, ArrowTableFunction::ArrowScanInitLocal);
 	tf.GetSignature().AddArgs("args", LogicalType::ANY);
-	// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 	tf.function_info = std::move(info);
 	return tf;
 }
@@ -675,7 +673,6 @@ TableFunction MakeN6kCatalogRpcFunction(const string &function_name, std::shared
 	TableFunction tf(Identifier(function_name), {}, ArrowTableFunction::ArrowScanFunction, bind_func,
 	                 ArrowTableFunction::ArrowScanInitGlobal, ArrowTableFunction::ArrowScanInitLocal);
 	tf.GetSignature().AddArgs("args", LogicalType::ANY);
-	// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 	tf.function_info = std::move(rpc_info);
 	return tf;
 }
@@ -685,7 +682,6 @@ void RegisterN6kRpc(ExtensionLoader &loader) {
 	                       ArrowTableFunction::ArrowScanFunction, N6kRpcBind, ArrowTableFunction::ArrowScanInitGlobal,
 	                       ArrowTableFunction::ArrowScanInitLocal);
 	rpc_func.GetSignature().AddArgs("args", LogicalType::ANY);
-	// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 	loader.RegisterFunction(rpc_func);
 
 	TableFunction rpc_table_func("n6k_catalog_rpc_table",
@@ -707,7 +703,6 @@ void RegisterN6kRpc(ExtensionLoader &loader) {
 	TableFunction query_func("n6k_catalog_query", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                         ArrowTableFunction::ArrowScanFunction, N6kQueryBind,
 	                         ArrowTableFunction::ArrowScanInitGlobal, ArrowTableFunction::ArrowScanInitLocal);
-	// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
 	loader.RegisterFunction(query_func);
 }
 
