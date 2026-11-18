@@ -37,9 +37,51 @@ struct WsSchemaRow {
 	string comment;
 };
 
+struct WsTableFunctionParam {
+	string name;
+	string kind;
+	//! Empty for an untyped macro parameter.
+	string type;
+	bool has_default = false;
+
+	bool operator==(const WsTableFunctionParam &other) const {
+		return name == other.name && kind == other.kind && type == other.type && has_default == other.has_default;
+	}
+};
+
+struct WsTableFunctionOverload {
+	vector<WsTableFunctionParam> params;
+	vector<std::pair<string, string>> options;
+
+	bool operator==(const WsTableFunctionOverload &other) const {
+		return params == other.params && options == other.options;
+	}
+};
+
+struct WsTableFunctionRow {
+	string schema;
+	string name;
+	string type;
+	string comment;
+	bool has_comment = false;
+	string description;
+	vector<string> examples;
+	vector<WsTableFunctionOverload> overloads;
+
+	bool operator==(const WsTableFunctionRow &other) const {
+		return schema == other.schema && name == other.name && type == other.type && comment == other.comment &&
+		       has_comment == other.has_comment && description == other.description && examples == other.examples &&
+		       overloads == other.overloads;
+	}
+	bool operator!=(const WsTableFunctionRow &other) const {
+		return !(*this == other);
+	}
+};
+
 struct WsTableList {
 	vector<WsTableRow> tables;
 	vector<WsSchemaRow> schemas;
+	vector<WsTableFunctionRow> table_functions;
 };
 
 class RequestState;
@@ -64,7 +106,8 @@ public:
 	virtual ~CatalogSession() = default;
 
 	virtual vector<string> ListSchemas() = 0;
-	virtual n6k::WsTableList ListTables() = 0;
+	//! `table_functions` asks the server for them: only with CAP_RPC_SIGNATURES.
+	virtual n6k::WsTableList ListTables(bool table_functions) = 0;
 	virtual void FetchTableSchema(const string &schema, const string &table, ArrowArrayStream *out) = 0;
 	virtual bool HasFunction(const string &name, const vector<string> &args) = 0;
 	// Start any op with a pre-serialized JSON body and hand back the raw RequestState so a source can
@@ -92,8 +135,9 @@ public:
 	virtual void CloseLink(n6k::N6kLinkState &link) = 0;
 	virtual int64_t Exec(const string &sql, const StreamCancelCheck &should_cancel) = 0;
 	virtual void Query(const string &sql, ArrowArrayStream *out, StreamCancelCheck should_cancel) = 0;
-	virtual void RpcScalar(const string &function, const string &args_json, ArrowArrayStream *out,
-	                       StreamCancelCheck should_cancel) = 0;
+	//! `schema` and `named_json` need CAP_RPC_SIGNATURES; empty leaves them out.
+	virtual void RpcScalar(const string &function, const string &schema, const string &args_json,
+	                       const string &named_json, ArrowArrayStream *out, StreamCancelCheck should_cancel) = 0;
 	virtual void RpcTable(const string &function, const string &args_json, const uint8_t *data, size_t len,
 	                      ArrowArrayStream *out, StreamCancelCheck should_cancel) = 0;
 	// An op answered by a bare RESP_END {ok}.

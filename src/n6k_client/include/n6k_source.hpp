@@ -50,6 +50,10 @@ public:
 	void ForgetServerFunctions();
 	void ForgetListing();
 
+	//! Whether the server lists its table functions (CAP_RPC_SIGNATURES).
+	bool ListsTableFunctions();
+	vector<n6k::WsTableFunctionRow> TableFunctions(const string &schema);
+
 private:
 	void ListIfNeeded();
 	bool ServerHasFunction(const string &name, const vector<string> &args);
@@ -64,6 +68,7 @@ private:
 	bool listed = false;
 	case_insensitive_map_t<case_insensitive_map_t<N6kTableInfo>> tables;
 	case_insensitive_map_t<vector<string>> schema_verbs;
+	case_insensitive_map_t<vector<n6k::WsTableFunctionRow>> table_functions;
 	mutex crossing_lock;
 	case_insensitive_set_t crossing_operators;
 	mutex server_functions_lock;

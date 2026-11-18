@@ -9,6 +9,7 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/connection.hpp"
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"
 #include "yyjson.hpp"
@@ -111,10 +112,12 @@ static unique_ptr<FunctionData> ScanDataOverStream(ClientContext &context, share
 }
 
 static unique_ptr<FunctionData> BindRpcScalar(ClientContext &context, CatalogSession &session,
-                                              const string &function_name, const string &args_json,
+                                              const string &function_name, const string &schema,
+                                              const string &args_json, const string &named_json,
                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto stream_data = make_shared_ptr<N6kStreamData>();
-	session.RpcScalar(function_name, args_json, &stream_data->stream, [&context]() { return context.IsInterrupted(); });
+	session.RpcScalar(function_name, schema, args_json, named_json, &stream_data->stream,
+	                  [&context]() { return context.IsInterrupted(); });
 	return ScanDataOverStream(context, std::move(stream_data), return_types, names);
 }
 
@@ -130,7 +133,8 @@ static unique_ptr<FunctionData> N6kRpcBind(ClientContext &context, TableFunction
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto function_name = input.inputs[1].GetValue<string>();
 	auto session = GetCatalogSession(context, db_name);
-	return BindRpcScalar(context, *session, function_name, RpcArgsJson(input.inputs, 2), return_types, names);
+	return BindRpcScalar(context, *session, function_name, string(), RpcArgsJson(input.inputs, 2), string(),
+	                     return_types, names);
 }
 
 struct N6kRpcArrowBindData : public FunctionData {
@@ -370,7 +374,8 @@ static unique_ptr<FunctionData> CatalogRpcBind(ClientContext &context, TableFunc
 	// `session` is never null here: this bind only runs for a name looked up inside an ATTACHed
 	// catalog, GetCatalogSession throws rather than returning null, and N6kCatalog is built from a
 	// CatalogSession::Create that throws on failure.
-	return BindRpcScalar(context, *info.session, info.function_name, RpcArgsJson(input.inputs, 0), return_types, names);
+	return BindRpcScalar(context, *info.session, info.function_name, string(), RpcArgsJson(input.inputs, 0), string(),
+	                     return_types, names);
 }
 
 static unique_ptr<FunctionData> CatalogNamedRpcBind(ClientContext &context, TableFunctionBindInput &input,
@@ -380,7 +385,150 @@ static unique_ptr<FunctionData> CatalogNamedRpcBind(ClientContext &context, Tabl
 		throw BinderException("rpc() requires at least a function name argument");
 	}
 	auto function_name = input.inputs[0].GetValue<string>();
-	return BindRpcScalar(context, *info.session, function_name, RpcArgsJson(input.inputs, 1), return_types, names);
+	return BindRpcScalar(context, *info.session, function_name, string(), RpcArgsJson(input.inputs, 1), string(),
+	                     return_types, names);
+}
+
+// The default of every parameter the server gives a default: the binder fills it in for an argument the call left
+// out, and the bind drops it, so the server applies its own default. Types the parameter ANY, which takes it uncast.
+static constexpr uintptr_t OMITTED_ARGUMENT = 0x6e366b4f4d4954ULL;
+
+static Value OmittedArgument() {
+	return Value::POINTER(OMITTED_ARGUMENT);
+}
+
+static bool IsOmittedArgument(const Value &value) {
+	return value.type().id() == LogicalTypeId::POINTER && !value.IsNull() && value.GetPointer() == OMITTED_ARGUMENT;
+}
+
+struct ListedRpcInfo : public TableFunctionInfo {
+	string function_name;
+	string schema;
+	std::shared_ptr<CatalogSession> session;
+	ListedRpcInfo(string function_name_p, string schema_p, std::shared_ptr<CatalogSession> session_p)
+	    : function_name(std::move(function_name_p)), schema(std::move(schema_p)), session(std::move(session_p)) {
+	}
+};
+
+// A positional slot filled by name after one left to its default goes by name, as `f(1, c := 5)` was written.
+static unique_ptr<FunctionData> ListedRpcBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto &info = input.info->Cast<ListedRpcInfo>();
+	auto &signature = input.table_function.GetSignature();
+	const auto positional_count = signature.GetPositionalParameterCount();
+
+	auto *doc = yyjson_mut_doc_new(nullptr);
+	auto *args = yyjson_mut_arr(doc);
+	auto *named = yyjson_mut_obj(doc);
+	auto add_named = [&](const string &name, const Value &value) {
+		yyjson_mut_obj_add(named, yyjson_mut_strncpy(doc, name.c_str(), name.size()), RpcValueToYYJSON(doc, value));
+	};
+	bool skipped = false;
+	for (idx_t i = 0; i < input.inputs.size(); i++) {
+		auto &value = input.inputs[i];
+		if (IsOmittedArgument(value)) {
+			skipped = true;
+			continue;
+		}
+		if (skipped && i < positional_count) {
+			add_named(signature.GetParameter(i).GetName().GetIdentifierName(), value);
+		} else {
+			yyjson_mut_arr_append(args, RpcValueToYYJSON(doc, value));
+		}
+	}
+	for (auto &entry : input.named_parameters) {
+		if (!IsOmittedArgument(entry.second)) {
+			add_named(entry.first.GetIdentifierName(), entry.second);
+		}
+	}
+	auto write = [&](yyjson_mut_val *val) {
+		size_t len = 0;
+		auto *json = yyjson_mut_val_write(val, 0, &len);
+		string out(json, len);
+		free(json);
+		return out;
+	};
+	auto args_json = write(args);
+	auto named_json = yyjson_mut_obj_size(named) == 0 ? string() : write(named);
+	yyjson_mut_doc_free(doc);
+	return BindRpcScalar(context, *info.session, info.function_name, info.schema, args_json, named_json, return_types,
+	                     names);
+}
+
+static FunctionParameterKind ParameterKindNamed(const string &kind) {
+	if (kind == "positional_only") {
+		return FunctionParameterKind::POSITIONAL_ONLY;
+	}
+	if (kind == "standard") {
+		return FunctionParameterKind::STANDARD;
+	}
+	if (kind == "var_positional") {
+		return FunctionParameterKind::VAR_POSITIONAL;
+	}
+	if (kind == "keyword_only") {
+		return FunctionParameterKind::KEYWORD_ONLY;
+	}
+	if (kind == "var_keyword") {
+		return FunctionParameterKind::VAR_KEYWORD;
+	}
+	throw IOException("n6k: the server listed a parameter of unknown kind \"%s\"", kind);
+}
+
+// A type the client cannot resolve, such as a server-side user type, is ANY: the server still checks the argument.
+static LogicalType ListedParameterType(ClientContext &context, const string &type) {
+	if (type.empty()) {
+		return LogicalType::ANY;
+	}
+	try {
+		auto parsed = TransformStringToLogicalType(type, context);
+		return parsed.id() == LogicalTypeId::TABLE ? LogicalType::ANY : parsed;
+	} catch (std::exception &) {
+		return LogicalType::ANY;
+	}
+}
+
+TableFunctionSet MakeN6kListedFunctionSet(DatabaseInstance &db, const n6k::WsTableFunctionRow &row,
+                                          std::shared_ptr<CatalogSession> session) {
+	auto info = make_shared_ptr<ListedRpcInfo>(row.name, row.schema, std::move(session));
+	TableFunctionSet set {Identifier(row.name)};
+	Connection conn(db);
+	conn.context->RunFunctionInTransaction([&]() {
+		for (auto &overload : row.overloads) {
+			TableFunction tf(Identifier(row.name), {}, ArrowTableFunction::ArrowScanFunction, ListedRpcBind,
+			                 ArrowTableFunction::ArrowScanInitGlobal, ArrowTableFunction::ArrowScanInitLocal);
+			auto &signature = tf.GetSignature();
+			for (auto &param : overload.params) {
+				auto kind = ParameterKindNamed(param.kind);
+				Identifier name(param.name);
+				auto type = param.has_default ? LogicalType::ANY : ListedParameterType(*conn.context, param.type);
+				if (kind == FunctionParameterKind::VAR_KEYWORD && !overload.options.empty()) {
+					TypedKwargs options;
+					for (auto &option : overload.options) {
+						options.Add(Identifier(option.first), ListedParameterType(*conn.context, option.second));
+					}
+					signature.AddTypedKwargs(std::move(name), std::move(options));
+					continue;
+				}
+				optional<Value> default_value;
+				if (param.has_default) {
+					default_value = OmittedArgument();
+				}
+				signature.AddParameter(std::move(name), std::move(type), std::move(default_value), kind);
+			}
+			// no projection_pushdown: bind-time materialize can't remap column_ids (segfault)
+			tf.function_info = info;
+			bool duplicate = false;
+			for (idx_t i = 0; i < set.Size(); i++) {
+				if (set.GetFunctionByOffset(i)->GetSignature().IsSameOverload(signature)) {
+					duplicate = true;
+				}
+			}
+			if (!duplicate) {
+				set.AddFunction(std::move(tf));
+			}
+		}
+	});
+	return set;
 }
 
 struct N6kExecBindData : public TableFunctionData {

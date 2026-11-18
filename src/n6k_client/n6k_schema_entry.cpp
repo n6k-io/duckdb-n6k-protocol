@@ -2,6 +2,7 @@
 #include "n6k_catalog.hpp"
 #include "n6k_catalog_session.hpp"
 #include "n6k_rpc_function.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
@@ -34,9 +35,74 @@ optional_ptr<CatalogEntry> N6kSchemaEntry::LookupEntry(CatalogTransaction transa
 		return Attach().LookupTable(name.GetIdentifierName(), *this, entry_name, transaction.transaction);
 	}
 	if (entry_type == CatalogType::TABLE_FUNCTION_ENTRY) {
-		return GetOrCreateTableFunctionEntry(transaction, entry_name);
+		if (entry_name == "exec" || entry_name == "query" || entry_name == "rpc" ||
+		    !GetN6kCatalog().Source().ListsTableFunctions()) {
+			return GetOrCreateTableFunctionEntry(transaction, entry_name);
+		}
+		auto entries = SyncListedFunctions(&entry_name);
+		return entries.empty() ? nullptr : &entries[0].get();
 	}
 	return nullptr;
+}
+
+vector<reference<CatalogEntry>> N6kSchemaEntry::SyncListedFunctions(const string *only) {
+	auto rows = GetN6kCatalog().Source().TableFunctions(name.GetIdentifierName());
+	case_insensitive_set_t listed;
+	for (auto &row : rows) {
+		listed.insert(row.name);
+	}
+	vector<reference<CatalogEntry>> entries;
+	lock_guard<mutex> lock(table_functions_lock);
+	for (auto it = listed_functions.begin(); it != listed_functions.end();) {
+		if (listed.count(it->first)) {
+			++it;
+			continue;
+		}
+		retired.push_back(std::move(it->second.entry));
+		it = listed_functions.erase(it);
+	}
+	for (auto &row : rows) {
+		if (only && !StringUtil::CIEquals(row.name, *only)) {
+			continue;
+		}
+		auto existing = listed_functions.find(row.name);
+		if (existing != listed_functions.end() && existing->second.row == row) {
+			entries.push_back(*existing->second.entry);
+			continue;
+		}
+		CreateTableFunctionInfo info(MakeN6kListedFunctionSet(catalog.GetDatabase(), row, session));
+		if (row.has_comment) {
+			info.comment = Value(row.comment);
+		}
+		if (!row.description.empty() || !row.examples.empty()) {
+			FunctionDescription description;
+			description.description = row.description;
+			description.examples = row.examples;
+			info.descriptions.push_back(std::move(description));
+		}
+		auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+		entries.push_back(*entry);
+		if (existing != listed_functions.end()) {
+			retired.push_back(std::move(existing->second.entry));
+			existing->second = ListedFunction {row, std::move(entry)};
+		} else {
+			listed_functions.emplace(row.name, ListedFunction {row, std::move(entry)});
+		}
+	}
+	return entries;
+}
+
+void N6kSchemaEntry::ScanTableFunctions(const std::function<void(CatalogEntry &)> &callback) {
+	if (GetN6kCatalog().Source().ListsTableFunctions()) {
+		for (auto &entry : SyncListedFunctions(nullptr)) {
+			callback(entry.get());
+		}
+		return;
+	}
+	lock_guard<mutex> lock(table_functions_lock);
+	for (auto &kv : table_functions) {
+		callback(*kv.second);
+	}
 }
 
 optional_ptr<CatalogEntry> N6kSchemaEntry::GetOrCreateTableFunctionEntry(CatalogTransaction transaction,
@@ -72,10 +138,7 @@ void N6kSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		Attach().ScanTables(name.GetIdentifierName(), *this, seen, callback, &Transaction::Get(context, catalog));
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
-		lock_guard<mutex> lock(table_functions_lock);
-		for (auto &kv : table_functions) {
-			callback(*kv.second);
-		}
+		ScanTableFunctions(callback);
 	}
 }
 
@@ -85,10 +148,7 @@ void N6kSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntr
 		Attach().ScanTables(name.GetIdentifierName(), *this, seen, callback, nullptr);
 	}
 	if (type == CatalogType::TABLE_FUNCTION_ENTRY) {
-		lock_guard<mutex> lock(table_functions_lock);
-		for (auto &kv : table_functions) {
-			callback(*kv.second);
-		}
+		ScanTableFunctions(callback);
 	}
 }
 

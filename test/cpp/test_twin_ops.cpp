@@ -1,6 +1,7 @@
 #include "framework/n6k_twin.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #include <string>
 #include <vector>
@@ -25,7 +26,159 @@ void SeedMacros(N6kTwin &twin) {
 	twin.Far("CREATE MACRO db.main.stream_counter(cnt) AS TABLE (SELECT * FROM n6k_testing_stream_counter(cnt))");
 }
 
+struct KwEchoData : public TableFunctionData {
+	vector<Value> row;
+};
+
+struct KwEchoState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+unique_ptr<FunctionData> KwEchoBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                    vector<Identifier> &names) {
+	auto data = make_uniq<KwEchoData>();
+	names = {Identifier("a"), Identifier("scale"), Identifier("label")};
+	types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR};
+	data->row.push_back(input.inputs[0]);
+	for (auto option : {"scale", "label"}) {
+		auto it = input.named_parameters.find(Identifier(option));
+		data->row.push_back(it == input.named_parameters.end() ? Value() : it->second);
+	}
+	data->row[1] = data->row[1].DefaultCastAs(LogicalType::INTEGER);
+	data->row[2] = data->row[2].DefaultCastAs(LogicalType::VARCHAR);
+	return std::move(data);
+}
+
+unique_ptr<GlobalTableFunctionState> KwEchoInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<KwEchoState>();
+}
+
+void KwEchoScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<KwEchoState>();
+	if (state.done) {
+		return;
+	}
+	state.done = true;
+	auto &row = input.bind_data->Cast<KwEchoData>().row;
+	for (idx_t i = 0; i < row.size(); i++) {
+		output.SetValue(i, 0, row[i]);
+	}
+	output.SetCardinality(1);
+}
+
+TableFunction KwEcho() {
+	TableFunction function("kw_echo", {}, KwEchoScan, KwEchoBind, KwEchoInit);
+	function.GetSignature().AddParameter(Identifier("a"), LogicalType::INTEGER);
+	function.GetSignature().WithTypedKwargs(Identifier("options"), [](TypedKwargs &options) {
+		options.Add(Identifier("scale"), LogicalType::INTEGER);
+		options.Add(Identifier("label"), LogicalType::VARCHAR);
+	});
+	return function;
+}
+
+void SeedSignatures(N6kTwin &twin) {
+	SeedMacros(twin);
+	twin.Far("CREATE MACRO db.main.greet(name, greeting := 'hi') AS TABLE (SELECT greeting || ' ' || name AS msg)");
+	twin.Far("CREATE MACRO db.main.three(a, b := 2, c := 3) AS TABLE (SELECT a, b, c)");
+	twin.Far("CREATE MACRO db.main.typed_add(a INTEGER, b INTEGER := 10) AS TABLE (SELECT a + b AS total)");
+	twin.Far("CREATE MACRO db.main.pick(a INTEGER) AS TABLE (SELECT 1 AS x), (a BIGINT) AS TABLE (SELECT 2 AS x)");
+	twin.Far("COMMENT ON MACRO TABLE db.main.greet IS 'says hello'");
+	twin.Far("CREATE SCHEMA db.other");
+	twin.Far("CREATE MACRO db.other.echo_other(x) AS TABLE (SELECT x AS other_arg)");
+	twin.FarTableFunction("db", "main", KwEcho());
+}
+
+const char *FUNCTIONS_SQL = "SELECT schema_name, function_name, parameters, varargs, comment, description, examples "
+                            "FROM duckdb_functions() WHERE database_name = 'db' ORDER BY ALL";
+
 } // namespace
+
+TEST_CASE("attached table functions bind like the server's", "[twin][ops][functions]") {
+	N6kTwin twin;
+	SeedSignatures(twin);
+	twin.Attach();
+
+	SECTION("duckdb_functions lists what the server has, right after ATTACH") {
+		twin.Same(FUNCTIONS_SQL);
+		twin.Same("SELECT function_name, function_type, parameters, parameter_types FROM duckdb_functions() "
+		          "WHERE database_name = 'db' AND function_type = 'table' ORDER BY ALL");
+		REQUIRE(twin.Rows("SELECT count(*) FROM duckdb_functions() WHERE database_name = 'db' AND function_name IN "
+		                  "('exec', 'query', 'rpc')") == RowList {"0"});
+	}
+
+	SECTION("calls") {
+		for (const std::string sql : {
+		         "SELECT * FROM db.greet('bob')",
+		         "SELECT * FROM db.greet('bob', 'yo')",
+		         "SELECT * FROM db.greet(greeting := 'hey', name := 'al')",
+		         "SELECT * FROM db.greet(name := 'z')",
+		         "SELECT * FROM db.three(1)",
+		         "SELECT * FROM db.three(1, 7, 8)",
+		         "SELECT * FROM db.three(1, c := 5)",
+		         "SELECT * FROM db.three(a := 1, b := 9)",
+		         "SELECT * FROM db.typed_add(1)",
+		         "SELECT * FROM db.typed_add(1, b := 2)",
+		         "SELECT * FROM db.pick(1)",
+		         "SELECT * FROM db.other.echo_other(4)",
+		         "SELECT * FROM db.main.echo('a', 'b')",
+		         "SELECT * FROM db.kw_echo(3)",
+		         "SELECT * FROM db.kw_echo(3, scale := 2)",
+		         "SELECT * FROM db.kw_echo(3, label := 'x', scale := 4)",
+		     }) {
+			twin.Same(sql);
+		}
+	}
+
+	SECTION("errors") {
+		for (const std::string sql : {
+		         "SELECT * FROM db.greet()",
+		         "SELECT * FROM db.greet('a', 'b', 'c')",
+		         "SELECT * FROM db.greet(nme := 'x')",
+		         "SELECT * FROM db.pick(1.5)",
+		         "SELECT * FROM db.kw_echo(3, sclae := 2)",
+		         "SELECT * FROM db.nope(1)",
+		         "SELECT * FROM db.main.nope(1)",
+		         "SELECT * FROM db.other.greet('x')",
+		         "SELECT * FROM db.n6k_testing_stream_counter(5)",
+		         "SELECT * FROM db.main.range(2)",
+		     }) {
+			twin.SameError(sql);
+		}
+		twin.NearFails("SELECT * FROM db.nope(1)", ExceptionType::CATALOG, "does not exist");
+	}
+
+	SECTION("drop, create and a changed signature follow an invalidate") {
+		const auto invalidate = "SELECT * FROM n6k_invalidate_cache('db', 'main')";
+		twin.Far("DROP MACRO TABLE db.main.greet");
+		twin.Rows(invalidate);
+		twin.SameError("SELECT * FROM db.greet('x')");
+		twin.Same(FUNCTIONS_SQL);
+
+		twin.Far("CREATE MACRO db.main.fresh(x) AS TABLE (SELECT x + 1 AS y)");
+		twin.Rows(invalidate);
+		twin.Same("SELECT * FROM db.fresh(1)");
+		twin.Same(FUNCTIONS_SQL);
+
+		twin.Far("CREATE OR REPLACE MACRO db.main.doubler(n, m := 3) AS TABLE (SELECT n * m AS doubled)");
+		twin.Rows(invalidate);
+		twin.Same("SELECT * FROM db.doubler(2)");
+		twin.Same("SELECT * FROM db.doubler(2, m := 5)");
+		twin.Same(FUNCTIONS_SQL);
+	}
+
+	SECTION("a statement prepared before an invalidate still runs") {
+		auto prepared = twin.NearPrepare("SELECT * FROM db.greet('bob')");
+		twin.Far(
+		    "CREATE OR REPLACE MACRO db.main.greet(name, greeting := 'yo') AS TABLE (SELECT greeting || name AS m)");
+		twin.Rows("SELECT * FROM n6k_invalidate_cache('db', 'main')");
+		auto result = prepared->Execute();
+		INFO((result->HasError() ? result->GetError() : "ran"));
+		twin.Same(FUNCTIONS_SQL);
+		twin.Same("SELECT * FROM db.greet('bob')");
+	}
+
+	REQUIRE(twin.ServeError().empty());
+}
 
 TEST_CASE("a query that fails after its schema raises the server's error", "[twin][ops]") {
 	const std::string big = "SELECT i, CASE WHEN i < 5000000 THEN i %s END AS x FROM range(10000000) t(i)";
@@ -178,7 +331,7 @@ TEST_CASE("exec, query and rpc reach the server", "[twin][ops]") {
 	SECTION("streaming rpc") {
 		const RowList counted = {"0", "1", "2", "3", "4"};
 		REQUIRE(twin.Rows("SELECT n FROM db.stream_counter(5) ORDER BY n") == counted);
-		REQUIRE(twin.Rows("SELECT n FROM db.n6k_testing_stream_counter(5) ORDER BY n") == counted);
+		REQUIRE(twin.Rows("SELECT n FROM db.rpc('n6k_testing_stream_counter', 5) ORDER BY n") == counted);
 	}
 
 	SECTION("table rpc binds and streams") {
@@ -225,7 +378,7 @@ TEST_CASE("a long stream is paced by credits and a full drain sends no cancel", 
 	REQUIRE(twin.FarRows("SELECT cancels FROM n6k_serve_stats()") == RowList {"0"});
 
 	twin.HoldCreditsUntilPause();
-	REQUIRE(twin.Rows("SELECT n FROM db.n6k_testing_stream_counter(40000)").size() == 40000);
+	REQUIRE(twin.Rows("SELECT n FROM db.rpc('n6k_testing_stream_counter', 40000)").size() == 40000);
 	REQUIRE(twin.SentCount(n6k::FrameType::CREDIT) >= 1);
 	REQUIRE(twin.SentCount(n6k::FrameType::CANCEL) == 0);
 	REQUIRE(twin.FarRows("SELECT credit_pauses >= 1, cancels FROM n6k_serve_stats()") == RowList {"true|0"});
@@ -238,7 +391,7 @@ TEST_CASE("a stream released before its RESP_END arrives sends no cancel", "[twi
 	twin.Attach();
 
 	twin.HoldRespEnd();
-	REQUIRE(twin.Rows("SELECT n FROM db.n6k_testing_stream_counter(40000)").size() == 40000);
+	REQUIRE(twin.Rows("SELECT n FROM db.rpc('n6k_testing_stream_counter', 40000)").size() == 40000);
 	twin.ReleaseRespEnd();
 	// A later round trip on the same socket: once it answers, every frame sent before it was recorded.
 	REQUIRE(twin.Rows("SELECT * FROM n6k_catalog_query('db', 'SELECT 1')") == RowList {"1"});
@@ -252,7 +405,7 @@ TEST_CASE("a stream released before its end-of-stream marker sends a cancel", "[
 	N6kTwin twin;
 	twin.Attach();
 
-	REQUIRE(twin.Rows("SELECT n FROM db.n6k_testing_stream_counter(1000000) LIMIT 1").size() == 1);
+	REQUIRE(twin.Rows("SELECT n FROM db.rpc('n6k_testing_stream_counter', 1000000) LIMIT 1").size() == 1);
 	REQUIRE(twin.Rows("SELECT * FROM n6k_catalog_query('db', 'SELECT 1')") == RowList {"1"});
 	REQUIRE(twin.SentCount(n6k::FrameType::CANCEL) == 1);
 	REQUIRE(twin.ServeError().empty());

@@ -19,7 +19,11 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
+#include "duckdb/function/table_macro_function.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/common/constants.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
@@ -39,9 +43,8 @@
 namespace duckdb {
 namespace n6k {
 
-// The wire carries only a function name, never a schema, so RPC resolves in one: `main`, matching
-// where CREATE MACRO lands by default.
-static constexpr const char *RPC_SCHEMA = "main";
+// A request that names no schema resolves in `main`, where CREATE MACRO lands by default.
+static constexpr const char *DEFAULT_RPC_SCHEMA = "main";
 
 // Where OP_RPC_TABLE stages the rows pushed with the call. Temp, so it is scoped to the worker's
 // own Connection and two concurrent requests cannot see each other's input.
@@ -161,6 +164,121 @@ static vector<vector<Value>> CollectFunctionRows(Connection &conn, const string 
 	return rows;
 }
 
+struct TableFunctionParamRow {
+	string name;
+	const char *kind;
+	Value type;
+	Value default_sql;
+};
+
+struct TableFunctionOverloadRow {
+	vector<TableFunctionParamRow> params;
+	vector<std::pair<string, string>> options;
+};
+
+struct TableFunctionRow {
+	string schema;
+	string name;
+	const char *type;
+	Value comment;
+	Value description;
+	vector<string> examples;
+	vector<TableFunctionOverloadRow> overloads;
+};
+
+static const char *ParameterKindName(FunctionParameterKind kind) {
+	switch (kind) {
+	case FunctionParameterKind::POSITIONAL_ONLY:
+		return "positional_only";
+	case FunctionParameterKind::STANDARD:
+		return "standard";
+	case FunctionParameterKind::VAR_POSITIONAL:
+		return "var_positional";
+	case FunctionParameterKind::KEYWORD_ONLY:
+		return "keyword_only";
+	case FunctionParameterKind::VAR_KEYWORD:
+		return "var_keyword";
+	}
+	throw InternalException("n6k_server: unknown FunctionParameterKind %d", static_cast<int>(kind));
+}
+
+static TableFunctionOverloadRow MacroOverloadRow(const MacroFunction &macro) {
+	TableFunctionOverloadRow overload;
+	for (idx_t i = 0; i < macro.parameters.size(); i++) {
+		auto &param_name = macro.parameters[i]->Cast<ColumnRefExpression>().GetColumnName();
+		TableFunctionParamRow param {param_name.GetIdentifierName(), "standard", Value(), Value()};
+		if (i < macro.types.size() && macro.types[i].id() != LogicalTypeId::UNKNOWN) {
+			param.type = Value(macro.types[i].ToString());
+		}
+		auto default_it = macro.default_parameters.find(param_name);
+		if (default_it != macro.default_parameters.end()) {
+			param.default_sql = Value(default_it->second->ToString());
+		}
+		overload.params.push_back(std::move(param));
+	}
+	return overload;
+}
+
+static TableFunctionOverloadRow TableFunctionOverloadOf(const FunctionSignature &signature) {
+	TableFunctionOverloadRow overload;
+	for (auto &parameter : signature.GetParameters()) {
+		TableFunctionParamRow param {parameter.GetName().GetIdentifierName(), ParameterKindName(parameter.GetKind()),
+		                             Value(parameter.GetType().ToString()), Value()};
+		if (parameter.HasDefaultValue()) {
+			param.default_sql = Value(parameter.GetDefaultValue()->ToSQLString());
+		}
+		overload.params.push_back(std::move(param));
+	}
+	if (auto options = signature.GetTypedKwargs()) {
+		for (auto &option : options->GetOptions()) {
+			overload.options.emplace_back(option.name.GetIdentifierName(), option.type.ToString());
+		}
+	}
+	return overload;
+}
+
+// The entries duckdb_functions() reads for the catalog's table functions and table macros.
+static vector<TableFunctionRow> CollectTableFunctionRows(ClientContext &context, Catalog &catalog,
+                                                         optional_ptr<const string> schema_filter) {
+	vector<TableFunctionRow> rows;
+	catalog.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
+		const auto &schema_name = schema.name.GetIdentifierName();
+		if (schema_filter && !StringUtil::CIEquals(schema_name, *schema_filter)) {
+			return;
+		}
+		schema.Scan(context, CatalogType::TABLE_FUNCTION_ENTRY, [&](CatalogEntry &entry) {
+			TableFunctionRow row;
+			row.schema = schema_name;
+			row.name = entry.name.GetIdentifierName();
+			row.comment = entry.comment;
+			auto &function_entry = entry.Cast<FunctionEntry>();
+			if (!function_entry.descriptions.empty()) {
+				auto &description = function_entry.descriptions[0];
+				if (!description.description.empty()) {
+					row.description = Value(description.description);
+				}
+				row.examples = description.examples;
+			}
+			if (entry.type == CatalogType::TABLE_MACRO_ENTRY) {
+				row.type = "table_macro";
+				for (auto &macro : entry.Cast<TableMacroCatalogEntry>().macros) {
+					row.overloads.push_back(MacroOverloadRow(*macro));
+				}
+			} else if (entry.type == CatalogType::TABLE_FUNCTION_ENTRY) {
+				row.type = "table";
+				auto &functions = entry.Cast<TableFunctionCatalogEntry>().functions;
+				for (idx_t i = 0; i < functions.Size(); i++) {
+					row.overloads.push_back(TableFunctionOverloadOf(functions.GetFunctionByOffset(i)->GetSignature()));
+				}
+			} else {
+				return;
+			}
+			rows.push_back(std::move(row));
+		});
+	});
+	return rows;
+}
+
 // value must be NULL, VARCHAR or a (nested) list of those; any other type fails in StringValue::Get.
 static void PackStringValue(msgpack::packer<msgpack::sbuffer> &pk, const Value &value) {
 	if (value.IsNull()) {
@@ -184,12 +302,59 @@ static Value CommentOf(const std::map<KEY, Value> &comments, const KEY &key) {
 	return it == comments.end() ? Value() : it->second;
 }
 
+static void PackTableFunctionRows(msgpack::packer<msgpack::sbuffer> &pk, const vector<TableFunctionRow> &rows) {
+	pk.pack_array(static_cast<uint32_t>(rows.size()));
+	for (auto &row : rows) {
+		pk.pack_map(7);
+		PackString(pk, "schema");
+		pk.pack(row.schema);
+		PackString(pk, "name");
+		pk.pack(row.name);
+		PackString(pk, "type");
+		PackString(pk, row.type);
+		PackString(pk, "comment");
+		PackStringValue(pk, row.comment.IsNull() ? row.comment : Value(row.comment.ToString()));
+		PackString(pk, "description");
+		PackStringValue(pk, row.description);
+		PackString(pk, "examples");
+		PackStrings(pk, row.examples);
+		PackString(pk, "overloads");
+		pk.pack_array(static_cast<uint32_t>(row.overloads.size()));
+		for (auto &overload : row.overloads) {
+			pk.pack_map(2);
+			PackString(pk, "params");
+			pk.pack_array(static_cast<uint32_t>(overload.params.size()));
+			for (auto &param : overload.params) {
+				pk.pack_map(4);
+				PackString(pk, "name");
+				pk.pack(param.name);
+				PackString(pk, "kind");
+				PackString(pk, param.kind);
+				PackString(pk, "type");
+				PackStringValue(pk, param.type);
+				PackString(pk, "default");
+				PackStringValue(pk, param.default_sql);
+			}
+			PackString(pk, "options");
+			pk.pack_array(static_cast<uint32_t>(overload.options.size()));
+			for (auto &option : overload.options) {
+				pk.pack_map(2);
+				PackString(pk, "name");
+				pk.pack(option.first);
+				PackString(pk, "type");
+				pk.pack(option.second);
+			}
+		}
+	}
+}
+
 static std::string PackTablesChunk(const FrameTarget &target, const vector<TablePermissionRow> &rows,
                                    const vector<SchemaPermissionRow> &schemas, const ListingComments &comments,
-                                   const vector<vector<Value>> &functions) {
+                                   const vector<vector<Value>> &functions,
+                                   optional_ptr<const vector<TableFunctionRow>> table_functions) {
 	msgpack::sbuffer sb;
 	msgpack::packer<msgpack::sbuffer> pk(&sb);
-	pk.pack_map(5 + NsKeyCount(target));
+	pk.pack_map(5 + (table_functions ? 1 : 0) + NsKeyCount(target));
 	PackTIdInto(pk, FrameType::RESP_CHUNK, target);
 	PackString(pk, "tables");
 	pk.pack_array(static_cast<uint32_t>(rows.size()));
@@ -247,6 +412,10 @@ static std::string PackTablesChunk(const FrameTarget &target, const vector<Table
 			PackStringValue(pk, function[c]);
 		}
 	}
+	if (table_functions) {
+		PackString(pk, "table_functions");
+		PackTableFunctionRows(pk, *table_functions);
+	}
 	return std::string(sb.data(), sb.size());
 }
 
@@ -255,6 +424,7 @@ static void HandleTablesList(ServeReactor &reactor, Connection &conn, const Sess
 	const FrameTarget target {slot.ns, slot.req_id};
 	string schema_filter_str;
 	bool has_filter = false;
+	bool want_table_functions = false;
 	JsonDoc doc(body, body_len);
 	if (body_len > 0) {
 		if (!doc.Parsed() || !duckdb_yyjson::yyjson_is_obj(doc.Root())) {
@@ -268,11 +438,19 @@ static void HandleTablesList(ServeReactor &reactor, Connection &conn, const Sess
 			schema_filter_str = duckdb_yyjson::yyjson_get_str(schema_val);
 			has_filter = !schema_filter_str.empty();
 		}
+		auto *table_functions_val = duckdb_yyjson::yyjson_obj_get(doc.Root(), "table_functions");
+		if (table_functions_val) {
+			if (!duckdb_yyjson::yyjson_is_bool(table_functions_val)) {
+				throw InvalidInputException("n6k_server: OP_TABLES_LIST \"table_functions\" must be a boolean");
+			}
+			want_table_functions = duckdb_yyjson::yyjson_get_bool(table_functions_val);
+		}
 	}
 	const std::string &catalog = sess.catalog;
 	optional_ptr<const string> schema_filter = has_filter ? &schema_filter_str : nullptr;
 	vector<TablePermissionRow> rows;
 	vector<SchemaPermissionRow> schemas;
+	vector<TableFunctionRow> table_functions;
 	conn.context->RunFunctionInTransaction([&]() {
 		auto &cat = Catalog::GetCatalog(*conn.context, Identifier(catalog));
 		// Dispatching, not the plain collector: a bridge- or provider-backed catalog registers its own
@@ -280,10 +458,14 @@ static void HandleTablesList(ServeReactor &reactor, Connection &conn, const Sess
 		// and the primary key that survived the hop. Falls back to plain classification otherwise.
 		CollectCatalogPermissions(*conn.context, cat, schema_filter, nullptr, rows);
 		CollectSchemaPermissions(*conn.context, cat, schema_filter, schemas);
+		if (want_table_functions) {
+			table_functions = CollectTableFunctionRows(*conn.context, cat, schema_filter);
+		}
 	});
 	auto comments = CollectListingComments(conn, catalog, schema_filter);
 	auto functions = CollectFunctionRows(conn, catalog, schema_filter);
-	reactor.SendForRequest(slot, PackTablesChunk(target, rows, schemas, comments, functions));
+	reactor.SendForRequest(slot, PackTablesChunk(target, rows, schemas, comments, functions,
+	                                             want_table_functions ? &table_functions : nullptr));
 	reactor.EndRequest(slot, PackRespEnd(target));
 }
 
@@ -781,6 +963,34 @@ static RpcTarget ResolveRpcTarget(Connection &conn, const std::string &catalog, 
 	return target;
 }
 
+struct RpcCall {
+	std::string function;
+	std::string schema;
+	duckdb_yyjson::yyjson_val *args = nullptr;
+	duckdb_yyjson::yyjson_val *named = nullptr;
+};
+
+static RpcCall ParseRpcCall(duckdb_yyjson::yyjson_val *root, const char *op_name) {
+	RpcCall call;
+	call.function = JsonGetStr(root, "function");
+	if (call.function.empty()) {
+		throw InvalidInputException("n6k_server: %s requires a \"function\" field", op_name);
+	}
+	call.schema = JsonGetStr(root, "schema");
+	if (call.schema.empty()) {
+		call.schema = DEFAULT_RPC_SCHEMA;
+	}
+	call.args = duckdb_yyjson::yyjson_obj_get(root, "args");
+	call.named = duckdb_yyjson::yyjson_obj_get(root, "named");
+	if (call.named && !duckdb_yyjson::yyjson_is_obj(call.named)) {
+		throw InvalidInputException("n6k_server: rpc \"named\" must be an object");
+	}
+	if (call.named && duckdb_yyjson::yyjson_obj_size(call.named) == 0) {
+		call.named = nullptr;
+	}
+	return call;
+}
+
 // The request's "args" as JSON text, for a target that parses them itself rather than having them
 // rendered into SQL. Absent args are an empty list, not null: the host binds them positionally.
 static std::string RpcArgsJson(duckdb_yyjson::yyjson_val *args) {
@@ -922,7 +1132,7 @@ private:
 
 // The catalog entry is only used to find the UDF names: binding it as SQL would decode the host's
 // Arrow blobs into vectors and immediately re-encode them, and would buffer where this does not.
-// `SELECT * FROM db.<RPC_SCHEMA>.<name>(...)` takes the bound path instead, inside vcatprovider.
+// `SELECT * FROM db.<schema>.<name>(...)` takes the bound path instead, inside vcatprovider.
 static std::unique_ptr<ParkedStream> StartRpcStream(ServeReactor &reactor, std::unique_ptr<Connection> conn,
                                                     const StreamFunctionInfo &rpc, const std::string &function,
                                                     const std::string &args_json, const uint8_t *input,
@@ -980,16 +1190,14 @@ static std::unique_ptr<ParkedStream> HandleRpcScalar(ServeReactor &reactor, std:
 		throw InvalidInputException("n6k_server: OP_RPC_SCALAR body is not valid JSON");
 	}
 	auto *root = doc.Root();
-	auto function = JsonGetStr(root, "function");
-	if (function.empty()) {
-		throw InvalidInputException("n6k_server: OP_RPC_SCALAR requires a \"function\" field");
+	auto call = ParseRpcCall(root, "OP_RPC_SCALAR");
+	auto rpc = ResolveRpcTarget(*conn, catalog, call.schema, call.function);
+	// The host's generator takes positional args only; a named call binds through vcatprovider instead.
+	if (rpc.stream && !call.named) {
+		return StartRpcStream(reactor, std::move(conn), *rpc.stream, call.function, RpcArgsJson(call.args), nullptr, 0,
+		                      slot);
 	}
-	auto rpc = ResolveRpcTarget(*conn, catalog, RPC_SCHEMA, function);
-	if (rpc.stream) {
-		return StartRpcStream(reactor, std::move(conn), *rpc.stream, function,
-		                      RpcArgsJson(duckdb_yyjson::yyjson_obj_get(root, "args")), nullptr, 0, slot);
-	}
-	auto sql = BuildRpcCallSql(rpc.catalog, RPC_SCHEMA, function, duckdb_yyjson::yyjson_obj_get(root, "args"));
+	auto sql = BuildRpcCallSql(rpc.catalog, call.schema, call.function, call.args, call.named);
 	return StreamQuery(reactor, std::move(conn), sql, slot, RequestedBatchRows(root));
 }
 
@@ -1014,20 +1222,17 @@ static std::unique_ptr<ParkedStream> HandleRpcTable(ServeReactor &reactor, std::
 		throw InvalidInputException("n6k_server: OP_RPC_TABLE header is not valid JSON");
 	}
 	auto *root = doc.Root();
-	auto function = JsonGetStr(root, "function");
-	if (function.empty()) {
-		throw InvalidInputException("n6k_server: OP_RPC_TABLE requires a \"function\" field");
-	}
+	auto call = ParseRpcCall(root, "OP_RPC_TABLE");
 
 	const uint8_t *arrow = reinterpret_cast<const uint8_t *>(body) + header_len + 1;
 	size_t arrow_len = body_len - header_len - 1;
 
 	// Resolved before the rows are staged: a host stream takes the Arrow bytes as they arrived, so
 	// building a view it would only read back would be pure cost.
-	auto rpc = ResolveRpcTarget(*conn, catalog, RPC_SCHEMA, function);
-	if (rpc.stream) {
-		return StartRpcStream(reactor, std::move(conn), *rpc.stream, function,
-		                      RpcArgsJson(duckdb_yyjson::yyjson_obj_get(root, "args")), arrow, arrow_len, slot);
+	auto rpc = ResolveRpcTarget(*conn, catalog, call.schema, call.function);
+	if (rpc.stream && !call.named) {
+		return StartRpcStream(reactor, std::move(conn), *rpc.stream, call.function, RpcArgsJson(call.args), arrow,
+		                      arrow_len, slot);
 	}
 
 	std::unique_ptr<SqlResultStream> stream(new SqlResultStream(std::move(conn), target, RequestedBatchRows(root)));
@@ -1039,8 +1244,7 @@ static std::unique_ptr<ParkedStream> HandleRpcTable(ServeReactor &reactor, std::
 
 	const std::string table_arg = rpc.takes_table_arg ? "(SELECT * FROM " + QuoteIdent(RPC_INPUT_VIEW) + ")"
 	                                                  : "'" + std::string(RPC_INPUT_VIEW) + "'";
-	auto sql =
-	    BuildRpcCallSql(rpc.catalog, RPC_SCHEMA, function, duckdb_yyjson::yyjson_obj_get(root, "args"), table_arg);
+	auto sql = BuildRpcCallSql(rpc.catalog, call.schema, call.function, call.args, call.named, table_arg);
 	stream->Start(reactor, slot, stream->conn->Submit(sql));
 	return std::move(stream);
 }

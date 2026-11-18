@@ -41,6 +41,32 @@ async def test_tables_list(target: Target) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", TARGETS, ids=str)
+async def test_tables_list_table_functions(target: Target) -> None:
+    async with connect(target) as (client, _hello):
+        frames = await client.request(OP_TABLES_LIST)
+        chunk = [h for h, _ in frames if h["t"] == FT_RESP_CHUNK][0]
+        assert "table_functions" not in chunk
+
+        frames = await client.request(OP_TABLES_LIST, table_functions=True)
+        chunk = [h for h, _ in frames if h["t"] == FT_RESP_CHUNK][0]
+        by_name = {(f["schema"], f["name"]): f for f in chunk["table_functions"]}
+        assert by_name[("main", "doubler")] == {
+            "schema": "main",
+            "name": "doubler",
+            "type": "table_macro",
+            "comment": "twice n",
+            "description": None,
+            "examples": [],
+            "overloads": [
+                {"params": [{"name": "n", "kind": "standard", "type": None, "default": None}], "options": []}
+            ],
+        }
+        echo = by_name[("main", "echo")]
+        assert [[p["name"] for p in o["params"]] for o in echo["overloads"]] == [["a"], ["a", "b"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", TARGETS, ids=str)
 async def test_table_schema(target: Target) -> None:
     async with connect(target) as (client, _hello):
         frames = await client.request(OP_TABLE_SCHEMA, schema="main", table="users")

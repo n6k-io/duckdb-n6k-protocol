@@ -18,3 +18,14 @@ TEST_CASE("create schema quotes names and whitelists on_conflict", "[sql_builder
 TEST_CASE("a qualified table quotes every part and doubles embedded quotes", "[sql_builder]") {
 	REQUIRE(QuoteQualifiedTable(R"(ca"t)", R"(we"ird)", R"(ta"ble)") == R"("ca""t"."we""ird"."ta""ble")");
 }
+
+TEST_CASE("an rpc call renders positional args, then named args quoted as identifiers", "[sql_builder]") {
+	JsonDoc args(std::string(R"([1, "a'b"])"));
+	JsonDoc named(std::string(R"({"c": 5, "we\"ird": [1, 2]})"));
+	REQUIRE(BuildRpcCallSql("db", "s", "f", args.Root(), named.Root()) ==
+	        R"(SELECT * FROM "db"."s"."f"(1, 'a''b', "c" := 5, "we""ird" := [1, 2]))");
+	REQUIRE(BuildRpcCallSql("", "main", "f", nullptr, named.Root(), "(SELECT 1)") ==
+	        R"(SELECT * FROM "f"((SELECT 1), "c" := 5, "we""ird" := [1, 2]))");
+	JsonDoc not_object(std::string("[1]"));
+	REQUIRE_THROWS(BuildRpcCallSql("db", "s", "f", nullptr, not_object.Root()));
+}

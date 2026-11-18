@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "n6k_catalog_session.hpp"
 
 #include <memory>
 
@@ -46,10 +47,21 @@ public:
 
 private:
 	optional_ptr<CatalogEntry> GetOrCreateTableFunctionEntry(CatalogTransaction transaction, const string &entry_name);
+	//! The entries for what the server lists in this schema; `only` limits it to that name.
+	vector<reference<CatalogEntry>> SyncListedFunctions(const string *only);
+	void ScanTableFunctions(const std::function<void(CatalogEntry &)> &callback);
+
+	struct ListedFunction {
+		n6k::WsTableFunctionRow row;
+		unique_ptr<CatalogEntry> entry;
+	};
 
 	std::shared_ptr<CatalogSession> session;
 	mutex table_functions_lock;
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> table_functions;
+	case_insensitive_map_t<ListedFunction> listed_functions;
+	//! Never freed while the attach lives: a binder can hold a raw CatalogEntry* for the rest of the statement.
+	vector<unique_ptr<CatalogEntry>> retired;
 };
 
 } // namespace duckdb

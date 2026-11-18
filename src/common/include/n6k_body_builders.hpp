@@ -69,6 +69,23 @@ inline std::string Rpc(const std::string &function, const std::string &args_json
 	return n6k::SerializeJsonDocAndFree(doc);
 }
 
+// `schema` and `named_json` are left out when empty.
+inline std::string Rpc(const std::string &function, const std::string &schema, const std::string &args_json,
+                       const std::string &named_json) {
+	auto *doc = yyjson_mut_doc_new(nullptr);
+	auto *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_strncpy(doc, root, "function", function.c_str(), function.size());
+	if (!schema.empty()) {
+		yyjson_mut_obj_add_strncpy(doc, root, "schema", schema.c_str(), schema.size());
+	}
+	AddParsedJsonOrThrowFreeingDoc(doc, root, "args", args_json, "[]");
+	if (!named_json.empty()) {
+		AddParsedJsonOrThrowFreeingDoc(doc, root, "named", named_json, "{}");
+	}
+	return n6k::SerializeJsonDocAndFree(doc);
+}
+
 inline std::string CreateSchema(const std::string &schema, const std::string &on_conflict) {
 	auto *doc = yyjson_mut_doc_new(nullptr);
 	auto *root = yyjson_mut_obj(doc);

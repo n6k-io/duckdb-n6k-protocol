@@ -172,10 +172,11 @@ public:
 		return schemas;
 	}
 
-	n6k::WsTableList ListTables() override {
+	n6k::WsTableList ListTables(bool table_functions) override {
 		std::string arrow, json_chunk, end_body;
-		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_TABLES_LIST, "{}", arrow, json_chunk, end_body,
-		                              StreamCancelCheck());
+		SendRequestAndCollectResponse(*client_, catalog_name_, n6k::OP_TABLES_LIST,
+		                              table_functions ? "{\"table_functions\":true}" : "{}", arrow, json_chunk,
+		                              end_body, StreamCancelCheck());
 		n6k::WsTableList out;
 		n6k::JsonDoc doc(json_chunk);
 		auto *arr = doc.Parsed() ? duckdb_yyjson::yyjson_obj_get(doc.Root(), "tables") : nullptr;
@@ -227,7 +228,67 @@ public:
 			row.comment = JsonGetStr(item, "comment");
 			out.schemas.emplace_back(std::move(row));
 		}
+		if (table_functions) {
+			auto *functions = duckdb_yyjson::yyjson_obj_get(doc.Root(), "table_functions");
+			if (!functions || !duckdb_yyjson::yyjson_is_arr(functions)) {
+				throw IOException("n6k[%s] %s: server returned no \"table_functions\" list", catalog_name_,
+				                  n6k::OpName(n6k::OP_TABLES_LIST));
+			}
+			yyjson_arr_foreach(functions, idx, n, item) {
+				out.table_functions.emplace_back(ParseTableFunctionRow(item));
+			}
+		}
 		return out;
+	}
+
+	n6k::WsTableFunctionRow ParseTableFunctionRow(duckdb_yyjson::yyjson_val *item) {
+		auto malformed = [&]() {
+			return IOException("n6k[%s] %s: malformed table function entry", catalog_name_,
+			                   n6k::OpName(n6k::OP_TABLES_LIST));
+		};
+		if (!duckdb_yyjson::yyjson_is_obj(item)) {
+			throw malformed();
+		}
+		n6k::WsTableFunctionRow row;
+		row.schema = JsonGetStr(item, "schema");
+		row.name = JsonGetStr(item, "name");
+		row.type = JsonGetStr(item, "type");
+		auto *comment = duckdb_yyjson::yyjson_obj_get(item, "comment");
+		row.has_comment = comment && duckdb_yyjson::yyjson_is_str(comment);
+		row.comment = JsonGetStr(item, "comment");
+		row.description = JsonGetStr(item, "description");
+		row.examples = n6k::JsonGetStrArray(item, "examples");
+		auto *overloads = duckdb_yyjson::yyjson_obj_get(item, "overloads");
+		if (row.name.empty() || !overloads || !duckdb_yyjson::yyjson_is_arr(overloads)) {
+			throw malformed();
+		}
+		size_t overload_idx, overload_n;
+		duckdb_yyjson::yyjson_val *overload_val;
+		yyjson_arr_foreach(overloads, overload_idx, overload_n, overload_val) {
+			auto *params = duckdb_yyjson::yyjson_obj_get(overload_val, "params");
+			auto *options = duckdb_yyjson::yyjson_obj_get(overload_val, "options");
+			if (!params || !duckdb_yyjson::yyjson_is_arr(params) || !options ||
+			    !duckdb_yyjson::yyjson_is_arr(options)) {
+				throw malformed();
+			}
+			n6k::WsTableFunctionOverload overload;
+			size_t idx, n;
+			duckdb_yyjson::yyjson_val *val;
+			yyjson_arr_foreach(params, idx, n, val) {
+				n6k::WsTableFunctionParam param;
+				param.name = JsonGetStr(val, "name");
+				param.kind = JsonGetStr(val, "kind");
+				param.type = JsonGetStr(val, "type");
+				auto *default_val = duckdb_yyjson::yyjson_obj_get(val, "default");
+				param.has_default = default_val && duckdb_yyjson::yyjson_is_str(default_val);
+				overload.params.emplace_back(std::move(param));
+			}
+			yyjson_arr_foreach(options, idx, n, val) {
+				overload.options.emplace_back(JsonGetStr(val, "name"), JsonGetStr(val, "type"));
+			}
+			row.overloads.emplace_back(std::move(overload));
+		}
+		return row;
 	}
 
 	void FetchTableSchema(const string &schema, const string &table, ArrowArrayStream *out) override {
@@ -276,10 +337,10 @@ public:
 		                                         std::move(should_cancel));
 	}
 
-	void RpcScalar(const string &function, const string &args_json, ArrowArrayStream *out,
-	               StreamCancelCheck should_cancel) override {
-		auto req = client_->AwaitReadySessionAndSendRequest(n6k::OP_RPC_SCALAR, n6k_body::Rpc(function, args_json),
-		                                                    should_cancel);
+	void RpcScalar(const string &function, const string &schema, const string &args_json, const string &named_json,
+	               ArrowArrayStream *out, StreamCancelCheck should_cancel) override {
+		auto req = client_->AwaitReadySessionAndSendRequest(
+		    n6k::OP_RPC_SCALAR, n6k_body::Rpc(function, schema, args_json, named_json), should_cancel);
 		n6k::StartStreamingArrowFromRequestState(catalog_name_, n6k::OP_RPC_SCALAR, std::move(req), out,
 		                                         std::move(should_cancel));
 	}

@@ -131,9 +131,10 @@ constexpr const char *CAP_MCP = "mcp";
 constexpr const char *CAP_CATALOG_PLANS = "catalog_plans";
 constexpr const char *CAP_HAS_FUNCTION = "has_function";
 constexpr const char *CAP_SCHEMA_DDL = "schema_ddl";
+constexpr const char *CAP_RPC_SIGNATURES = "rpc_signatures";
 constexpr std::array<const char *, 3> HELLO_CAPS = {{"crossing", "jsonrpc", "mcp"}};
 constexpr std::array<const char *, 2> APP_HELLO_CAPS = {{"jsonrpc", "mcp"}};
-constexpr std::array<const char *, 3> OPEN_CAPS = {{"catalog_plans", "has_function", "schema_ddl"}};
+constexpr std::array<const char *, 4> OPEN_CAPS = {{"catalog_plans", "has_function", "schema_ddl", "rpc_signatures"}};
 
 } // namespace n6k
 } // namespace duckdb

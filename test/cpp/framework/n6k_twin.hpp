@@ -15,6 +15,7 @@
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -314,6 +315,26 @@ public:
 		INFO(result->GetError());
 		REQUIRE(result->GetErrorType() == type);
 		REQUIRE(result->GetError().find(message) != std::string::npos);
+	}
+
+	//! Both fail with the same error type; the message can differ, e.g. in its "Did you mean" suggestions.
+	void SameError(const std::string &sql) {
+		INFO(sql);
+		auto expected = far_con.Query(sql);
+		auto got = con->Query(sql);
+		INFO("far: " << (expected->HasError() ? expected->GetError() : "no error"));
+		INFO("near: " << (got->HasError() ? got->GetError() : "no error"));
+		REQUIRE(expected->HasError());
+		REQUIRE(got->HasError());
+		REQUIRE(got->GetErrorType() == expected->GetErrorType());
+	}
+
+	unique_ptr<PreparedStatement> NearPrepare(const std::string &sql) {
+		auto prepared = con->Prepare(sql);
+		if (prepared->HasError()) {
+			throw std::runtime_error(sql + "\n" + prepared->GetError());
+		}
+		return prepared;
 	}
 
 	void NearFunction(ScalarFunction function) {
@@ -762,6 +783,20 @@ public:
 	}
 	void Same(const std::string &sql) {
 		First().Same(sql);
+	}
+	void SameError(const std::string &sql) {
+		First().SameError(sql);
+	}
+	unique_ptr<PreparedStatement> NearPrepare(const std::string &sql) {
+		return First().NearPrepare(sql);
+	}
+	//! Creates `function` in `catalog`.`schema` on the server, as only an extension can.
+	void FarTableFunction(const std::string &catalog, const std::string &schema, TableFunction function) {
+		CreateTableFunctionInfo info(std::move(function));
+		info.SetQualification(Identifier(catalog), Identifier(schema));
+		far_con.context->RunFunctionInTransaction([&]() {
+			Catalog::GetCatalog(*far_con.context, Identifier(catalog)).CreateTableFunction(*far_con.context, info);
+		});
 	}
 	TwinPlan LastPlan() {
 		return First().LastPlan();

@@ -230,6 +230,7 @@ missing capability is fatal. Each name is defined at exactly one level.
 | `catalog_plans` | open | A plan on a link may name a table `[catalog, schema, table]`, for any catalog a session on this socket has open. |
 | `has_function` | open | `HAS_FUNCTION {name, args}` is implemented: `RESP_END {exists}` says whether the session's server has a scalar or aggregate function taking exactly those argument types, with no cast. A client without this capability treats every answer as no and keeps named function calls out of its plans. |
 | `schema_ddl` | open | `CREATE_SCHEMA` is implemented. A client without this capability refuses `CREATE SCHEMA`. |
+| `rpc_signatures` | open | `TABLES_LIST {table_functions: true}` answers with a `table_functions` array ([TABLES_LIST table_functions row shape](#tables_list-table_functions-row-shape)), and `RPC_SCALAR` / `RPC_TABLE` take `schema` and `named`. A client without this capability resolves any name in the catalog as an RPC and sends positional arguments only. |
 
 `catalog_plans` is granted only for a catalog the server serves itself, never one it forwards upstream. A
 plan naming a catalog no session on the socket has open fails with a `Catalog` error, and one naming a
@@ -348,6 +349,35 @@ catalog, limited to the request's `schema` when it names one. Every key is alway
 
 The client uses `{schema, name}` as the table identity on subsequent
 `TABLE_SCHEMA` / `INSERT` frames.
+
+## TABLES_LIST table_functions row shape
+
+Sent only when the request carries `table_functions: true`. One entry per table function or table macro catalog
+entry in the served catalog (the entries `duckdb_functions()` reads), limited to the request's `schema` when it names
+one:
+
+| Column | Type | Required |
+|--------|------|----------|
+| `schema` | string | yes |
+| `name` | string | yes |
+| `type` | `"table"` or `"table_macro"` | yes |
+| `comment` | string \| null | yes |
+| `description` | string \| null | yes |
+| `examples` | string[] | yes |
+| `overloads` | overload[] | yes |
+
+An overload is `{params, options}`. `params` is in declaration order, each `{name, kind, type, default}`:
+
+- `kind` is DuckDB's `FunctionParameterKind`: `positional_only`, `standard`, `var_positional`, `keyword_only` or
+  `var_keyword`. Every macro parameter is `standard`.
+- `type` is the declared type as DuckDB spells it, or null for an untyped macro parameter.
+- `default` is the default's SQL, or null when there is none.
+
+`options` lists the `{name, type}` a typed `**kwargs` parameter accepts, in order; empty otherwise.
+
+A client binds against these signatures and sends only the arguments the caller wrote: `RPC_SCALAR {function,
+schema, args, named}`, where `args` are positional and `named` maps a parameter name to its value. The server applies
+defaults itself. `schema` defaults to `main`.
 
 ## Lifecycle
 
