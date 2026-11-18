@@ -301,6 +301,9 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
             ("tables", _ARRAY_OF_OBJ, True),
             ("schemas", _ARRAY_OF_OBJ, True),
             ("functions", _ARRAY_OF_OBJ, True),
+            # Only when the request sets `table_functions`. docs/n6k-network-protocol.md
+            # "TABLES_LIST table_functions row shape".
+            ("table_functions", _ARRAY_OF_OBJ, False),
         ],
     },
     {
@@ -322,7 +325,7 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         "name": "REQ_TABLES_LIST",
         "t": FT_REQ,
         "op": OP_TABLES_LIST,
-        "fields": [_F_ID, ("schema", "string", False)],
+        "fields": [_F_ID, ("schema", "string", False), ("table_functions", "boolean", False)],
     },
     {
         "name": "REQ_TABLE_SCHEMA",
@@ -348,13 +351,25 @@ _FRAME_HEADERS: list[dict[str, Any]] = [
         "name": "REQ_RPC_SCALAR",
         "t": FT_REQ,
         "op": OP_RPC_SCALAR,
-        "fields": [_F_ID, ("function", "string", True), ("args", "array", False)],
+        "fields": [
+            _F_ID,
+            ("function", "string", True),
+            ("schema", "string", False),
+            ("args", "array", False),
+            ("named", "object", False),
+        ],
     },
     {
         "name": "REQ_RPC_TABLE",
         "t": FT_REQ,
         "op": OP_RPC_TABLE,
-        "fields": [_F_ID, ("function", "string", True), ("args", "array", False)],
+        "fields": [
+            _F_ID,
+            ("function", "string", True),
+            ("schema", "string", False),
+            ("args", "array", False),
+            ("named", "object", False),
+        ],
         "body": "arrow?",
     },
     {
@@ -498,9 +513,10 @@ CAP_MCP: Final = "mcp"
 CAP_CATALOG_PLANS: Final = "catalog_plans"
 CAP_HAS_FUNCTION: Final = "has_function"
 CAP_SCHEMA_DDL: Final = "schema_ddl"
+CAP_RPC_SIGNATURES: Final = "rpc_signatures"
 
 # What this implementation supports at each level; client and server both send their set.
 HELLO_CAPS: Final = (CAP_CROSSING, CAP_JSONRPC, CAP_MCP)
 # The subset of HELLO_CAPS the server grants only when the app serving the socket provides it.
 APP_HELLO_CAPS: Final = (CAP_JSONRPC, CAP_MCP)
-OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_SCHEMA_DDL)
+OPEN_CAPS: Final = (CAP_CATALOG_PLANS, CAP_HAS_FUNCTION, CAP_SCHEMA_DDL, CAP_RPC_SIGNATURES)

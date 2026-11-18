@@ -256,6 +256,17 @@ async def test_rpc_table_carries_scalar_args_too() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rpc_takes_a_schema_and_named_args() -> None:
+    async with connect(TUNED) as (client, _hello):
+        rows = await client.table(OP_RPC_SCALAR, function="echo", schema="main", args=["x"], named={"b": 5})
+        assert rows.to_pylist() == [{"arg0": "x", "arg1": 5}]
+        rows = await client.table(OP_RPC_SCALAR, function="echo", named={"a": "y"})
+        assert rows.to_pylist() == [{"arg0": "y"}]
+        err = await client.error(OP_RPC_SCALAR, function="echo", schema="no_such_schema", args=["x"])
+        assert err["exception_type"] == "CatalogException"
+
+
+@pytest.mark.asyncio
 async def test_rpc_table_uses_a_subquery_for_a_declared_table_parameter() -> None:
     """A native in-out function declares TABLE, so it gets a sub-select, not a view name.
 

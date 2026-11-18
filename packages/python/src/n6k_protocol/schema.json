@@ -627,6 +627,12 @@
             "type": "object"
           }
         },
+        "table_functions": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
         "ns": {
           "type": "integer"
         }
@@ -734,6 +740,9 @@
         },
         "schema": {
           "type": "string"
+        },
+        "table_functions": {
+          "type": "boolean"
         },
         "ns": {
           "type": "integer"
@@ -880,8 +889,14 @@
         "function": {
           "type": "string"
         },
+        "schema": {
+          "type": "string"
+        },
         "args": {
           "type": "array"
+        },
+        "named": {
+          "type": "object"
         },
         "ns": {
           "type": "integer"
@@ -910,8 +925,14 @@
         "function": {
           "type": "string"
         },
+        "schema": {
+          "type": "string"
+        },
         "args": {
           "type": "array"
+        },
+        "named": {
+          "type": "object"
         },
         "ns": {
           "type": "integer"

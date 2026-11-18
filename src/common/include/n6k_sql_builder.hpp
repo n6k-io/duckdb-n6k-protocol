@@ -36,17 +36,20 @@ std::string BuildCreateSchemaSql(const std::string &catalog, const std::string &
 // Nested values recurse, so a struct of lists round-trips.
 std::string RenderRpcArgValue(duckdb_yyjson::yyjson_val *v);
 
-// OP_RPC_SCALAR / OP_RPC_TABLE: `SELECT * FROM fn(args...)`.
+// OP_RPC_SCALAR / OP_RPC_TABLE: `SELECT * FROM fn(args..., name := value...)`.
 //
 // Empty `catalog` calls the bare name, reaching a table function the host registered on the
 // DatabaseInstance (those live in the system catalog); non-empty qualifies it as
 // "catalog"."schema"."fn", reaching a table macro inside the served catalog. Choosing between the
 // two needs a ClientContext and is the caller's job.
 //
+// `named` is a JSON object or null; its keys are quoted as identifiers.
+//
 // `table_arg`, when non-empty, is emitted verbatim as the FIRST argument: the sub-select an in-out
 // table function reads its input relation from, built by the server, not taken from the request.
 std::string BuildRpcCallSql(const std::string &catalog, const std::string &schema, const std::string &function,
-                            duckdb_yyjson::yyjson_val *args, const std::string &table_arg = "");
+                            duckdb_yyjson::yyjson_val *args, duckdb_yyjson::yyjson_val *named = nullptr,
+                            const std::string &table_arg = "");
 
 } // namespace n6k
 } // namespace duckdb

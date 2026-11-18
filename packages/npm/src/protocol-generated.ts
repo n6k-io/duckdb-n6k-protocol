@@ -64,10 +64,7 @@ export const CAP_MCP = "mcp";
 export const CAP_CATALOG_PLANS = "catalog_plans";
 export const CAP_HAS_FUNCTION = "has_function";
 export const CAP_SCHEMA_DDL = "schema_ddl";
+export const CAP_RPC_SIGNATURES = "rpc_signatures";
 export const HELLO_CAPS: readonly string[] = ["crossing", "jsonrpc", "mcp"];
 export const APP_HELLO_CAPS: readonly string[] = ["jsonrpc", "mcp"];
-export const OPEN_CAPS: readonly string[] = [
-  "catalog_plans",
-  "has_function",
-  "schema_ddl",
-];
+export const OPEN_CAPS: readonly string[] = ["catalog_plans", "has_function", "schema_ddl", "rpc_signatures"];

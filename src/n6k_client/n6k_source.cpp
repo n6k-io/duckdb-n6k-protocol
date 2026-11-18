@@ -137,7 +137,8 @@ void N6kSource::ListIfNeeded() {
 	}
 	tables.clear();
 	schema_verbs.clear();
-	auto listing = session->ListTables();
+	table_functions.clear();
+	auto listing = session->ListTables(ListsTableFunctions());
 	for (auto &row : listing.tables) {
 		N6kTableInfo info;
 		info.verbs = row.verbs;
@@ -152,7 +153,21 @@ void N6kSource::ListIfNeeded() {
 	for (auto &row : listing.schemas) {
 		schema_verbs[row.name] = row.verbs;
 	}
+	for (auto &row : listing.table_functions) {
+		table_functions[row.schema].push_back(std::move(row));
+	}
 	listed = true;
+}
+
+bool N6kSource::ListsTableFunctions() {
+	return session->HasCapability(n6k::CAP_RPC_SIGNATURES);
+}
+
+vector<n6k::WsTableFunctionRow> N6kSource::TableFunctions(const string &schema) {
+	lock_guard<mutex> guard(lock);
+	ListIfNeeded();
+	auto it = table_functions.find(schema);
+	return it == table_functions.end() ? vector<n6k::WsTableFunctionRow>() : it->second;
 }
 
 vector<string> N6kSource::Schemas() {

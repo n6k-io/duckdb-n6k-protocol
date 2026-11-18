@@ -88,7 +88,8 @@ std::string RenderRpcArgValue(duckdb_yyjson::yyjson_val *v) {
 }
 
 std::string BuildRpcCallSql(const std::string &catalog, const std::string &schema, const std::string &function,
-                            duckdb_yyjson::yyjson_val *args, const std::string &table_arg) {
+                            duckdb_yyjson::yyjson_val *args, duckdb_yyjson::yyjson_val *named,
+                            const std::string &table_arg) {
 	using namespace duckdb_yyjson; // NOLINT
 	if (function.empty()) {
 		throw InvalidInputException("n6k: rpc requires a function name");
@@ -114,6 +115,20 @@ std::string BuildRpcCallSql(const std::string &catalog, const std::string &schem
 				rendered += ", ";
 			}
 			rendered += RenderRpcArgValue(item);
+		}
+	}
+	if (named && !yyjson_is_obj(named)) {
+		throw InvalidInputException("n6k: rpc \"named\" must be an object");
+	}
+	if (named) {
+		size_t idx, max;
+		yyjson_val *key;
+		yyjson_val *val;
+		yyjson_obj_foreach(named, idx, max, key, val) {
+			if (!rendered.empty()) {
+				rendered += ", ";
+			}
+			rendered += QuoteIdent(yyjson_get_str(key)) + " := " + RenderRpcArgValue(val);
 		}
 	}
 	return "SELECT * FROM " + target + "(" + rendered + ")";

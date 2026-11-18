@@ -18,6 +18,14 @@ autocommit run in a server transaction, so a statement that fails after its writ
 `comment` on table, view and schema rows plus `column_comments` on table rows. Table, view and column comments now
 show on an attached database in `duckdb_tables()` and `duckdb_columns()`.
 
+An attached database now lists the server's table functions and table macros in `duckdb_functions()` from ATTACH,
+in every schema, and binds a call against their signatures: named arguments, defaults and overloads work, and a name
+the server does not have fails with DuckDB's own `CatalogException`, as does a system function called through the
+attached database (`db.range(2)`). A server macro shows as `function_type = 'table'`, and an untyped or defaulted
+parameter as `ANY`. A changed or dropped function is picked up on invalidate. This adds the `rpc_signatures`
+capability, `table_functions` on `TABLES_LIST`, and `schema` and `named` on `RPC_SCALAR` / `RPC_TABLE`; against a
+server without them, calls resolve as before.
+
 `n6k_serve_*` takes `max_links`: far transactions open at once on a connection, each on its own thread.
 
 The recursive part of a `WITH RECURSIVE` can no longer read an attached table; it fails with an error.
