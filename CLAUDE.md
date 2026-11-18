@@ -26,6 +26,13 @@ uv run flake8 .
 cd packages/python && uv run mypy . --strict
 ```
 
+## Tests (cpp)
+You run 
+```
+make cpp-test
+```
+
+
 ## Tests (use uv, no sandbox)
 ```
 uv run pytest packages/python
@@ -47,3 +54,5 @@ TEST_SERVER=skip BACKEND=skip bun run test
 `make protocol-gen` and commit the regenerated mirrors; `make protocol-check` verifies them.
 
 ## Python duckdb version must match the extension build's duckdb version.
+
+The only things you are not to run are `make release`, `make wasm` `uv run test-server` the user will run these commands for you 

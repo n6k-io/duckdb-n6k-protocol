@@ -88,7 +88,8 @@ void SeedSignatures(N6kTwin &twin) {
 	twin.FarTableFunction("db", "main", KwEcho());
 }
 
-const char *FUNCTIONS_SQL = "SELECT schema_name, function_name, parameters, varargs, comment, description, examples "
+const char *FUNCTIONS_SQL = "SELECT schema_name, function_name, parameters, varargs, comment, description, examples, "
+                            "internal "
                             "FROM duckdb_functions() WHERE database_name = 'db' ORDER BY ALL";
 
 } // namespace
@@ -101,7 +102,7 @@ TEST_CASE("attached table functions bind like the server's", "[twin][ops][functi
 	SECTION("duckdb_functions lists what the server has, right after ATTACH") {
 		twin.Same(FUNCTIONS_SQL);
 		twin.Same("SELECT function_name, function_type, parameters, parameter_types FROM duckdb_functions() "
-		          "WHERE database_name = 'db' AND function_type = 'table' ORDER BY ALL");
+		          "WHERE database_name = 'db' AND function_name = 'kw_echo' ORDER BY ALL");
 		REQUIRE(twin.Rows("SELECT count(*) FROM duckdb_functions() WHERE database_name = 'db' AND function_name IN "
 		                  "('exec', 'query', 'rpc')") == RowList {"0"});
 	}

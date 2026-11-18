@@ -11,6 +11,9 @@
 #include "ws_transport_raw.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -794,8 +797,12 @@ public:
 	void FarTableFunction(const std::string &catalog, const std::string &schema, TableFunction function) {
 		CreateTableFunctionInfo info(std::move(function));
 		info.SetQualification(Identifier(catalog), Identifier(schema));
+		info.internal = false;
 		far_con.context->RunFunctionInTransaction([&]() {
-			Catalog::GetCatalog(*far_con.context, Identifier(catalog)).CreateTableFunction(*far_con.context, info);
+			auto &target = Catalog::GetCatalog(*far_con.context, Identifier(catalog));
+			MetaTransaction::Get(*far_con.context)
+			    .ModifyDatabase(target.GetAttached(), DatabaseModificationType::CREATE_CATALOG_ENTRY);
+			target.CreateTableFunction(*far_con.context, info);
 		});
 	}
 	TwinPlan LastPlan() {

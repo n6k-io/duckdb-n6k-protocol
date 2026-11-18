@@ -71,9 +71,7 @@ vector<reference<CatalogEntry>> N6kSchemaEntry::SyncListedFunctions(const string
 			continue;
 		}
 		CreateTableFunctionInfo info(MakeN6kListedFunctionSet(catalog.GetDatabase(), row, session));
-		if (row.has_comment) {
-			info.comment = Value(row.comment);
-		}
+		info.internal = false;
 		if (!row.description.empty() || !row.examples.empty()) {
 			FunctionDescription description;
 			description.description = row.description;
@@ -81,6 +79,9 @@ vector<reference<CatalogEntry>> N6kSchemaEntry::SyncListedFunctions(const string
 			info.descriptions.push_back(std::move(description));
 		}
 		auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+		if (row.has_comment) {
+			entry->comment = Value(row.comment);
+		}
 		entries.push_back(*entry);
 		if (existing != listed_functions.end()) {
 			retired.push_back(std::move(existing->second.entry));
