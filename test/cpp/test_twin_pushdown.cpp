@@ -333,3 +333,17 @@ TEST_CASE("has_function answers are cached until invalidated", "[twin][pushdown]
 
 	REQUIRE(twin.ServeError().empty());
 }
+
+TEST_CASE("an aggregate ORDER BY folds into the remote", "[twin][pushdown][aggregate_order]") {
+	N6kTwin twin;
+	SeedUsersAndProducts(twin);
+	twin.Attach();
+
+	for (const char *sql : {
+	         "SELECT list(id ORDER BY id DESC) FROM db.main.users",
+	         "SELECT list(id ORDER BY id DESC) OVER () FROM db.main.users",
+	     }) {
+		twin.Folds(sql);
+		twin.Same(sql);
+	}
+}

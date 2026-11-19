@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator, List, Optional
 import duckdb
 import pyarrow as pa
 
-from virtual_catalog.rpc_stream import HostStreamUdfs, RpcRegistry, StreamingRpc, register_rpc_streams
+from virtual_catalog.rpc_stream import HostStreamUdfs, RpcEntry, RpcEntryFn, RpcRegistry, StreamingRpc, register_rpc_streams
 
 ECHO_SCHEMA = pa.schema([("arg0", pa.string())])
 TICK_SCHEMA = pa.schema([("seq", pa.int64())])
@@ -64,11 +64,16 @@ async def _py_ticker(scalars: List[Any], table: Optional[pa.Table]) -> AsyncIter
         _ticker_closes += 1
 
 
+def _any_args(fn: RpcEntryFn, schema: pa.Schema) -> RpcEntry:
+    """Optional trailing arguments (`py_ticker(count[, interval_ms])`) need an untyped signature."""
+    return RpcEntry(fn=fn, schema=schema, params=None, description=None)
+
+
 HOST_RPCS: RpcRegistry = {
-    "py_echo": (_py_echo, ECHO_SCHEMA),
-    "py_sum_table": (_py_sum_table, TOTAL_SCHEMA),
-    "py_ticker": (StreamingRpc(_py_ticker), TICK_SCHEMA),
-    "py_ticker_closes": (_py_ticker_closes, CLOSES_SCHEMA),
+    "py_echo": _any_args(_py_echo, ECHO_SCHEMA),
+    "py_sum_table": _any_args(_py_sum_table, TOTAL_SCHEMA),
+    "py_ticker": _any_args(StreamingRpc(_py_ticker), TICK_SCHEMA),
+    "py_ticker_closes": _any_args(_py_ticker_closes, CLOSES_SCHEMA),
 }
 
 
